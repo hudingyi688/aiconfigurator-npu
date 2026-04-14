@@ -75,7 +75,7 @@ def _create_rope(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
     def forward():
         torch_npu._npu_rotary_embedding(
-            q, k, cos_sin_cache, positions, head_size, rotary_dim, True,
+            positions, q, k, head_size, cos_sin_cache, True,
         )
 
     forward()
