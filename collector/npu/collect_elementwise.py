@@ -1,18 +1,14 @@
 """ElementWise operator microbenchmark collector for Ascend NPU.
 
-Covers small but non-negligible operators that are not GEMM/Attention/MoE:
-  - RoPE (Rotary Position Embedding)
-  - RmsNorm (Root Mean Square Normalization)
-  - SwiGLU (SiLU + Gated Linear Unit activation)
-  - Softmax
-
-These operators are memory-bound and shape-fixed per model, but on NPU
-their latency includes significant CANN dispatch overhead that cannot be
-estimated from memory bandwidth alone. Bench data is needed for accurate
-E2E prediction.
+Covers small but non-negligible operators via vllm-ascend / torch_npu APIs,
+ensuring the same CANN kernel path as production inference:
+  - RmsNorm: torch_npu.npu_rms_norm()
+  - RoPE: torch_npu._npu_rotary_embedding()
+  - SwiGLU: torch_npu.npu_swiglu()
+  - Softmax: torch.nn.functional.softmax()
 
 Usage:
-    python collect_elementwise.py --hidden-list 2048 5120 7168 \
+    python collect_elementwise.py --hidden-list 2048 5120 7168 \\
         --batch-list 1 16 --output-dir ./elementwise_data
 """
 
@@ -25,7 +21,11 @@ from typing import Callable
 
 import torch
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -40,18 +40,19 @@ class ElemSpec:
     dtype: torch.dtype = torch.bfloat16
 
 
-# ── Operator factories ──
+# ── Operator factories (aligned with vllm-ascend kernel path) ──
+
 
 def _create_rmsnorm(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """RmsNorm: input (batch, hidden) → normalized (batch, hidden)."""
+    """RmsNorm via torch_npu.npu_rms_norm — same as vllm_ascend/ops/layernorm.py:82."""
+    import torch_npu  # noqa: F401
+
     weight = torch.ones(spec.hidden_size, dtype=spec.dtype, device=device)
     x = torch.randn(spec.batch, spec.hidden_size, dtype=spec.dtype, device=device)
-    variance_epsilon = 1e-6
+    eps = 1e-6
 
     def forward():
-        variance = x.pow(2).mean(-1, keepdim=True)
-        hidden = x * torch.rsqrt(variance + variance_epsilon)
-        return hidden * weight
+        torch_npu.npu_rms_norm(x, weight, eps)
 
     forward()
     torch.npu.synchronize()
@@ -59,23 +60,23 @@ def _create_rmsnorm(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
 
 def _create_rope(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """RoPE: apply rotary embedding to Q/K tensors."""
-    seq_len = spec.batch  # reuse batch as seq_len for RoPE
-    q = torch.randn(seq_len, spec.num_heads, spec.head_size, dtype=spec.dtype, device=device)
-    k = torch.randn(seq_len, spec.num_heads, spec.head_size, dtype=spec.dtype, device=device)
+    """RoPE via torch_npu._npu_rotary_embedding — same as vllm_ascend/ops/rotary_embedding.py:189."""
+    import torch_npu  # noqa: F401
 
-    # Pre-compute cos/sin tables
-    half_dim = spec.head_size // 2
-    freqs = torch.randn(seq_len, half_dim, dtype=spec.dtype, device=device)
-    cos = torch.cos(freqs).unsqueeze(1)
-    sin = torch.sin(freqs).unsqueeze(1)
+    num_tokens = spec.batch
+    num_heads = spec.num_heads
+    head_size = spec.head_size
+    rotary_dim = head_size  # full rotary
+
+    q = torch.randn(num_tokens, num_heads * head_size, dtype=spec.dtype, device=device)
+    k = torch.randn(num_tokens, num_heads * head_size, dtype=spec.dtype, device=device)
+    cos_sin_cache = torch.randn(32768, rotary_dim, dtype=spec.dtype, device=device)
+    positions = torch.arange(num_tokens, device=device)
 
     def forward():
-        q1, q2 = q[..., :half_dim], q[..., half_dim:]
-        k1, k2 = k[..., :half_dim], k[..., half_dim:]
-        q_rot = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-        k_rot = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
-        return q_rot, k_rot
+        torch_npu._npu_rotary_embedding(
+            q, k, cos_sin_cache, positions, head_size, rotary_dim, True,
+        )
 
     forward()
     torch.npu.synchronize()
@@ -83,12 +84,15 @@ def _create_rope(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
 
 def _create_swiglu(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """SwiGLU: gate_up (batch, inter*2) → silu(gate) * up → (batch, inter)."""
-    x = torch.randn(spec.batch, spec.intermediate_size * 2, dtype=spec.dtype, device=device)
+    """SwiGLU via torch_npu.npu_swiglu — same as vllm_ascend/ops/activation.py:38."""
+    import torch_npu  # noqa: F401
+
+    x = torch.randn(
+        spec.batch, spec.intermediate_size * 2, dtype=spec.dtype, device=device,
+    )
 
     def forward():
-        gate, up = x.chunk(2, dim=-1)
-        return torch.nn.functional.silu(gate) * up
+        torch_npu.npu_swiglu(x)
 
     forward()
     torch.npu.synchronize()
@@ -96,11 +100,11 @@ def _create_swiglu(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
 
 def _create_softmax(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """Softmax over last dimension."""
+    """Softmax — standard PyTorch (same kernel on NPU)."""
     x = torch.randn(spec.batch, spec.hidden_size, dtype=spec.dtype, device=device)
 
     def forward():
-        return torch.nn.functional.softmax(x, dim=-1)
+        torch.nn.functional.softmax(x, dim=-1)
 
     forward()
     torch.npu.synchronize()
@@ -117,8 +121,10 @@ OP_FACTORIES = {
 
 def main():
     parser = argparse.ArgumentParser(description="ElementWise operator microbenchmark")
-    parser.add_argument("--op-types", nargs="+", default=list(OP_FACTORIES.keys()),
-                        choices=list(OP_FACTORIES.keys()))
+    parser.add_argument(
+        "--op-types", nargs="+", default=list(OP_FACTORIES.keys()),
+        choices=list(OP_FACTORIES.keys()),
+    )
     parser.add_argument("--hidden-list", nargs="+", type=int, default=[2048, 4096, 5120, 7168, 8192])
     parser.add_argument("--intermediate-list", nargs="+", type=int, default=[1024, 2048, 3200, 4096])
     parser.add_argument("--batch-list", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128])
@@ -130,6 +136,7 @@ def main():
     args = parser.parse_args()
 
     import torch_npu  # noqa: F401
+
     torch.npu.config.allow_internal_format = True
     device = torch.device("npu")
 
@@ -137,8 +144,10 @@ def main():
 
     from bench_engine import benchmark_npu
 
-    fieldnames = ["Op Type", "Batch", "Hidden Size", "Intermediate Size",
-                  "Num Heads", "Head Size", "Average Duration(us)"]
+    fieldnames = [
+        "Op Type", "Batch", "Hidden Size", "Intermediate Size",
+        "Num Heads", "Head Size", "Average Duration(us)",
+    ]
 
     csv_path = os.path.join(args.output_dir, "elementwise_perf.csv")
     f = open(csv_path, "w", newline="")
@@ -176,8 +185,12 @@ def main():
             total += 1
             try:
                 func = factory(spec, device)
-                result = benchmark_npu(func, warmup_iters=args.warmup_iters,
-                                       num_runs=args.bench_iters, repeat_n=6)
+                result = benchmark_npu(
+                    func,
+                    warmup_iters=args.warmup_iters,
+                    num_runs=args.bench_iters,
+                    repeat_n=6,
+                )
                 writer.writerow({
                     "Op Type": op_type,
                     "Batch": spec.batch,
@@ -188,16 +201,24 @@ def main():
                     "Average Duration(us)": f"{result.avg_us:.2f}",
                 })
                 graph_tag = "graph" if result.used_graph else "eager"
-                logger.info("%s batch=%d hidden=%d -> %.2f us (%s)",
-                            op_type, spec.batch, spec.hidden_size, result.avg_us, graph_tag)
+                logger.info(
+                    "%s batch=%d hidden=%d -> %.2f us (%s)",
+                    op_type, spec.batch, spec.hidden_size, result.avg_us, graph_tag,
+                )
             except Exception:
-                logger.exception("FAILED %s batch=%d hidden=%d", op_type, spec.batch, spec.hidden_size)
+                logger.exception(
+                    "FAILED %s batch=%d hidden=%d",
+                    op_type, spec.batch, spec.hidden_size,
+                )
                 errors += 1
             finally:
                 torch.npu.empty_cache()
 
     f.close()
-    logger.info("Done: %d benchmarked, %d errors. Output: %s", total - errors, errors, csv_path)
+    logger.info(
+        "Done: %d benchmarked, %d errors. Output: %s",
+        total - errors, errors, csv_path,
+    )
 
 
 if __name__ == "__main__":
