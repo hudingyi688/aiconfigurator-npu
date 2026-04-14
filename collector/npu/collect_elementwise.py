@@ -124,8 +124,12 @@ def _create_swiglu(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
 
 def _create_softmax(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """Softmax — standard PyTorch (same kernel on NPU)."""
-    x = torch.randn(spec.batch, spec.hidden_size, dtype=spec.dtype, device=device)
+    """Softmax over vocab dimension — LM head sampling softmax.
+
+    In production, this is called once per decode step with shape (1, vocab_size).
+    The hidden_size parameter is repurposed as vocab_size here.
+    """
+    x = torch.randn(1, spec.hidden_size, dtype=spec.dtype, device=device)
 
     def forward():
         torch.nn.functional.softmax(x, dim=-1)
@@ -152,6 +156,7 @@ def main():
     )
     parser.add_argument("--hidden-list", nargs="+", type=int, default=[2048, 4096, 5120, 7168, 8192])
     parser.add_argument("--intermediate-list", nargs="+", type=int, default=[1024, 2048, 3200, 4096])
+    parser.add_argument("--vocab-size-list", nargs="+", type=int, default=[32000, 128256, 151936, 152064])
     parser.add_argument("--batch-list", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128])
     parser.add_argument("--num-heads-list", nargs="+", type=int, default=[4, 8, 16, 32, 64])
     parser.add_argument("--head-size", type=int, default=128)
@@ -199,7 +204,19 @@ def main():
                 for h in args.hidden_list
                 for inter in args.intermediate_list
             ]
-        else:  # rmsnorm, softmax
+        elif op_type == "softmax":
+            # Softmax uses vocab_size as hidden_size dimension
+            specs = [
+                ElemSpec(op_type, 1, vocab, 0, 0, args.head_size)
+                for vocab in args.vocab_size_list
+            ]
+        elif op_type in ("rmsnorm", "add_rmsnorm"):
+            specs = [
+                ElemSpec(op_type, b, h, 0, 0, args.head_size)
+                for b in args.batch_list
+                for h in args.hidden_list
+            ]
+        else:
             specs = [
                 ElemSpec(op_type, b, h, 0, 0, args.head_size)
                 for b in args.batch_list
