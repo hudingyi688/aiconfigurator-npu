@@ -44,7 +44,10 @@ class ElemSpec:
 
 
 def _create_rmsnorm(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
-    """RmsNorm via torch_npu.npu_rms_norm — same as vllm_ascend/ops/layernorm.py:82."""
+    """RmsNorm via torch_npu.npu_rms_norm — same as vllm_ascend/ops/layernorm.py:82.
+
+    Independent RmsNorm without residual add. Used for final_layernorm and QK norm.
+    """
     import torch_npu  # noqa: F401
 
     weight = torch.ones(spec.hidden_size, dtype=spec.dtype, device=device)
@@ -53,6 +56,27 @@ def _create_rmsnorm(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
     def forward():
         torch_npu.npu_rms_norm(x, weight, eps)
+
+    forward()
+    torch.npu.synchronize()
+    return forward
+
+
+def _create_add_rmsnorm(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
+    """Fused Add+RmsNorm via torch_npu.npu_add_rms_norm — same as vllm_ascend/ops/layernorm.py:77.
+
+    Fused residual add + RmsNorm. This is the dominant path (~97.7% of RmsNorm calls),
+    used for input_layernorm and post_attention_layernorm in every layer.
+    """
+    import torch_npu  # noqa: F401
+
+    weight = torch.ones(spec.hidden_size, dtype=spec.dtype, device=device)
+    x = torch.randn(spec.batch, spec.hidden_size, dtype=spec.dtype, device=device)
+    residual = torch.randn(spec.batch, spec.hidden_size, dtype=spec.dtype, device=device)
+    eps = 1e-6
+
+    def forward():
+        torch_npu.npu_add_rms_norm(x, residual, weight, eps)
 
     forward()
     torch.npu.synchronize()
@@ -113,6 +137,7 @@ def _create_softmax(spec: ElemSpec, device: torch.device) -> Callable[[], None]:
 
 OP_FACTORIES = {
     "rmsnorm": _create_rmsnorm,
+    "add_rmsnorm": _create_add_rmsnorm,
     "rope": _create_rope,
     "swiglu": _create_swiglu,
     "softmax": _create_softmax,
