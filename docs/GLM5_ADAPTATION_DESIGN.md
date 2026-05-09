@@ -35,6 +35,34 @@ DSA（DeepSeek Sparse Attention）参数：
 
 GLM-5 使用 DSA（DeepSeek Sparse Attention）——在 MLA 基础上叠加稀疏索引注意力，每个 token 只 attend 到部分 KV position，减少 attention 计算量但增加 sparse indexer 开销。
 
+### 1.2 完整算子类型
+
+算子类型由模型 config 决定存在性，由 vLLM/vllm-ascend 决定具体实现路径（见第 10 节）。
+
+| 算子 | 维度 | 层数 | 作用 | bench 脚本 |
+|------|------|------|------|-----------|
+| **Embedding** | vocab=154880 → hidden=6144 | 1 | 将 token id 映射为 hidden_size 向量，推理时只在 prefill 首 token 执行 | 未采集（延迟可忽略） |
+| **Dense MLP** | 6144 → 12288×2 → 6144 | 3 层（layer 0-2） | `first_k_dense_replace=3`，前 3 层用标准 FFN（gate_up_proj + SiLU + down_proj），`intermediate_size=12288` | `collect_gemm.py`（GEMM BF16/W8A8） |
+| **MoE routed experts** | 6144 → 2048×2 → 6144，256 experts topk=8 | 75 层（layer 3-77） | `moe_layer_freq=1`，第 3 层起全部是 MoE；每个 token 路由到 8 个 expert，GroupedGEMM 并行计算 | `collect_moe.py`（MoE BF16/W8A8） |
+| **MoE shared expert** | 6144 → 2048×2 → 6144，1 expert | 75 层 | `n_shared_experts=1`，每个 MoE 层有 1 个 shared expert，所有 token 都经过，与 routed experts 并行执行后相加 | `collect_gemm.py`（维度同 Dense MLP，M=batch） |
+| **DSA Attention** | 见 MLA 参数 | 全部 78 层 | 完整 MLA 模块：fused_qkv_a_proj → q_a_layernorm → q_b_proj → kv_a_layernorm → kv_b_proj → sparse attention → o_proj；每个 token 只 attend 到 index_topk=2048 个 KV position | `collect_mla_module.py`（Method C，Module 级） |
+| **RMSNorm** | hidden=6144 | 78×2 + 1 = 157 | 每层的 input_layernorm（attention 前）+ post_attention_layernorm（FFN 前）+ 最终 norm；实际走 fused Add+RMSNorm（含残差加法） | `collect_elementwise.py`（rmsnorm / add_rmsnorm） |
+| **LM Head** | 6144 → 154880 | 1 | 将最后一层 hidden state 投影到词表，取 argmax 得到下一个 token | `collect_gemm.py`（GEMM BF16，M=batch，N=154880，K=6144） |
+| **AllReduce** | hidden=6144 | 每层（TP>1 时） | TP 模式下 attention o_proj 和 MLP down_proj 后的 all-reduce，合并各 TP rank 的部分结果 | 未采集（aiconfigurator 用解析模型估算） |
+| **AllToAll** | token dispatch/combine | 每 MoE 层（EP>1 时） | EP 模式下 MoE dispatch（将 token 发送到对应 expert 所在 rank）和 combine（收集 expert 输出），是 MoE 延迟的主要瓶颈之一 | 未采集（aiconfigurator 用解析模型估算） |
+
+**bench 脚本覆盖情况**：
+
+| bench 脚本 | 覆盖算子 | 状态 |
+|-----------|---------|------|
+| `collect_gemm.py` | Dense MLP、shared expert、LM Head 的线性层 | ✅ 有实测数据 |
+| `collect_moe.py` | MoE routed experts（GroupedGEMM） | ✅ 有实测数据（DeepSeek-V3 维度覆盖 GLM-5） |
+| `collect_mla_module.py` | DSA Attention（完整 Module 级） | ⬜ 待采集（需 NPU 硬件） |
+| `collect_elementwise.py` | RMSNorm（rmsnorm / add_rmsnorm） | ✅ 有实测数据 |
+| `collect_attn.py` | 标准 MHA attention（非 DSA，GLM-5 不用） | — 不适用 |
+| `collect_mla.py` | MLA attention kernel 级（Kernel 级近似） | ⬜ 无实测数据（可作为 DSA 近似） |
+| 无 | AllReduce、AllToAll、Embedding | — aiconfigurator 用解析模型估算 |
+
 ---
 
 ## 2. aiconfigurator 对 GLM-5 的建模路径
