@@ -1,0 +1,84 @@
+diff --git a/src/aiconfigurator/sdk/backends/factory.py b/src/aiconfigurator/sdk/backends/factory.py
+index 2f76b0a..0944c11 100644
+--- a/src/aiconfigurator/sdk/backends/factory.py
++++ b/src/aiconfigurator/sdk/backends/factory.py
+@@ -19,9 +19,15 @@ def get_backend(backend_name: str) -> BaseBackend:
+         common.BackendName.trtllm: TRTLLMBackend,
+         common.BackendName.sglang: SGLANGBackend,
+         common.BackendName.vllm: VLLMBackend,
++        common.BackendName.vllm_ascend: VLLMBackend,
+     }
+ 
+-    backend_class = backend_map.get(common.BackendName[backend_name])
++    try:
++        backend_enum = common.BackendName(backend_name)
++    except ValueError:
++        raise ValueError(f"Unknown backend: {backend_name}")
++
++    backend_class = backend_map.get(backend_enum)
+     if backend_class is None:
+         raise ValueError(f"Unknown backend: {backend_name}")
+ 
+diff --git a/src/aiconfigurator/sdk/common.py b/src/aiconfigurator/sdk/common.py
+index 3b6f8af..886fdc7 100644
+--- a/src/aiconfigurator/sdk/common.py
++++ b/src/aiconfigurator/sdk/common.py
+@@ -545,6 +545,7 @@ class BackendName(Enum):
+     trtllm = "trtllm"
+     sglang = "sglang"
+     vllm = "vllm"
++    vllm_ascend = "vllm-ascend"
+ 
+ 
+ class PerfDataFilename(Enum):
+@@ -596,6 +597,7 @@ class GEMMQuantMode(Enum):
+     fp8 = QuantMapping(1, 2, "fp8")  # w8fp8
+     fp8_static = QuantMapping(1, 2, "fp8_static")  # fp8 with static quantization (compute_scale/scale_matrix modeled)
+     sq = QuantMapping(1, 2, "sq")  # w8int8
++    w8a8_dynamic = QuantMapping(1, 2, "w8a8_dynamic")  # Ascend NPU W8A8 dynamic quant (maps to sq bandwidth)
+     fp8_block = QuantMapping(1, 2, "fp8_block")  # specific for trtllm torch ds fp8
+     fp8_ootb = QuantMapping(
+         1, 2, "fp8_ootb"
+@@ -617,6 +619,7 @@ class MoEQuantMode(Enum):
+     w4a16_mxfp4 = QuantMapping(0.5, 1, "w4a16_mxfp4")  # native data format for gpt oss
+     w4a8_mxfp4_mxfp8 = QuantMapping(0.5, 2, "w4a8_mxfp4_mxfp8")
+     # mxfp4 weights, mxfp8 activations (recommended for Blackwell)
++    w8a8_dynamic = QuantMapping(1, 2, "w8a8_dynamic")  # Ascend NPU W8A8 dynamic quant
+ 
+ 
+ class FMHAQuantMode(Enum):
+diff --git a/src/aiconfigurator/sdk/operations.py b/src/aiconfigurator/sdk/operations.py
+index 4d11c2d..8afa487 100755
+--- a/src/aiconfigurator/sdk/operations.py
++++ b/src/aiconfigurator/sdk/operations.py
+@@ -706,7 +706,7 @@ class MoEDispatch(Operation):
+                         )
+                     else:
+                         comm_latency = 0
+-        elif database.backend == common.BackendName.vllm.value:
++        elif database.backend in (common.BackendName.vllm.value, common.BackendName.vllm_ascend.value):
+             assert self._moe_tp_size == 1 or self._moe_ep_size == 1, (
+                 "vllm does not support MoE TP and MoE EP at the same time"
+             )
+diff --git a/src/aiconfigurator/sdk/task.py b/src/aiconfigurator/sdk/task.py
+index 36db585..a1fbf50 100644
+--- a/src/aiconfigurator/sdk/task.py
++++ b/src/aiconfigurator/sdk/task.py
+@@ -224,7 +224,7 @@ def build_disagg_parallel_lists(
+                 decode_worker_config["dp_list"] = parallel_config_list
+                 decode_worker_config["moe_tp_list"] = parallel_config_list
+                 decode_worker_config["moe_ep_list"] = [1]
+-        elif backend_name == "vllm":
++        elif backend_name in ("vllm", "vllm-ascend"):
+             parallel_config_list = [1, 2, 4, 8]
+ 
+             prefill_worker_config["num_gpu_per_worker"] = parallel_config_list
+@@ -414,7 +414,7 @@ class TaskConfigFactory:
+                     worker_config["dp_list"] = [1, 2, 4, 8]
+                     worker_config["moe_tp_list"] = [1, 2, 4, 8]
+                     worker_config["moe_ep_list"] = [1]
+-            elif ctx.backend_name == "vllm":
++            elif ctx.backend_name in ("vllm", "vllm-ascend"):
+                 worker_config["num_gpu_per_worker"] = [1, 2, 4, 8]
+                 worker_config["tp_list"] = [1, 2, 4, 8]
+                 worker_config["pp_list"] = [1, 2, 4, 8] if should_enable_pp else [1]

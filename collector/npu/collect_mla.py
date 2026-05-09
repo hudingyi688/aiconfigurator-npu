@@ -1,6 +1,10 @@
 """MLA microbenchmark collector for Ascend NPU (CANN + vLLM Ascend).
 
 Adapted from AIConfigurator's collect_attn.py design with MLA specifics.
+
+Output formats:
+  tensorcast  - TensorCast CSV (default, for archival and conversion)
+  dsa_module  - aiconfigurator DSA module perf .txt (direct integration)
 """
 
 import argparse
@@ -42,6 +46,7 @@ KERNEL_TYPE_MAP = {
     OP_GENERATION: "FusedInferAttentionScore_Decode_MLA",
 }
 
+# TensorCast CSV columns
 CSV_COLUMNS = [
     "OP State",
     "Accelerator Core",
@@ -59,9 +64,29 @@ CSV_COLUMNS = [
     "KV LoRA Rank",
     "QK Nope Dim",
     "QK Rope Dim",
+    "Architecture",
 ]
 
+# aiconfigurator DSA module perf .txt columns
+DSA_CONTEXT_COLUMNS = [
+    "framework", "version", "device", "op_name", "kernel_source",
+    "batch_size", "isl", "num_heads", "gemm_type", "mla_dtype",
+    "kv_cache_dtype", "architecture", "latency",
+]
+DSA_GENERATION_COLUMNS = [
+    "framework", "version", "device", "op_name", "kernel_source",
+    "batch_size", "isl", "num_heads", "gemm_type", "mla_dtype",
+    "kv_cache_dtype", "architecture", "step", "latency",
+]
+
+OUTPUT_FORMAT_TENSORCAST = "tensorcast"
+OUTPUT_FORMAT_DSA_MODULE = "dsa_module"
+
 CHECKPOINT_FILE = "mla_checkpoint.json"
+
+# GLM-5 architecture identifier (matches aiconfigurator DSA_MODEL_DIMS key)
+ARCH_GLM5 = "GlmMoeDsaForCausalLM"
+ARCH_DSV3 = "DeepseekV32ForCausalLM"
 
 
 def _format_context_shapes(spec: MlaSpec) -> tuple[str, str]:
@@ -91,7 +116,7 @@ def _format_generation_shapes(spec: MlaSpec) -> tuple[str, str]:
     return input_shapes, output_shapes
 
 
-def _make_csv_row(spec: MlaSpec, result: BenchResult) -> dict[str, str]:
+def _make_csv_row(spec: MlaSpec, result: BenchResult, architecture: str) -> dict[str, str]:
     if spec.op_type == OP_CONTEXT:
         input_shapes, output_shapes = _format_context_shapes(spec)
     else:
@@ -114,7 +139,46 @@ def _make_csv_row(spec: MlaSpec, result: BenchResult) -> dict[str, str]:
         "KV LoRA Rank": str(spec.kv_lora_rank),
         "QK Nope Dim": str(spec.qk_nope_head_dim),
         "QK Rope Dim": str(spec.qk_rope_head_dim),
+        "Architecture": architecture,
     }
+
+
+def _make_dsa_row(
+    spec: MlaSpec,
+    result: BenchResult,
+    architecture: str,
+    framework: str,
+    version: str,
+    device: str,
+    gemm_type: str,
+    mla_dtype: str,
+    kv_cache_dtype: str,
+) -> dict[str, str]:
+    """Build an aiconfigurator DSA module perf row from a benchmark result."""
+    latency_ms = result.avg_us / 1000.0
+    base = {
+        "framework": framework,
+        "version": version,
+        "device": device,
+        "kernel_source": "vllm_ascend_mla",
+        "batch_size": str(spec.batch),
+        "isl": str(spec.seq_len),
+        "num_heads": str(spec.num_heads),
+        "gemm_type": gemm_type,
+        "mla_dtype": mla_dtype,
+        "kv_cache_dtype": kv_cache_dtype,
+        "architecture": architecture,
+        "latency": f"{latency_ms:.6f}",
+    }
+    if spec.op_type == OP_CONTEXT:
+        base["op_name"] = "dsa_context_module"
+        return base
+    else:
+        # generation: isl=1, step=seq_len-1 (total context = seq_len)
+        base["op_name"] = "dsa_generation_module"
+        base["isl"] = "1"
+        base["step"] = str(max(0, spec.seq_len - 1))
+        return base
 
 
 def _spec_key(spec: MlaSpec) -> str:
@@ -175,8 +239,16 @@ def run_benchmark(
     warmup_iters: int,
     bench_iters: int,
     resume: bool,
+    output_format: str = OUTPUT_FORMAT_TENSORCAST,
+    architecture: str = ARCH_GLM5,
+    framework: str = "vllm-ascend",
+    version: str = "0.18.0",
+    device: str = "Ascend 910B",
+    gemm_type: str = "float16",
+    mla_dtype: str = "float16",
+    kv_cache_dtype: str = "float16",
 ) -> None:
-    device = torch.device("npu")
+    npu_device = torch.device("npu")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     completed: set[str] = _load_checkpoint(output_dir) if resume else set()
@@ -186,15 +258,33 @@ def run_benchmark(
     op_types_in_specs = sorted({s.op_type for s in specs})
     csv_files: dict[str, tuple[TextIO, csv.DictWriter]] = {}
 
-    for op_type in op_types_in_specs:
-        kernel_type = KERNEL_TYPE_MAP[op_type]
-        csv_path = output_dir / f"{kernel_type}.csv"
-        file_exists = csv_path.exists() and resume
-        fh = open(csv_path, "a" if file_exists else "w", newline="", encoding="utf-8-sig")
-        writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        csv_files[op_type] = (fh, writer)
+    if output_format == OUTPUT_FORMAT_TENSORCAST:
+        for op_type in op_types_in_specs:
+            kernel_type = KERNEL_TYPE_MAP[op_type]
+            csv_path = output_dir / f"{kernel_type}.csv"
+            file_exists = csv_path.exists() and resume
+            fh = open(csv_path, "a" if file_exists else "w", newline="", encoding="utf-8-sig")
+            writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+            csv_files[op_type] = (fh, writer)
+    else:
+        dsa_filenames = {
+            OP_CONTEXT: "dsa_context_module_perf.txt",
+            OP_GENERATION: "dsa_generation_module_perf.txt",
+        }
+        dsa_columns = {
+            OP_CONTEXT: DSA_CONTEXT_COLUMNS,
+            OP_GENERATION: DSA_GENERATION_COLUMNS,
+        }
+        for op_type in op_types_in_specs:
+            csv_path = output_dir / dsa_filenames[op_type]
+            file_exists = csv_path.exists() and resume
+            fh = open(csv_path, "a" if file_exists else "w", newline="", encoding="utf-8")
+            writer = csv.DictWriter(fh, fieldnames=dsa_columns[op_type])
+            if not file_exists:
+                writer.writeheader()
+            csv_files[op_type] = (fh, writer)
 
     total = len(specs)
     skipped = 0
@@ -215,13 +305,20 @@ def run_benchmark(
         )
 
         try:
-            attn_func = create_mla_func(spec, device)
+            attn_func = create_mla_func(spec, npu_device)
             result = benchmark_npu(
                 attn_func,
                 warmup_iters=warmup_iters,
                 num_runs=bench_iters,
             )
-            row = _make_csv_row(spec, result)
+            if output_format == OUTPUT_FORMAT_TENSORCAST:
+                row = _make_csv_row(spec, result, architecture)
+            else:
+                row = _make_dsa_row(
+                    spec, result, architecture,
+                    framework, version, device,
+                    gemm_type, mla_dtype, kv_cache_dtype,
+                )
             _, writer = csv_files[spec.op_type]
             writer.writerow(row)
 
@@ -286,20 +383,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seq-len-list", nargs="+", type=int, default=None,
     )
+    # GLM-5 default: 64 heads; DeepSeek-V3 default: 128 heads
     parser.add_argument(
-        "--num-heads-list", nargs="+", type=int, default=[128], # default DSV3 heads
+        "--num-heads-list", nargs="+", type=int, default=[64],
     )
     parser.add_argument(
         "--kv-lora-rank", type=int, default=512,
     )
+    # GLM-5 default: 192; DeepSeek-V3 default: 128
     parser.add_argument(
-        "--qk-nope-head-dim", type=int, default=128,
+        "--qk-nope-head-dim", type=int, default=192,
     )
     parser.add_argument(
         "--qk-rope-head-dim", type=int, default=64,
     )
+    # GLM-5 default: 256; DeepSeek-V3 default: 128
     parser.add_argument(
-        "--v-head-dim", type=int, default=128,
+        "--v-head-dim", type=int, default=256,
     )
     parser.add_argument(
         "--warmup-iters", type=int, default=20,
@@ -313,6 +413,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    # Output format and metadata
+    parser.add_argument(
+        "--output-format", default=OUTPUT_FORMAT_TENSORCAST,
+        choices=[OUTPUT_FORMAT_TENSORCAST, OUTPUT_FORMAT_DSA_MODULE],
+        help=(
+            "tensorcast: TensorCast CSV (for archival/conversion); "
+            "dsa_module: aiconfigurator DSA module perf .txt (direct integration)"
+        ),
+    )
+    parser.add_argument(
+        "--architecture", default=ARCH_GLM5,
+        help=f"Model architecture identifier (default: {ARCH_GLM5})",
+    )
+    parser.add_argument(
+        "--framework", default="vllm-ascend",
+        help="Framework name written into dsa_module output",
+    )
+    parser.add_argument(
+        "--version", default="0.18.0",
+        help="Framework version written into dsa_module output",
+    )
+    parser.add_argument(
+        "--device", default="Ascend 910B",
+        help="Device name written into dsa_module output",
+    )
+    parser.add_argument(
+        "--gemm-type", default="float16",
+        choices=["float16", "sq", "w8a8_dynamic", "fp8"],
+        help="GEMM quant mode for dsa_module output (maps to GEMMQuantMode enum name)",
+    )
+    parser.add_argument(
+        "--mla-dtype", default="float16",
+        choices=["float16", "fp8"],
+        help="MLA/FMHA quant mode for dsa_module output (maps to FMHAQuantMode enum name)",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype", default="float16",
+        choices=["float16", "int8", "fp8"],
+        help="KV cache quant mode for dsa_module output (maps to KVCacheQuantMode enum name)",
     )
     return parser.parse_args()
 
@@ -363,6 +503,14 @@ def main() -> None:
         warmup_iters=args.warmup_iters,
         bench_iters=args.bench_iters,
         resume=args.resume,
+        output_format=args.output_format,
+        architecture=args.architecture,
+        framework=args.framework,
+        version=args.version,
+        device=args.device,
+        gemm_type=args.gemm_type,
+        mla_dtype=args.mla_dtype,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
 
 

@@ -53,3 +53,44 @@ def _timed_run(
     torch.npu.synchronize()
 
     return start_evt.elapsed_time(end_evt) * 1000.0 / num_runs / repeat_n
+
+
+def benchmark_npu(
+    kernel_func: Callable[[], None],
+    warmup_iters: int = 20,
+    num_runs: int = 100,
+    repeat_n: int = 1,
+) -> BenchResult:
+    """Warmup + time kernel_func on NPU. Tries NPU graph, falls back to eager."""
+    for _ in range(warmup_iters):
+        kernel_func()
+    torch.npu.synchronize()
+
+    try:
+        stream = torch.npu.current_stream()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream):
+            for _ in range(repeat_n):
+                kernel_func()
+
+        graph_us = _timed_run(kernel_func, num_runs, repeat_n, graph=graph)
+        eager_us = _timed_run(kernel_func, num_runs, repeat_n)
+        used_graph = graph_us <= eager_us
+        return BenchResult(
+            avg_us=graph_us if used_graph else eager_us,
+            num_runs=num_runs,
+            repeat_n=repeat_n,
+            used_graph=used_graph,
+            graph_us=graph_us,
+            eager_us=eager_us,
+        )
+    except Exception:
+        logger.warning("NPU graph capture failed, using eager mode")
+        eager_us = _timed_run(kernel_func, num_runs, repeat_n)
+        return BenchResult(
+            avg_us=eager_us,
+            num_runs=num_runs,
+            repeat_n=repeat_n,
+            used_graph=False,
+            eager_us=eager_us,
+        )
