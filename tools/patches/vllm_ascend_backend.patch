@@ -60,6 +60,28 @@ index 4d11c2d..8afa487 100755
              assert self._moe_tp_size == 1 or self._moe_ep_size == 1, (
                  "vllm does not support MoE TP and MoE EP at the same time"
              )
+diff --git a/src/aiconfigurator/sdk/perf_database.py b/src/aiconfigurator/sdk/perf_database.py
+index 573cc2b..0f42155 100755
+--- a/src/aiconfigurator/sdk/perf_database.py
++++ b/src/aiconfigurator/sdk/perf_database.py
+@@ -2749,7 +2749,7 @@ class PerfDatabase:
+             gemm_modes = self.supported_quant_mode.get("gemm", []) or []
+             if common.GEMMQuantMode.fp8.name in gemm_modes and common.GEMMQuantMode.fp8_static.name not in gemm_modes:
+                 gemm_modes.append(common.GEMMQuantMode.fp8_static.name)
+-        elif self.backend == "vllm":
++        elif self.backend in ("vllm", common.BackendName.vllm_ascend.value):
+             self.supported_quant_mode = {
+                 "gemm": _enum_key_names(getattr(self, "_gemm_data", None)),
+                 "context_attention": _enum_key_names(getattr(self, "_context_attention_data", None)),
+@@ -5083,7 +5083,7 @@ class PerfDatabase:
+                         lat = result
+                         energy = 0.0
+                     return PerformanceResult(lat, energy=energy)
+-                elif self.backend == common.BackendName.vllm.value:
++                elif self.backend in (common.BackendName.vllm.value, common.BackendName.vllm_ascend.value):
+                     self._moe_data.raise_if_not_loaded()
+                     used_workload_distribution = (
+                         workload_distribution if workload_distribution in self._moe_data[quant_mode] else "uniform"
 diff --git a/src/aiconfigurator/sdk/task.py b/src/aiconfigurator/sdk/task.py
 index 36db585..a1fbf50 100644
 --- a/src/aiconfigurator/sdk/task.py

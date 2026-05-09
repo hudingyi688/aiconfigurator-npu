@@ -321,6 +321,39 @@ cp data/glm5_dsa_module/dsa_generation_module_perf.txt \
 
 ## 7. 配置搜索流程
 
+### 7.0 aiconfigurator NPU 移植状态
+
+配置搜索依赖 upstream aiconfigurator，需要先完成移植。移植方式为 patch + 数据复制，通过 `tools/apply_patches.sh` 一键完成。
+
+**已完成的 patch（`tools/patches/vllm_ascend_backend.patch`，共 5 个文件）**：
+
+| 文件 | 改动 | 原因 |
+|------|------|------|
+| `sdk/common.py` | 新增 `BackendName.vllm_ascend = "vllm-ascend"`；新增 `GEMMQuantMode.w8a8_dynamic`、`MoEQuantMode.w8a8_dynamic` | NPU 量化模式注册 |
+| `sdk/backends/factory.py` | `get_backend()` 支持 `vllm_ascend` → 映射到 `VLLMBackend` | 后端路由 |
+| `sdk/operations.py` | `MoEDispatch.query()` 的 vllm 分支扩展到 `vllm_ascend` | MoE dispatch 延迟查询 |
+| `sdk/perf_database.py` | `supported_quant_mode` 初始化分支扩展到 `vllm_ascend`；MoE 查询分支扩展到 `vllm_ascend` | 数据库初始化 + MoE 查询路径 |
+| `sdk/task.py` | `build_disagg_parallel_lists()` 和 `TaskConfigFactory` 的 vllm 分支扩展到 `vllm_ascend` | 并行配置生成 |
+
+**移植步骤**：
+
+```bash
+# 1. 克隆 upstream aiconfigurator（如未克隆）
+git clone https://github.com/ai-dynamo/aiconfigurator /path/to/aiconfigurator
+
+# 2. 应用 patch + 复制数据
+cd /path/to/aiconfigurator-npu
+./tools/apply_patches.sh /path/to/aiconfigurator
+
+# 3. 安装
+pip install -e /path/to/aiconfigurator
+```
+
+`apply_patches.sh` 会自动：
+- 应用 `vllm_ascend_backend.patch`（幂等，已应用则跳过）
+- 复制 `systems/data/ascend_910b/` → upstream 的 `systems/data/ascend_910b/`
+- 复制 `systems/ascend_910b_aiconfigurator/ascend_910b.yaml` → upstream 的 `systems/`
+
 ### 7.1 数据准备检查清单
 
 ```
@@ -332,24 +365,80 @@ cp data/glm5_dsa_module/dsa_generation_module_perf.txt \
 ⬜ dsa_generation_module_perf.txt — 待采集（collect_mla_module.py 已就绪，需 NPU 硬件）
 ```
 
-### 7.2 HYBRID 模式下的流程验证
+### 7.2 配置搜索工作原理
 
-在 DSA 数据缺失时，可用 HYBRID 模式先验证 MoE + GEMM 部分：
+aiconfigurator 的配置搜索是**解析模型 + 实测数据库**的混合估算框架，不需要实际部署模型：
+
+```
+TaskConfig（搜索参数）
+    ↓
+PerfDatabase（加载 perf .txt 数据）
+    ↓
+Model.context_ops / generation_ops（算子序列）
+    ↓  每个算子调用 Operation.query(database, num_tokens, ...)
+    ↓  → GEMM: 查 gemm_perf.txt，按 (M,N,K,quant) 插值
+    ↓  → MoE:  查 moe_perf.txt，按 (tokens,hidden,inter,topk,ep) 插值
+    ↓  → DSA:  查 dsa_context/generation_module_perf.txt，按 (batch,isl,heads) 插值
+    ↓  → Comm: 解析模型（AllReduce/AllToAll 用带宽公式估算）
+    ↓  → Norm/Embed: 解析模型（roofline）
+    ↓
+InferenceSummary（TTFT / TPOT / throughput 估算）
+    ↓
+ParetoAnalysis（过滤满足 SLA 的配置，输出 Pareto 最优集）
+```
+
+**HYBRID 模式**：当某类算子没有实测数据时（如 DSA module 数据缺失），自动退回解析模型估算，不会报错。适合在 DSA 数据采集前先验证 MoE + GEMM 路径。
+
+**SILICON 模式**：全部使用实测数据，缺数据则报错。用于最终精确搜索。
+
+### 7.3 执行配置搜索
+
+**Step 1：环境准备**
+
+```bash
+# 应用 patch（见 7.0）
+./tools/apply_patches.sh /path/to/aiconfigurator
+pip install -e /path/to/aiconfigurator
+
+# 如有 DSA 数据，先复制到数据目录
+cp data/glm5_dsa_module/dsa_context_module_perf.txt \
+   /path/to/aiconfigurator/src/aiconfigurator/systems/data/ascend_910b/vllm-ascend/0.18.0/
+cp data/glm5_dsa_module/dsa_generation_module_perf.txt \
+   /path/to/aiconfigurator/src/aiconfigurator/systems/data/ascend_910b/vllm-ascend/0.18.0/
+```
+
+**Step 2：运行搜索**
 
 ```python
 from aiconfigurator.sdk.task import TaskConfig
-from aiconfigurator.sdk.common import DatabaseMode
+from aiconfigurator.sdk.common import DatabaseMode, GEMMQuantMode, MoEQuantMode
 
+# HYBRID 模式（DSA 数据缺失时用解析模型兜底）
 task = TaskConfig(
-    model="GLM-5",           # 或对应的 aiconfigurator 模型名
+    model="zai-org/GLM-5",
     backend="vllm-ascend",
     system="ascend_910b",
-    database_mode=DatabaseMode.HYBRID,  # DSA 部分用解析模型兜底
-    ...
+    database_mode=DatabaseMode.HYBRID,
+    isl=4096,          # prefill 输入长度
+    osl=512,           # 生成长度
+    num_requests=100,  # 并发请求数
+    gemm_quant_mode=GEMMQuantMode.float16,    # BF16；W8A8 用 w8a8_dynamic
+    moe_quant_mode=MoEQuantMode.float16,
 )
+
+results = task.run()
+results.pareto_analysis(
+    ttft_sla_ms=3000,   # TTFT ≤ 3000ms
+    tpot_sla_ms=50,     # TPOT ≤ 50ms
+)
+results.print_pareto_table()
 ```
 
-### 7.3 搜索空间
+**Step 3：解读结果**
+
+输出为各 (total_gpus, TP, EP) 组合下的 TTFT / TPOT / throughput 估算，以及满足 SLA 的 Pareto 最优配置集。
+
+### 7.4 搜索空间
 
 | 参数 | 候选值 |
 |------|--------|
