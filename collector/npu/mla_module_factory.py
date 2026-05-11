@@ -64,7 +64,7 @@ class DsaModuleSpec:
 # Model config resolution — avoid HuggingFace Hub downloads
 # ═══════════════════════════════════════════════════════════════════════
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _LOCAL_MODEL_CONFIGS_DIR = _PROJECT_ROOT / "model_configs"
 _UPSTREAM_MODEL_CONFIGS_DIR = _PROJECT_ROOT / "src" / "aiconfigurator" / "model_configs"
 _local_config_cache: dict[str, str] = {}
