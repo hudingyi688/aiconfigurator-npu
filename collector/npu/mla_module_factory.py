@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable
 
 import torch
+import torch.nn as nn
 
 try:
     import torch_npu  # noqa: F401
