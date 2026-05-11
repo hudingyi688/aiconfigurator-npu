@@ -460,6 +460,8 @@ class SimpleIndexer(nn.Module):
         
         with torch.no_grad():
             self.k_norm.weight.data = self.k_norm.weight.data.to(torch.bfloat16)
+            if self.k_norm.bias is not None:
+                self.k_norm.bias.data = self.k_norm.bias.data.to(torch.bfloat16)
 
     def wk(self, x):
         """Return tuple (output, None) to match vllm linear layer interface."""
