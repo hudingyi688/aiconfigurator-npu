@@ -242,7 +242,7 @@ def _create_attention_module(
         )
 
     rotary_emb = get_rope(
-        head_dim=hf_config.qk_rope_head_dim,
+        head_size=hf_config.qk_rope_head_dim,
         rotary_dim=hf_config.qk_rope_head_dim,
         max_position=hf_config.max_position_embeddings,
         base=getattr(hf_config, "rope_theta", 10000.0),
