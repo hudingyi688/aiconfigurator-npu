@@ -429,23 +429,6 @@ def _create_mla_modules(
     )
 
 
-def _create_simple_indexer(
-    n_head: int,
-    head_dim: int,
-    topk_tokens: int,
-    q_lora_rank: int,
-    hidden_size: int,
-) -> SimpleIndexer:
-    """Create a simple indexer for benchmarking."""
-    return SimpleIndexer(
-        n_head=n_head,
-        head_dim=head_dim,
-        topk_tokens=topk_tokens,
-        q_lora_rank=q_lora_rank,
-        hidden_size=hidden_size,
-    )
-
-
 class SimpleIndexer(nn.Module):
     """Simple Indexer for DSA benchmarking when DeepseekV3Indexer is unavailable."""
 
@@ -471,6 +454,23 @@ class SimpleIndexer(nn.Module):
 
     def forward(self, x):
         return x
+
+
+def _create_simple_indexer(
+    n_head: int,
+    head_dim: int,
+    topk_tokens: int,
+    q_lora_rank: int,
+    hidden_size: int,
+) -> SimpleIndexer:
+    """Create a simple indexer for benchmarking."""
+    return SimpleIndexer(
+        n_head=n_head,
+        head_dim=head_dim,
+        topk_tokens=topk_tokens,
+        q_lora_rank=q_lora_rank,
+        hidden_size=hidden_size,
+    )
 
 
 def _process_module_weights(attn_module, vllm_config) -> None:
