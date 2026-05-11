@@ -385,8 +385,14 @@ def _create_mla_modules(
         indexer = indexer.to(torch.device(device))
 
     from vllm.model_executor.layers.layernorm import RMSNorm
-    q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
-    kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
+    
+    with torch.no_grad():
+        q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
+        kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
+        
+        if q_a_layernorm is not None:
+            q_a_layernorm.weight.data = q_a_layernorm.weight.data.to(torch.bfloat16)
+        kv_a_layernorm.weight.data = kv_a_layernorm.weight.data.to(torch.bfloat16)
 
     target_device = torch.device(device)
     
@@ -451,6 +457,9 @@ class SimpleIndexer(nn.Module):
         self._wk_linear = nn.Linear(hidden_size, head_dim, bias=False)
         self.weights_proj = nn.Linear(n_head * head_dim, topk_tokens, bias=False)
         self.k_norm = nn.LayerNorm(head_dim)
+        
+        with torch.no_grad():
+            self.k_norm.weight.data = self.k_norm.weight.data.to(torch.bfloat16)
 
     def wk(self, x):
         """Return tuple (output, None) to match vllm linear layer interface."""
