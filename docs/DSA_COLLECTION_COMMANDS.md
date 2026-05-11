@@ -5,6 +5,14 @@
 > 2. 已创建本地 GLM-5 配置文件 `model_configs/zai-org--GLM-5_config.json`，无需访问 HuggingFace Hub
 > 3. **必须设置离线环境变量**：`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`
 
+## 版本兼容性检查（首次运行前执行）
+
+```bash
+python tools/check_vllm_compat.py
+```
+
+如果有失败项，需要升级 vllm-ascend 或调整代码中的导入路径。
+
 ## 快速验证（单点测试）
 
 ```bash
