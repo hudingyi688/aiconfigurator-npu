@@ -1,0 +1,31 @@
+# Ascend 910B (Atlas 800T A2) system specification
+# Specs: 64GB HBM, 2TB/s mem_bw, 256 TFLOPS BF16 (512 TFLOPS INT8)
+# 8 dies per node, 56GB/s HCCS intra-node per die
+
+data_dir: data/ascend_910b # relative to systems_dir
+gpu:
+  mem_bw: 2000000000000 # 2TB/s
+  mem_bw_empirical_scaling_factor: 0.85
+  mem_empirical_constant_latency: 0.000003 # 3us
+  mem_capacity: 68719476736 # 64GiB
+  float16_tc_flops: 256000000000000 # 256 TFLOPS BF16
+  int8_tc_flops: 512000000000000 # 512 TFLOPS INT8
+  fp8_tc_flops: 512000000000000 # 512 TFLOPS FP8 (same as INT8)
+  power: 400 # Watt
+  sm_version: 0 # not applicable for Ascend NPU
+
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 25000000000 # Byte/s per die, single direction, 100Gb/s RoCE
+  intra_node_bw: 56000000000 # Byte/s per die, single direction, HCCS 56GB/s
+  pcie_bw: 32000000000 # Byte/s, single direction, PCIe 4.0
+  p2p_latency: 0.00001 # 10us
+
+misc:
+  nccl_mem: # HCCL memory overhead (approximate, similar to NCCL)
+    1: 0
+    2: 358612992 # 342MB
+    4: 411041792 # 392MB
+    8: 411041792 # 392MB
+  other_mem: 3758096384 # 3.5GB reserved
+  nccl_version: '2.26.0' # HCCL version (mapped to nccl_version field)

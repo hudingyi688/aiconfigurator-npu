@@ -27,6 +27,7 @@
 | Attention (MHA) | `collector/npu/collect_attn.py` | ✅ 完整 |
 | MoE | `collector/npu/collect_moe.py` | ✅ 完整 |
 | MLA (Kernel 级) | `collector/npu/collect_mla.py` | ✅ 代码完整，**无实测数据** |
+| DSA Module (Module 级) | `collector/npu/collect_mla_module.py` | ✅ **已实现**，待 NPU 硬件采集 |
 | ElementWise | `collector/npu/collect_elementwise.py` | ✅ 完整 |
 
 ### 2.3 已完成的集成工作
@@ -75,12 +76,13 @@ DSA module 对应 aiconfigurator 的 `collect_mla_module.py`（Module 级），�
 
 ### 3.4 缺口汇总（更新后）
 
-| 缺口 | 影响 | 优先级 | 说明 |
+| 缺口 | 影响 | 优先级 | 状态 |
 |------|------|--------|------|
-| **DSA module profiling 数据** | GLM-5 attention 无法用实测数据估算 | P0 | 需要 `collect_mla_module.py` 的 DSA 路径，或直接采集后转换 |
-| **GLM-5 MoE 数据** | ~~当前 MoE 数据来自 DeepSeek-V2-Lite~~ | ~~P1~~ | **已解决**：GLM-5 MoE 维度 = DeepSeek-V3，现有数据已覆盖 |
-| **HCCL 通信数据** | all-to-all/all-reduce 延迟用解析模型估算，精度有限 | P2 | |
-| **aiconfigurator 集成完整性** | 当前靠 patch 方式，需要整合为独立可运行仓库 | P3 | |
+| **DSA module profiling 数据** | GLM-5 attention 无法用实测数据估算 | P0 | ⬜ 待采集（`collect_mla_module.py` 已就绪） |
+| **GLM-5 MoE 数据** | ~~当前 MoE 数据来自 DeepSeek-V2-Lite~~ | ~~P1~~ | ✅ **已解决**：GLM-5 MoE 维度 = DeepSeek-V3，现有数据已覆盖 |
+| **vllm-ascend backend patch** | upstream aiconfigurator 不支持 NPU | P1 | ✅ **已完成**：`vllm_ascend_backend.patch` 5 处改动 |
+| **HCCL 通信数据** | all-to-all/all-reduce 延迟用解析模型估算，精度有限 | P2 | ⬜ 待采集 |
+| **aiconfigurator-npu 独立集成** | 当前靠 patch 方式，需要整合为独立可运行仓库 | P3 | ⬜ 待开发 |
 
 ---
 
@@ -178,20 +180,35 @@ aiconfigurator-npu/
 
 ## 5. 里程碑（更新后）
 
-| 里程碑 | 交付物 | 依赖 | 状态 |
-|--------|--------|------|------|
-| M0 | GLM-5 MoE 数据 | — | ✅ **已有**（DeepSeek-V3 数据覆盖） |
-| M1 | DSA module 数据（Kernel 级近似） | NPU 硬件 | 待采集 |
-| M2 | aiconfigurator-npu 独立可运行 | 无 | 待开发 |
-| M3 | GLM-5 配置搜索结果 + 最优配置报告 | M1 + M2 | 待验证 |
+| 里程碑 | 交付物 | 依赖 | 状态 | 完成日期 |
+|--------|--------|------|------|----------|
+| M0 | GLM-5 MoE 数据 | — | ✅ **已完成** | 2026-05-09 |
+| M1 | vllm-ascend backend patch + ascend_910b.yaml | — | ✅ **已完成** | 2026-05-09 |
+| M2 | `collect_mla_module.py` 实现 | — | ✅ **已完成** | 2026-05-09 |
+| M3 | DSA module 数据采集 | NPU 硬件 | ⬜ **待采集** | — |
+| M4 | aiconfigurator-npu 独立可运行包 | 无 | ⬜ **待开发** | — |
+| M5 | GLM-5 配置搜索验证（HYBRID 模式） | M3 | ⬜ **待验证** | — |
+| M6 | GLM-5 配置搜索验证（SILICON 模式） | M3 + M4 | ⬜ **待验证** | — |
 
 ---
 
 ## 6. 当前可立即推进的工作（无需硬件）
 
-1. **Phase 2.1**：整理仓库结构，写 `pyproject.toml`，让 `aiconfigurator-npu` 可以 `pip install`
-2. **用 HYBRID 模式先跑 GLM-5**：DSA 部分用解析模型估算，验证其余流程（MoE + GEMM）是否通畅
-3. **README 更新**：补充 MLA collector 的 DSA module 输出格式说明和 GLM-5 采集命令
+1. ✅ **已完成**：`collect_mla_module.py` Module 级 DSA 采集脚本实现
+2. ✅ **已完成**：`vllm_ascend_backend.patch` + `ascend_910b.yaml` 硬件规格
+3. ⬜ **待推进**：整理仓库结构，写 `pyproject.toml`，让 `aiconfigurator-npu` 可以 `pip install`
+4. ⬜ **待推进**：用 HYBRID 模式先跑 GLM-5（DSA 部分用解析模型估算，验证其余流程）
+5. ⬜ **待推进**：README 更新，补充 DSA module 采集命令和配置寻优样例
+
+---
+
+## 7. 需 NPU 硬件的工作
+
+| 任务 | 脚本 | 输出 | 预计耗时 |
+|------|------|------|----------|
+| DSA Context Module 采集 | `collect_mla_module.py --mode context` | `dsa_context_module_perf.txt` | 2-3 天 |
+| DSA Generation Module 采集 | `collect_mla_module.py --mode generation` | `dsa_generation_module_perf.txt` | 2-3 天 |
+| HCCL 通信延迟采集 | 待实现 | `custom_allreduce_perf.txt` / `nccl_perf.txt` | 可选（P2） |
 
 ---
 

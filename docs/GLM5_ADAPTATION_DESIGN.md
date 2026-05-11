@@ -3,6 +3,23 @@
 基于 AIConfigurator-NPU 对 GLM-5（GlmMoeDsaForCausalLM）的完整适配记录与设计说明。
 
 创建日期：2026-05-09
+最后更新：2026-05-11
+
+---
+
+## 0. 适配进展摘要
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| 架构分析 | ✅ 完成 | GLM-5 算子类型、维度梳理 |
+| MoE 数据 | ✅ 完成 | DeepSeek-V3 数据覆盖，无需重采 |
+| Backend Patch | ✅ 完成 | `vllm_ascend_backend.patch` 5 处改动 |
+| 系统规格 | ✅ 完成 | `ascend_910b.yaml` 硬件配置 |
+| DSA Collector | ✅ 完成 | `collect_mla_module.py` Module 级采集脚本 |
+| DSA 数据采集 | ⬜ 待进行 | 需 NPU 硬件执行采集 |
+| 配置搜索验证 | ⬜ 待进行 | 待 DSA 数据完成后验证 |
+
+**下一步**：在 NPU 硬件上执行 `collect_mla_module.py`，采集 DSA Module 性能数据。
 
 ---
 
@@ -356,14 +373,14 @@ pip install -e /path/to/aiconfigurator
 
 ### 7.1 数据准备检查清单
 
-```
-✅ gemm_perf.txt          — 已有（MatMulV2 + QuantBatchMatmulV3）
-✅ moe_perf.txt           — 已有（DeepSeek-V3 配置覆盖 GLM-5）
-✅ context_attention_perf.txt    — 已有（非 DSA 层用）
-✅ generation_attention_perf.txt — 已有（非 DSA 层用）
-⬜ dsa_context_module_perf.txt   — 待采集（collect_mla_module.py 已就绪，需 NPU 硬件）
-⬜ dsa_generation_module_perf.txt — 待采集（collect_mla_module.py 已就绪，需 NPU 硬件）
-```
+| 数据文件 | 状态 | 说明 |
+|---------|------|------|
+| `gemm_perf.txt` | ✅ 已有 | MatMulV2 + QuantBatchMatmulV3 |
+| `moe_perf.txt` | ✅ 已有 | DeepSeek-V3 配置覆盖 GLM-5 |
+| `context_attention_perf.txt` | ✅ 已有 | 标准 MHA（非 DSA 层用） |
+| `generation_attention_perf.txt` | ✅ 已有 | 标准 MHA（非 DSA 层用） |
+| `dsa_context_module_perf.txt` | ⬜ 待采集 | `collect_mla_module.py` 已就绪，需 NPU 硬件 |
+| `dsa_generation_module_perf.txt` | ⬜ 待采集 | `collect_mla_module.py` 已就绪，需 NPU 硬件 |
 
 ### 7.2 配置搜索工作原理
 

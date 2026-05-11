@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aiconfigurator-npu"
+version = "0.1.0"
+description = "AIConfigurator for Ascend NPU - Performance database and configuration search for GLM-5, DeepSeek-V3"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "NVIDIA CORPORATION & AFFILIATES"},
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "pyyaml>=6.0",
+    "munch>=4.0",
+    "matplotlib>=3.7",
+    "plotext>=5.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+aic-npu = "aiconfigurator_npu.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aiconfigurator_npu = ["systems/*.yaml", "systems/data/**/*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501", "F811"]
