@@ -680,6 +680,12 @@ def create_dsa_module_func(
         from vllm_ascend.ascend_forward_context import set_ascend_forward_context
         from vllm_ascend.utils import set_weight_prefetch_method
         from vllm_ascend.ascend_config import WeightPrefetchConfig
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+        
+        try:
+            init_device_properties_triton()
+        except Exception:
+            pass
         
         weight_prefetch_config = WeightPrefetchConfig({})
         set_weight_prefetch_method(weight_prefetch_config)
