@@ -132,7 +132,6 @@ def _create_npu_vllm_config(
     cache_config = CacheConfig(
         block_size=block_size,
         cache_dtype="auto",
-        swap_space=0,
     )
     cache_config.num_gpu_blocks = num_kv_cache_blocks
     cache_config.num_cpu_blocks = 0
