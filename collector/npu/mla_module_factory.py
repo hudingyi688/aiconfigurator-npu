@@ -380,6 +380,7 @@ def _create_mla_modules(
                 head_dim=hf_config.index_head_dim,
                 topk_tokens=hf_config.index_topk,
                 q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
+                hidden_size=hidden_size,
             )
         indexer = indexer.to(torch.device(device))
 
@@ -428,6 +429,23 @@ def _create_mla_modules(
     )
 
 
+def _create_simple_indexer(
+    n_head: int,
+    head_dim: int,
+    topk_tokens: int,
+    q_lora_rank: int,
+    hidden_size: int,
+) -> SimpleIndexer:
+    """Create a simple indexer for benchmarking."""
+    return SimpleIndexer(
+        n_head=n_head,
+        head_dim=head_dim,
+        topk_tokens=topk_tokens,
+        q_lora_rank=q_lora_rank,
+        hidden_size=hidden_size,
+    )
+
+
 class SimpleIndexer(nn.Module):
     """Simple Indexer for DSA benchmarking when DeepseekV3Indexer is unavailable."""
 
@@ -437,6 +455,7 @@ class SimpleIndexer(nn.Module):
         head_dim: int,
         topk_tokens: int,
         q_lora_rank: int,
+        hidden_size: int,
     ):
         super().__init__()
         self.n_head = n_head
@@ -445,28 +464,13 @@ class SimpleIndexer(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.softmax_scale = 1.0 / (head_dim ** 0.5)
 
-        self.wq_b = nn.Linear(q_lora_rank, n_head * head_dim, bias=False)
-        self.wk = nn.Linear(q_lora_rank, head_dim, bias=False)
-        self.weights_proj = nn.Linear(n_head * head_dim, topk_tokens, bias=False)
+        self.wq_b = nn.Parameter(torch.empty(q_lora_rank, n_head * head_dim))
+        self.wk = nn.Parameter(torch.empty(hidden_size, head_dim))
+        self.weights_proj = nn.Parameter(torch.empty(n_head * head_dim, topk_tokens))
         self.k_norm = nn.LayerNorm(head_dim)
 
     def forward(self, x):
         return x
-
-
-def _create_simple_indexer(
-    n_head: int,
-    head_dim: int,
-    topk_tokens: int,
-    q_lora_rank: int,
-) -> SimpleIndexer:
-    """Create a simple indexer for benchmarking."""
-    return SimpleIndexer(
-        n_head=n_head,
-        head_dim=head_dim,
-        topk_tokens=topk_tokens,
-        q_lora_rank=q_lora_rank,
-    )
 
 
 def _process_module_weights(attn_module, vllm_config) -> None:
