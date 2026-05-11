@@ -189,6 +189,7 @@ def _create_attention_module(
     device: str = "npu:0",
 ):
     """Create a DeepseekV2MLAAttention module with dummy weights on NPU."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
 
     try:
@@ -240,6 +241,15 @@ def _create_attention_module(
             device=device,
         )
 
+    rotary_emb = get_rope(
+        head_dim=hf_config.qk_rope_head_dim,
+        rotary_dim=hf_config.qk_rope_head_dim,
+        max_position=hf_config.max_position_embeddings,
+        base=getattr(hf_config, "rope_theta", 10000.0),
+        is_neox_style=False,
+        dtype=torch.bfloat16,
+    )
+
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
         attn_module = DeepseekV2MLAAttention(
             vllm_config=vllm_config,
@@ -256,6 +266,7 @@ def _create_attention_module(
             quant_config=None,
             prefix="model.layers.0.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            rotary_emb=rotary_emb,
         )
 
     if any(p.is_meta for p in attn_module.parameters()):
