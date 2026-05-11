@@ -244,11 +244,12 @@ def _create_attention_module(
     num_heads = hf_config.num_attention_heads
     hidden_size = hf_config.hidden_size
 
-    mla_modules = _create_mla_modules(
-        hf_config=hf_config,
-        hidden_size=hidden_size,
-        device=device,
-    )
+    with set_current_vllm_config(vllm_config):
+        mla_modules = _create_mla_modules(
+            hf_config=hf_config,
+            hidden_size=hidden_size,
+            device=device,
+        )
 
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
         attn_module = AscendMultiHeadLatentAttention(
