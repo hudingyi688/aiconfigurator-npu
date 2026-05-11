@@ -64,10 +64,9 @@ class DsaModuleSpec:
 # Model config resolution — avoid HuggingFace Hub downloads
 # ═══════════════════════════════════════════════════════════════════════
 
-_MODEL_CONFIGS_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "src" / "aiconfigurator" / "model_configs"
-)
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_LOCAL_MODEL_CONFIGS_DIR = _PROJECT_ROOT / "model_configs"
+_UPSTREAM_MODEL_CONFIGS_DIR = _PROJECT_ROOT / "src" / "aiconfigurator" / "model_configs"
 _local_config_cache: dict[str, str] = {}
 
 
@@ -76,19 +75,21 @@ def _resolve_model_path(model_name: str) -> str:
     if model_name in _local_config_cache:
         return _local_config_cache[model_name]
 
-    config_file = _MODEL_CONFIGS_DIR / f"{model_name.replace('/', '--')}_config.json"
-    if not config_file.exists():
-        return model_name
+    config_name = f"{model_name.replace('/', '--')}_config.json"
+    for config_dir in [_LOCAL_MODEL_CONFIGS_DIR, _UPSTREAM_MODEL_CONFIGS_DIR]:
+        config_file = config_dir / config_name
+        if config_file.exists():
+            tmp_dir = tempfile.mkdtemp(prefix=f"aic_model_{model_name.replace('/', '_')}_")
+            os.symlink(config_file, os.path.join(tmp_dir, "config.json"))
 
-    tmp_dir = tempfile.mkdtemp(prefix=f"aic_model_{model_name.replace('/', '_')}_")
-    os.symlink(config_file, os.path.join(tmp_dir, "config.json"))
+            quant_file = config_dir / f"{model_name.replace('/', '--')}_hf_quant_config.json"
+            if quant_file.exists():
+                os.symlink(quant_file, os.path.join(tmp_dir, "hf_quant_config.json"))
 
-    quant_file = _MODEL_CONFIGS_DIR / f"{model_name.replace('/', '--')}_hf_quant_config.json"
-    if quant_file.exists():
-        os.symlink(quant_file, os.path.join(tmp_dir, "hf_quant_config.json"))
+            _local_config_cache[model_name] = tmp_dir
+            return tmp_dir
 
-    _local_config_cache[model_name] = tmp_dir
-    return tmp_dir
+    return model_name
 
 
 # ═══════════════════════════════════════════════════════════════════════
