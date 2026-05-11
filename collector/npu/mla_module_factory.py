@@ -381,10 +381,27 @@ def _create_mla_modules(
                 topk_tokens=hf_config.index_topk,
                 q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
             )
+        indexer = indexer.to(torch.device(device))
 
     from vllm.model_executor.layers.layernorm import RMSNorm
     q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
     kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
+
+    target_device = torch.device(device)
+    
+    if q_proj is not None:
+        q_proj = q_proj.to(target_device)
+    if q_b_proj is not None:
+        q_b_proj = q_b_proj.to(target_device)
+    if fused_qkv_a_proj is not None:
+        fused_qkv_a_proj = fused_qkv_a_proj.to(target_device)
+    if kv_a_proj_with_mqa is not None:
+        kv_a_proj_with_mqa = kv_a_proj_with_mqa.to(target_device)
+    kv_b_proj = kv_b_proj.to(target_device)
+    o_proj = o_proj.to(target_device)
+    if q_a_layernorm is not None:
+        q_a_layernorm = q_a_layernorm.to(target_device)
+    kv_a_layernorm = kv_a_layernorm.to(target_device)
 
     topk_indices_buffer = None
     if indexer is not None:

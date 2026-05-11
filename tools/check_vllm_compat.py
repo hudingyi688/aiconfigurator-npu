@@ -13,6 +13,8 @@ checks = [
     ("vllm_ascend.ops.mla", "from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention"),
     ("vllm_ascend.ops.mla", "from vllm_ascend.ops.mla import IndexerWrapper"),
     ("vllm_ascend.ascend_forward_context", "from vllm_ascend.ascend_forward_context import set_ascend_forward_context"),
+    ("vllm_ascend.utils", "from vllm_ascend.utils import set_weight_prefetch_method"),
+    ("vllm_ascend.ascend_config", "from vllm_ascend.ascend_config import WeightPrefetchConfig"),
     ("vllm.model_executor.layers.mla", "from vllm.model_executor.layers.mla import MLAModules"),
     ("vllm.model_executor.layers.linear", "from vllm.model_executor.layers.linear import RowParallelLinear, ColumnParallelLinear"),
     ("vllm.model_executor.layers.layernorm", "from vllm.model_executor.layers.layernorm import RMSNorm"),
