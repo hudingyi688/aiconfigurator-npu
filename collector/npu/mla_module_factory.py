@@ -291,8 +291,13 @@ def _create_mla_modules(
 ) -> "MLAModules":
     """Create MLAModules with dummy weights for DSA benchmarking."""
     from vllm.model_executor.layers.linear import RowParallelLinear, ColumnParallelLinear
-    from vllm.model_executor.layers.mla import MLAModules, DeepseekV3Indexer
+    from vllm.model_executor.layers.mla import MLAModules
     from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    try:
+        from vllm.model_executor.layers.mla import DeepseekV3Indexer
+    except ImportError:
+        DeepseekV3Indexer = None
 
     q_lora_rank = getattr(hf_config, "q_lora_rank", None)
     kv_lora_rank = hf_config.kv_lora_rank
@@ -356,13 +361,21 @@ def _create_mla_modules(
 
     indexer = None
     if hasattr(hf_config, "index_topk"):
-        indexer = DeepseekV3Indexer(
-            n_head=hf_config.index_n_heads,
-            head_dim=hf_config.index_head_dim,
-            topk_tokens=hf_config.index_topk,
-            q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
-            block_size=64,
-        )
+        if DeepseekV3Indexer is not None:
+            indexer = DeepseekV3Indexer(
+                n_head=hf_config.index_n_heads,
+                head_dim=hf_config.index_head_dim,
+                topk_tokens=hf_config.index_topk,
+                q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
+                block_size=64,
+            )
+        else:
+            indexer = _create_simple_indexer(
+                n_head=hf_config.index_n_heads,
+                head_dim=hf_config.index_head_dim,
+                topk_tokens=hf_config.index_topk,
+                q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
+            )
 
     from vllm.model_executor.layers.norm import RMSNorm
     q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
@@ -380,6 +393,47 @@ def _create_mla_modules(
         o_proj=o_proj,
         indexer=indexer,
         is_sparse=indexer is not None,
+    )
+
+
+class SimpleIndexer(nn.Module):
+    """Simple Indexer for DSA benchmarking when DeepseekV3Indexer is unavailable."""
+
+    def __init__(
+        self,
+        n_head: int,
+        head_dim: int,
+        topk_tokens: int,
+        q_lora_rank: int,
+    ):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = head_dim
+        self.topk_tokens = topk_tokens
+        self.q_lora_rank = q_lora_rank
+        self.softmax_scale = 1.0 / (head_dim ** 0.5)
+
+        self.wq_b = nn.Linear(q_lora_rank, n_head * head_dim, bias=False)
+        self.wk = nn.Linear(head_dim, head_dim, bias=False)
+        self.weights_proj = nn.Linear(n_head * head_dim, topk_tokens, bias=False)
+        self.k_norm = nn.LayerNorm(head_dim)
+
+    def forward(self, x):
+        return x
+
+
+def _create_simple_indexer(
+    n_head: int,
+    head_dim: int,
+    topk_tokens: int,
+    q_lora_rank: int,
+) -> SimpleIndexer:
+    """Create a simple indexer for benchmarking."""
+    return SimpleIndexer(
+        n_head=n_head,
+        head_dim=head_dim,
+        topk_tokens=topk_tokens,
+        q_lora_rank=q_lora_rank,
     )
 
 
