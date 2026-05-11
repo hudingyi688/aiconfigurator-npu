@@ -194,7 +194,15 @@ def _create_attention_module(
     indexer and all MLA submodules for DSA (Sparse Flash Attention).
     """
     from vllm.model_executor.layers.mla import MLAModules
-    from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
+
+    try:
+        from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
+    except ImportError as e:
+        raise ImportError(
+            "vllm_ascend.ops.mla module not found. "
+            "Please upgrade vllm-ascend to a version that includes this module. "
+            "Run: pip install --upgrade vllm-ascend"
+        ) from e
 
     try:
         from vllm.utils.torch_utils import set_default_torch_dtype
