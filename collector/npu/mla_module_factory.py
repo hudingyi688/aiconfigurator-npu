@@ -313,8 +313,8 @@ def _create_mla_modules(
         max_position=hf_config.max_position_embeddings,
         base=getattr(hf_config, "rope_theta", 10000.0),
         is_neox_style=False,
-        dtype=torch.bfloat16,
     )
+    rotary_emb.dtype = torch.bfloat16
 
     if q_lora_rank is None:
         q_proj = ColumnParallelLinear(
