@@ -446,7 +446,7 @@ class SimpleIndexer(nn.Module):
         self.softmax_scale = 1.0 / (head_dim ** 0.5)
 
         self.wq_b = nn.Linear(q_lora_rank, n_head * head_dim, bias=False)
-        self.wk = nn.Linear(head_dim, head_dim, bias=False)
+        self.wk = nn.Linear(q_lora_rank, head_dim, bias=False)
         self.weights_proj = nn.Linear(n_head * head_dim, topk_tokens, bias=False)
         self.k_norm = nn.LayerNorm(head_dim)
 
