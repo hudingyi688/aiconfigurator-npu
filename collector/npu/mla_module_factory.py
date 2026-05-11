@@ -188,9 +188,13 @@ def _create_attention_module(
     is_context: bool,
     device: str = "npu:0",
 ):
-    """Create a DeepseekV2MLAAttention module with dummy weights on NPU."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-    from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
+    """Create a DSA attention module with dummy weights on NPU.
+
+    Uses vllm_ascend's AscendMultiHeadLatentAttention which properly creates
+    indexer and all MLA submodules for DSA (Sparse Flash Attention).
+    """
+    from vllm.model_executor.layers.mla import MLAModules
+    from vllm_ascend.ops.mla import AscendMultiHeadLatentAttention
 
     try:
         from vllm.utils.torch_utils import set_default_torch_dtype
@@ -230,43 +234,28 @@ def _create_attention_module(
     hf_config = vllm_config.model_config.hf_config
     hf_config.num_hidden_layers = 1
     num_heads = hf_config.num_attention_heads
+    hidden_size = hf_config.hidden_size
 
-    topk_indices_buffer = None
-    if hasattr(hf_config, "index_topk"):
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        topk_indices_buffer = torch.empty(
-            max_tokens,
-            hf_config.index_topk,
-            dtype=torch.int32,
-            device=device,
-        )
-
-    rotary_emb = get_rope(
-        head_size=hf_config.qk_rope_head_dim,
-        rotary_dim=hf_config.qk_rope_head_dim,
-        max_position=hf_config.max_position_embeddings,
-        base=getattr(hf_config, "rope_theta", 10000.0),
-        is_neox_style=False,
-        dtype=torch.bfloat16,
+    mla_modules = _create_mla_modules(
+        hf_config=hf_config,
+        hidden_size=hidden_size,
+        device=device,
     )
 
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16):
-        attn_module = DeepseekV2MLAAttention(
-            vllm_config=vllm_config,
-            config=hf_config,
-            hidden_size=hf_config.hidden_size,
+        attn_module = AscendMultiHeadLatentAttention(
+            hidden_size=hidden_size,
             num_heads=num_heads,
+            scale=1.0 / (hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim) ** 0.5,
             qk_nope_head_dim=hf_config.qk_nope_head_dim,
             qk_rope_head_dim=hf_config.qk_rope_head_dim,
             v_head_dim=hf_config.v_head_dim,
             q_lora_rank=getattr(hf_config, "q_lora_rank", None),
             kv_lora_rank=hf_config.kv_lora_rank,
-            max_position_embeddings=hf_config.max_position_embeddings,
+            mla_modules=mla_modules,
             cache_config=vllm_config.cache_config,
             quant_config=None,
             prefix="model.layers.0.self_attn",
-            topk_indices_buffer=topk_indices_buffer,
-            rotary_emb=rotary_emb,
         )
 
     if any(p.is_meta for p in attn_module.parameters()):
@@ -288,18 +277,113 @@ def _create_attention_module(
     return attn_module, vllm_config
 
 
+def _create_mla_modules(
+    hf_config,
+    hidden_size: int,
+    device: str = "npu:0",
+) -> "MLAModules":
+    """Create MLAModules with dummy weights for DSA benchmarking."""
+    from vllm.model_executor.layers.linear import RowParallelLinear, ColumnParallelLinear
+    from vllm.model_executor.layers.mla import MLAModules, DeepseekV3Indexer
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    q_lora_rank = getattr(hf_config, "q_lora_rank", None)
+    kv_lora_rank = hf_config.kv_lora_rank
+    qk_nope_head_dim = hf_config.qk_nope_head_dim
+    qk_rope_head_dim = hf_config.qk_rope_head_dim
+    v_head_dim = hf_config.v_head_dim
+    num_heads = hf_config.num_attention_heads
+
+    rotary_emb = get_rope(
+        head_size=qk_rope_head_dim,
+        rotary_dim=qk_rope_head_dim,
+        max_position=hf_config.max_position_embeddings,
+        base=getattr(hf_config, "rope_theta", 10000.0),
+        is_neox_style=False,
+        dtype=torch.bfloat16,
+    )
+
+    if q_lora_rank is None:
+        q_proj = ColumnParallelLinear(
+            hidden_size,
+            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+            bias=False,
+            gather_output=False,
+        )
+        q_b_proj = None
+        kv_a_proj_with_mqa = RowParallelLinear(
+            hidden_size,
+            kv_lora_rank + qk_rope_head_dim,
+            bias=False,
+            input_is_parallel=True,
+        )
+        fused_qkv_a_proj = None
+    else:
+        q_proj = None
+        fused_qkv_a_proj = ColumnParallelLinear(
+            hidden_size,
+            q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+            bias=False,
+            gather_output=False,
+        )
+        q_b_proj = ColumnParallelLinear(
+            q_lora_rank,
+            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+            bias=False,
+            gather_output=False,
+        )
+        kv_a_proj_with_mqa = None
+
+    kv_b_proj = RowParallelLinear(
+        kv_lora_rank,
+        num_heads * (qk_nope_head_dim + v_head_dim),
+        bias=False,
+        input_is_parallel=True,
+    )
+    o_proj = RowParallelLinear(
+        num_heads * v_head_dim,
+        hidden_size,
+        bias=False,
+        input_is_parallel=True,
+    )
+
+    indexer = None
+    if hasattr(hf_config, "index_topk"):
+        indexer = DeepseekV3Indexer(
+            n_head=hf_config.index_n_heads,
+            head_dim=hf_config.index_head_dim,
+            topk_tokens=hf_config.index_topk,
+            q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
+            block_size=64,
+        )
+
+    from vllm.model_executor.layers.norm import RMSNorm
+    q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
+    kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
+
+    return MLAModules(
+        rotary_emb=rotary_emb,
+        fused_qkv_a_proj=fused_qkv_a_proj,
+        q_b_proj=q_b_proj,
+        q_proj=q_proj,
+        kv_a_proj_with_mqa=kv_a_proj_with_mqa,
+        kv_a_layernorm=kv_a_layernorm,
+        q_a_layernorm=q_a_layernorm,
+        kv_b_proj=kv_b_proj,
+        o_proj=o_proj,
+        indexer=indexer,
+        is_sparse=indexer is not None,
+    )
+
+
 def _process_module_weights(attn_module, vllm_config) -> None:
     """Process weights after loading (creates W_UK_T, W_UV for MLA)."""
     from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
     with set_current_vllm_config(vllm_config):
-        for _, module in attn_module.named_modules():
-            if isinstance(module, MLAAttention) and hasattr(
-                module, "process_weights_after_loading"
-            ):
-                module.process_weights_after_loading(
-                    vllm_config.model_config.dtype
-                )
+        mla_attn = attn_module.mla_attn
+        if isinstance(mla_attn, MLAAttention) and hasattr(mla_attn, "process_weights_after_loading"):
+            mla_attn.process_weights_after_loading(vllm_config.model_config.dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════
