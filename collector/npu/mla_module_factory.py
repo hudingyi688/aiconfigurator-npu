@@ -382,7 +382,7 @@ def _create_mla_modules(
                 q_lora_rank=q_lora_rank if q_lora_rank else hidden_size,
             )
 
-    from vllm.model_executor.layers.norm import RMSNorm
+    from vllm.model_executor.layers.layernorm import RMSNorm
     q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
     kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
 
