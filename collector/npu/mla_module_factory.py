@@ -307,14 +307,17 @@ def _create_mla_modules(
     v_head_dim = hf_config.v_head_dim
     num_heads = hf_config.num_attention_heads
 
+    rope_parameters = {
+        "rotary_dim": qk_rope_head_dim,
+        "rope_theta": getattr(hf_config, "rope_theta", 10000.0),
+    }
     rotary_emb = get_rope(
         head_size=qk_rope_head_dim,
-        rotary_dim=qk_rope_head_dim,
         max_position=hf_config.max_position_embeddings,
-        base=getattr(hf_config, "rope_theta", 10000.0),
         is_neox_style=False,
+        rope_parameters=rope_parameters,
+        dtype=torch.bfloat16,
     )
-    rotary_emb.dtype = torch.bfloat16
 
     if q_lora_rank is None:
         q_proj = ColumnParallelLinear(
