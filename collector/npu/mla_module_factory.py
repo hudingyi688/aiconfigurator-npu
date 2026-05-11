@@ -649,16 +649,18 @@ def create_dsa_module_func(
     _stack = ExitStack()
     _stack.enter_context(set_current_vllm_config(vllm_config))
 
+    attn_metadata_dict = {attn_layer_name: attn_metadata}
+
     try:
         from vllm_ascend.ascend_forward_context import set_ascend_forward_context
         _stack.enter_context(set_ascend_forward_context(
-            attn_metadata,
+            attn_metadata_dict,
             vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
         ))
     except ImportError:
-        _stack.enter_context(set_forward_context(attn_metadata, vllm_config))
+        _stack.enter_context(set_forward_context(attn_metadata_dict, vllm_config))
 
     def forward_fn() -> None:
         attn_module.forward(positions, hidden_states, None)
