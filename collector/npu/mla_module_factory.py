@@ -386,6 +386,15 @@ def _create_mla_modules(
     q_a_layernorm = RMSNorm(q_lora_rank, eps=hf_config.rms_norm_eps) if q_lora_rank else None
     kv_a_layernorm = RMSNorm(kv_lora_rank + qk_rope_head_dim, eps=hf_config.rms_norm_eps)
 
+    topk_indices_buffer = None
+    if indexer is not None:
+        topk_indices_buffer = torch.empty(
+            4096,
+            hf_config.index_topk,
+            dtype=torch.int32,
+            device=device,
+        )
+
     return MLAModules(
         rotary_emb=rotary_emb,
         fused_qkv_a_proj=fused_qkv_a_proj,
@@ -398,6 +407,7 @@ def _create_mla_modules(
         o_proj=o_proj,
         indexer=indexer,
         is_sparse=indexer is not None,
+        topk_indices_buffer=topk_indices_buffer,
     )
 
 
