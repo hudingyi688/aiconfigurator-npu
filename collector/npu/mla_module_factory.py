@@ -33,6 +33,57 @@ except ImportError:
 from vllm.config import set_current_vllm_config
 from vllm.forward_context import set_forward_context
 
+os.environ.setdefault("VLLM_ASCEND_ENABLE_MLAPO", "1")
+
+
+class MockW8A8Linear(nn.Module):
+    """Mock W8A8 quantized Linear layer for MLAPO benchmarking.
+    
+    Simulates the structure of AscendW8A8DynamicLinearMethod layers
+    to enable MLAPO fused path, avoiding npu_kv_rmsnorm_rope_cache
+    which only supports last_dim=512 or 192 (GLM-5 uses 576).
+    
+    Weight is stored in transposed format (input_size, output_size)
+    as expected by _process_weights_for_fused_mlapo after
+    AscendW8A8DynamicLinearMethod.process_weights_after_loading.
+    """
+
+    def __init__(self, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        
+        self._input_size = input_size
+        self._output_size = output_size
+        
+        self.weight = nn.Parameter(torch.zeros(input_size, output_size, dtype=torch.int8))
+        self.weight_scale = nn.Parameter(torch.ones(output_size, 1, dtype=dtype))
+        self.weight_offset = nn.Parameter(torch.zeros(output_size, 1, dtype=dtype))
+        self.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
+        self.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
+        
+        self.quant_config = None
+        self.quant_method = self._get_quant_method()
+        
+        with torch.no_grad():
+            self.weight.data.uniform_(-10, 10)
+
+    def _get_quant_method(self):
+        try:
+            from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+            return AscendW8A8DynamicLinearMethod()
+        except ImportError:
+            return None
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        if self.quant_method is not None:
+            try:
+                return self.quant_method.apply(self, x), None
+            except Exception:
+                pass
+        
+        weight_dequant = self.weight.float() * self.weight_scale.float().T + self.weight_offset.float().T
+        output = torch.matmul(x, weight_dequant.to(x.dtype))
+        return output, None
+
 # Patch config registry so AutoConfig resolves glm_moe_dsa → DeepseekV3Config.
 try:
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
@@ -337,18 +388,21 @@ def _create_mla_modules(
         fused_qkv_a_proj = None
     else:
         q_proj = None
-        fused_qkv_a_proj = ColumnParallelLinear(
+        
+        fused_qkv_a_proj_output_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+        fused_qkv_a_proj = MockW8A8Linear(
             hidden_size,
-            q_lora_rank + kv_lora_rank + qk_rope_head_dim,
-            bias=False,
-            gather_output=False,
+            fused_qkv_a_proj_output_size,
+            dtype=torch.bfloat16,
         )
-        q_b_proj = ColumnParallelLinear(
+        
+        q_b_proj_output_size = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        q_b_proj = MockW8A8Linear(
             q_lora_rank,
-            num_heads * (qk_nope_head_dim + qk_rope_head_dim),
-            bias=False,
-            gather_output=False,
+            q_b_proj_output_size,
+            dtype=torch.bfloat16,
         )
+        
         kv_a_proj_with_mqa = None
 
     kv_b_proj = RowParallelLinear(
