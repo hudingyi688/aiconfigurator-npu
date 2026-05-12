@@ -63,26 +63,29 @@ def _ensure_npu_compile_opts() -> None:
     except ImportError:
         return
 
-    # Step 1: bind current thread to a real NPU device — required before
-    # any ACL compile option read/write; otherwise ACL reports 500001.
+    # IMPORTANT: allow_internal_format must be toggled BEFORE set_device
+    # or ACL context locks internal_format=False and later changes are
+    # silently ignored (see the "Cannot create tensor with internal
+    # format" warning). Mirrors model_runner_v1.py:156 which sets this
+    # at module import time, well before any device binding.
+    try:
+        torch.npu.config.allow_internal_format = True
+    except Exception as e:
+        print(f"[WARN] set allow_internal_format failed: {type(e).__name__}: {e}")
+
+    # Bind NPU device.
     try:
         torch.npu.set_device(0)
     except Exception as e:
         print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
 
-    # Step 2: import torch_npu._inductor (worker.py does this when Triton
-    # is available). This appears to finish ACL compile-opt init so that
-    # later AclSetCompileopt calls don't 500001.
+    # Import torch_npu._inductor (worker.py does this when Triton is
+    # available). Appears to finish ACL compile-opt lazy init so later
+    # AclSetCompileopt calls don't 500001.
     try:
         import torch_npu._inductor  # noqa: F401
     except Exception as e:
         print(f"[WARN] import torch_npu._inductor failed: {type(e).__name__}: {e}")
-
-    # Mirror vllm_ascend/worker/model_runner_v1.py:156
-    try:
-        torch.npu.config.allow_internal_format = True
-    except Exception as e:
-        print(f"[WARN] set allow_internal_format failed: {type(e).__name__}: {e}")
 
     # Mirror vllm_ascend/compilation/compiler_interface.py:81
     try:
@@ -90,12 +93,11 @@ def _ensure_npu_compile_opts() -> None:
     except Exception as e:
         print(f"[WARN] set_compile_mode failed: {type(e).__name__}: {e}")
 
-    # Step 5: trigger a tiny NPU op and empty_cache to force ACL
-    # lazy-init to fully complete (what MemorySnapshot() does implicitly
-    # in production worker).
+    # Trigger a tiny NPU op and empty_cache to force ACL lazy-init to
+    # fully complete (what MemorySnapshot() does implicitly in worker).
     try:
         import gc
-        _ = torch.zeros(1, device="npu:0") + 1  # trivial op
+        _ = torch.zeros(1, device="npu:0") + 1
         del _
         gc.collect()
         torch.npu.empty_cache()

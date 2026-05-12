@@ -76,6 +76,18 @@ def _ensure_npu_compile_opts() -> None:
     except ImportError:
         return
 
+    # IMPORTANT: allow_internal_format must be set BEFORE set_device,
+    # otherwise ACL context gets initialized with internal_format=False
+    # and later toggling is silently ignored (producing the warning
+    # "Cannot create tensor with internal format while
+    # allow_internel_format=False"). This matches model_runner_v1.py:156
+    # which sets it at module import time, long before any set_device().
+    try:
+        torch.npu.config.allow_internal_format = True
+        print("[NPU INIT] allow_internal_format=True OK (pre-set_device)", flush=True)
+    except Exception as e:
+        print(f"[NPU INIT] allow_internal_format failed: {type(e).__name__}: {e}", flush=True)
+
     # Verbose so we can see exactly which step trips when things go wrong.
     try:
         torch.npu.set_device(0)
@@ -88,12 +100,6 @@ def _ensure_npu_compile_opts() -> None:
         print("[NPU INIT] torch_npu._inductor imported", flush=True)
     except Exception as e:
         print(f"[NPU INIT] torch_npu._inductor import failed: {type(e).__name__}: {e}", flush=True)
-
-    try:
-        torch.npu.config.allow_internal_format = True
-        print("[NPU INIT] allow_internal_format=True OK", flush=True)
-    except Exception as e:
-        print(f"[NPU INIT] allow_internal_format failed: {type(e).__name__}: {e}", flush=True)
 
     try:
         torch.npu.set_compile_mode(jit_compile=False)
@@ -113,13 +119,15 @@ def _ensure_npu_compile_opts() -> None:
     except Exception as e:
         print(f"[NPU INIT] warmup failed: {type(e).__name__}: {e}", flush=True)
 
-    # Also probe npu_format_cast(29) here so we catch the real failure
-    # at init time instead of deep inside process_weights_after_loading.
+    # Probe npu_format_cast(29) here so we catch the real failure at
+    # init time instead of deep inside process_weights_after_loading.
+    # Check .storage().size() or internal format to confirm NZ took effect.
     try:
         probe = torch.randn(16, 32, dtype=torch.bfloat16, device="npu:0")
-        _ = torch_npu.npu_format_cast(probe, 29)
+        nz = torch_npu.npu_format_cast(probe, 29)
         torch.npu.synchronize()
-        print("[NPU INIT] npu_format_cast(29) probe OK", flush=True)
+        nz_format = torch_npu.get_npu_format(nz) if hasattr(torch_npu, "get_npu_format") else "unknown"
+        print(f"[NPU INIT] npu_format_cast(29) probe OK shape={tuple(nz.shape)} format={nz_format}", flush=True)
     except Exception as e:
         print(f"[NPU INIT] npu_format_cast(29) probe failed: {type(e).__name__}: {e}", flush=True)
 
