@@ -76,33 +76,52 @@ def _ensure_npu_compile_opts() -> None:
     except ImportError:
         return
 
+    # Verbose so we can see exactly which step trips when things go wrong.
     try:
         torch.npu.set_device(0)
+        print("[NPU INIT] set_device(0) OK", flush=True)
     except Exception as e:
-        print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
+        print(f"[NPU INIT] set_device failed: {type(e).__name__}: {e}", flush=True)
 
     try:
         import torch_npu._inductor  # noqa: F401
+        print("[NPU INIT] torch_npu._inductor imported", flush=True)
     except Exception as e:
-        print(f"[WARN] import torch_npu._inductor failed: {type(e).__name__}: {e}")
+        print(f"[NPU INIT] torch_npu._inductor import failed: {type(e).__name__}: {e}", flush=True)
 
     try:
         torch.npu.config.allow_internal_format = True
+        print("[NPU INIT] allow_internal_format=True OK", flush=True)
     except Exception as e:
-        print(f"[WARN] set allow_internal_format failed: {type(e).__name__}: {e}")
+        print(f"[NPU INIT] allow_internal_format failed: {type(e).__name__}: {e}", flush=True)
+
     try:
         torch.npu.set_compile_mode(jit_compile=False)
+        print("[NPU INIT] set_compile_mode(jit_compile=False) OK", flush=True)
     except Exception as e:
-        print(f"[WARN] set_compile_mode failed: {type(e).__name__}: {e}")
+        print(f"[NPU INIT] set_compile_mode failed: {type(e).__name__}: {e}", flush=True)
 
     try:
         import gc
-        _ = torch.zeros(1, device="npu:0") + 1
-        del _
+        t = torch.zeros(1, device="npu:0")
+        t = t + 1
+        torch.npu.synchronize()
+        del t
         gc.collect()
         torch.npu.empty_cache()
+        print("[NPU INIT] warmup op + empty_cache OK", flush=True)
     except Exception as e:
-        print(f"[WARN] NPU warmup failed: {type(e).__name__}: {e}")
+        print(f"[NPU INIT] warmup failed: {type(e).__name__}: {e}", flush=True)
+
+    # Also probe npu_format_cast(29) here so we catch the real failure
+    # at init time instead of deep inside process_weights_after_loading.
+    try:
+        probe = torch.randn(16, 32, dtype=torch.bfloat16, device="npu:0")
+        _ = torch_npu.npu_format_cast(probe, 29)
+        torch.npu.synchronize()
+        print("[NPU INIT] npu_format_cast(29) probe OK", flush=True)
+    except Exception as e:
+        print(f"[NPU INIT] npu_format_cast(29) probe failed: {type(e).__name__}: {e}", flush=True)
 
 
 _ensure_c_ascend_loaded()
