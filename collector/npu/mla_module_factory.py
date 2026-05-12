@@ -46,8 +46,7 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
         
         weight_float = layer.weight.data.float()
         weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
-        weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).to(torch.int8)
-        weight_int8 = weight_int8.transpose(0, 1).contiguous()
+        weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).T.contiguous().to(torch.int8)
         layer.weight.data = weight_int8
         
         layer.register_buffer("weight_scale", weight_scale.to(dtype))
@@ -55,6 +54,8 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
         layer.register_buffer("acln_input_scale", torch.ones(output_size, dtype=dtype))
         layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
         layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
+        layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))
+        layer.register_buffer("input_offset", torch.zeros(1, dtype=dtype))
     except ImportError:
         pass
 
@@ -485,6 +486,7 @@ def _create_mla_modules(
         
         if q_a_layernorm is not None:
             q_a_layernorm.weight.data = q_a_layernorm.weight.data.to(torch.bfloat16)
+            q_a_layernorm.bias = nn.Parameter(torch.zeros(q_lora_rank, dtype=torch.bfloat16))
         kv_a_layernorm.weight.data = kv_a_layernorm.weight.data.to(torch.bfloat16)
 
     target_device = torch.device(device)
