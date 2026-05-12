@@ -813,8 +813,21 @@ def create_dsa_module_func(
 
     try:
         _process_module_weights(attn_module, vllm_config)
-    except Exception:
-        pass  # non-fatal; weights still usable for benchmarking
+    except Exception as e:
+        # If post-loading weight processing fails (most likely inside
+        # _process_weights_for_fused_mlapo due to shape/dtype mismatches
+        # on the synthetic weights), MLAPO fused buffers like wd_qkv
+        # will not exist and the forward pass will AttributeError.
+        # Disable MLAPO on this layer so forward takes the non-fused path.
+        print(
+            f"[WARN] _process_module_weights failed: {type(e).__name__}: {e}. "
+            f"Disabling MLAPO for this module (enable_mlapo=False)."
+        )
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        for _, sub in attn_module.named_modules():
+            if isinstance(sub, MLAAttention) and hasattr(sub, "impl"):
+                if hasattr(sub.impl, "enable_mlapo"):
+                    sub.impl.enable_mlapo = False
 
     hf_config = vllm_config.model_config.hf_config
 
