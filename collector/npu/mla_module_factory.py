@@ -686,7 +686,13 @@ class SimpleIndexer(nn.Module):
 
         self.wq_b = nn.Linear(q_lora_rank, n_head * head_dim, bias=False)
         self._wk_linear = nn.Linear(hidden_size, head_dim, bias=False)
-        self.weights_proj = nn.Linear(n_head * head_dim, topk_tokens, bias=False)
+        # weights_proj takes hidden_states (not wq_b output) as input, and
+        # produces per-head scalar weights used to combine q_li per head.
+        # See vllm_ascend/attention/sfa_v1.py:956 where
+        #   weights, _ = self.weights_proj(x)
+        # and x is hidden_states with last dim = hidden_size.
+        # Output dim is n_head (one weight per indexer head), NOT topk_tokens.
+        self.weights_proj = nn.Linear(hidden_size, n_head, bias=False)
         self.k_norm = nn.LayerNorm(head_dim)
         
         with torch.no_grad():
