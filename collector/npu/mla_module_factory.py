@@ -39,19 +39,19 @@ os.environ.setdefault("VLLM_ASCEND_ENABLE_MLAPO", "1")
 def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
     """Setup W8A8 quantization attributes on a linear layer for MLAPO path."""
     try:
-        from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-        qm = AscendW8A8DynamicLinearMethod()
+        from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+        qm = AscendW8A8LinearMethod()
         qm.quant_method = qm
         layer.quant_method = qm
         
         weight_float = layer.weight.data.float()
-        weight_scale = weight_float.abs().max(dim=1, keepdim=True).values.clamp(min=1e-5)
-        weight_int8 = (weight_float / weight_scale).round().clamp(-127, 127).to(torch.int8)
+        weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
+        weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).to(torch.int8)
         weight_int8 = weight_int8.transpose(0, 1).contiguous()
         layer.weight.data = weight_int8
         
         layer.register_buffer("weight_scale", weight_scale.to(dtype))
-        layer.register_buffer("weight_offset", torch.zeros(output_size, 1, dtype=dtype))
+        layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
         layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
         layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
     except ImportError:
@@ -78,11 +78,12 @@ class MockW8A8Linear(nn.Module):
         
         weight_float = torch.zeros(output_size, input_size, dtype=torch.float32)
         weight_float.uniform_(-1.0, 1.0)
-        weight_data = (weight_float * 127).clamp(-127, 127).round().to(torch.int8)
+        weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
+        weight_data = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).to(torch.int8)
         self.register_buffer("weight", weight_data)
         
-        self.weight_scale = nn.Parameter(torch.ones(output_size, 1, dtype=dtype))
-        self.weight_offset = nn.Parameter(torch.zeros(output_size, 1, dtype=dtype))
+        self.weight_scale = nn.Parameter(weight_scale.to(dtype))
+        self.weight_offset = nn.Parameter(torch.zeros(output_size, dtype=dtype))
         self.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
         self.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
         
@@ -94,8 +95,8 @@ class MockW8A8Linear(nn.Module):
 
     def _get_quant_method(self):
         try:
-            from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-            return AscendW8A8DynamicLinearMethod()
+            from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+            return AscendW8A8LinearMethod()
         except ImportError:
             return None
 
@@ -106,7 +107,7 @@ class MockW8A8Linear(nn.Module):
             except Exception:
                 pass
         
-        weight_dequant = self.weight.float() * self.weight_scale.float() + self.weight_offset.float()
+        weight_dequant = self.weight.float() * self.weight_scale.float().unsqueeze(1) + self.weight_offset.float().unsqueeze(1)
         output = torch.matmul(x, weight_dequant.T.to(x.dtype))
         return output, None
 
