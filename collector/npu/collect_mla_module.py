@@ -54,7 +54,31 @@ def _ensure_c_ascend_loaded() -> None:
             print(f"[WARN] failed to load {so}: {e}")
 
 
+def _ensure_npu_compile_opts() -> None:
+    """Apply NPU compile options that model_runner_v1 / worker would set.
+
+    AIConfigurator builds vllm_config manually and skips engine startup,
+    so ACL_PRECISION_MODE / ACL_OP_JIT_COMPILE stay unconfigured. When
+    MLAPO's process_weights_after_loading calls
+    npu_format_cast(wd_qkv, 29) it then errors with 500001.
+    """
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return
+
+    try:
+        torch.npu.config.allow_internal_format = True
+    except Exception as e:
+        print(f"[WARN] set allow_internal_format failed: {type(e).__name__}: {e}")
+    try:
+        torch.npu.set_compile_mode(jit_compile=False)
+    except Exception as e:
+        print(f"[WARN] set_compile_mode failed: {type(e).__name__}: {e}")
+
+
 _ensure_c_ascend_loaded()
+_ensure_npu_compile_opts()
 
 from bench_engine import BenchResult, benchmark_npu
 from gemm_factory import _init_vllm_context
