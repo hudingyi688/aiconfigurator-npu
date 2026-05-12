@@ -36,6 +36,28 @@ from vllm.forward_context import set_forward_context
 os.environ.setdefault("VLLM_ASCEND_ENABLE_MLAPO", "1")
 
 
+def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
+    """Setup W8A8 quantization attributes on a linear layer for MLAPO path."""
+    try:
+        from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+        qm = AscendW8A8DynamicLinearMethod()
+        qm.quant_method = qm
+        layer.quant_method = qm
+        
+        weight_float = layer.weight.data.float()
+        weight_scale = weight_float.abs().max(dim=1, keepdim=True).values.clamp(min=1e-5)
+        weight_int8 = (weight_float / weight_scale).round().clamp(-127, 127).to(torch.int8)
+        weight_int8 = weight_int8.transpose(0, 1).contiguous()
+        layer.weight.data = weight_int8
+        
+        layer.register_buffer("weight_scale", weight_scale.to(dtype))
+        layer.register_buffer("weight_offset", torch.zeros(output_size, 1, dtype=dtype))
+        layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
+        layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
+    except ImportError:
+        pass
+
+
 class MockW8A8Linear(nn.Module):
     """Mock W8A8 quantized Linear layer for MLAPO benchmarking.
     
@@ -54,7 +76,7 @@ class MockW8A8Linear(nn.Module):
         self._input_size = input_size
         self._output_size = output_size
         
-        weight_float = torch.zeros(input_size, output_size, dtype=torch.float32)
+        weight_float = torch.zeros(output_size, input_size, dtype=torch.float32)
         weight_float.uniform_(-1.0, 1.0)
         weight_data = (weight_float * 127).clamp(-127, 127).round().to(torch.int8)
         self.register_buffer("weight", weight_data)
@@ -65,7 +87,10 @@ class MockW8A8Linear(nn.Module):
         self.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
         
         self.quant_config = None
-        self.quant_method = self._get_quant_method()
+        qm = self._get_quant_method()
+        if qm is not None:
+            qm.quant_method = qm
+        self.quant_method = qm
 
     def _get_quant_method(self):
         try:
@@ -81,8 +106,8 @@ class MockW8A8Linear(nn.Module):
             except Exception:
                 pass
         
-        weight_dequant = self.weight.float() * self.weight_scale.float().T + self.weight_offset.float().T
-        output = torch.matmul(x, weight_dequant.to(x.dtype))
+        weight_dequant = self.weight.float() * self.weight_scale.float() + self.weight_offset.float()
+        output = torch.matmul(x, weight_dequant.T.to(x.dtype))
         return output, None
 
 # Patch config registry so AutoConfig resolves glm_moe_dsa → DeepseekV3Config.
@@ -391,18 +416,23 @@ def _create_mla_modules(
         q_proj = None
         
         fused_qkv_a_proj_output_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
-        fused_qkv_a_proj = MockW8A8Linear(
+        fused_qkv_a_proj = ColumnParallelLinear(
             hidden_size,
             fused_qkv_a_proj_output_size,
-            dtype=torch.bfloat16,
+            bias=False,
+            gather_output=False,
         )
         
         q_b_proj_output_size = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        q_b_proj = MockW8A8Linear(
+        q_b_proj = ColumnParallelLinear(
             q_lora_rank,
             q_b_proj_output_size,
-            dtype=torch.bfloat16,
+            bias=False,
+            gather_output=False,
         )
+        
+        _setup_w8a8_quant_method(fused_qkv_a_proj, hidden_size, fused_qkv_a_proj_output_size)
+        _setup_w8a8_quant_method(q_b_proj, q_lora_rank, q_b_proj_output_size)
         
         kv_a_proj_with_mqa = None
 
