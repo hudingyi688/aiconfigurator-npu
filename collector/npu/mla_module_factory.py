@@ -55,6 +55,8 @@ def _ensure_npu_compile_opts() -> None:
     set_compile_mode, MLAPO's process_weights_after_loading hits
     'AclSetCompileopt ... ACL_PRECISION_MODE error 500001' when it calls
     npu_format_cast(wd_qkv, 29) for the MLAPO NZ layout.
+
+    Mirrors vllm_ascend/worker/worker.py:_init_device() ordering.
     """
     try:
         import torch_npu  # noqa: F401
@@ -68,6 +70,14 @@ def _ensure_npu_compile_opts() -> None:
     except Exception as e:
         print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
 
+    # Step 2: import torch_npu._inductor (worker.py does this when Triton
+    # is available). This appears to finish ACL compile-opt init so that
+    # later AclSetCompileopt calls don't 500001.
+    try:
+        import torch_npu._inductor  # noqa: F401
+    except Exception as e:
+        print(f"[WARN] import torch_npu._inductor failed: {type(e).__name__}: {e}")
+
     # Mirror vllm_ascend/worker/model_runner_v1.py:156
     try:
         torch.npu.config.allow_internal_format = True
@@ -79,6 +89,18 @@ def _ensure_npu_compile_opts() -> None:
         torch.npu.set_compile_mode(jit_compile=False)
     except Exception as e:
         print(f"[WARN] set_compile_mode failed: {type(e).__name__}: {e}")
+
+    # Step 5: trigger a tiny NPU op and empty_cache to force ACL
+    # lazy-init to fully complete (what MemorySnapshot() does implicitly
+    # in production worker).
+    try:
+        import gc
+        _ = torch.zeros(1, device="npu:0") + 1  # trivial op
+        del _
+        gc.collect()
+        torch.npu.empty_cache()
+    except Exception as e:
+        print(f"[WARN] NPU warmup failed: {type(e).__name__}: {e}")
 
 
 _ensure_c_ascend_loaded()
@@ -848,15 +870,14 @@ def create_dsa_module_func(
     try:
         _process_module_weights(attn_module, vllm_config)
     except Exception as e:
-        # If post-loading weight processing fails (most likely inside
-        # _process_weights_for_fused_mlapo due to shape/dtype mismatches
-        # on the synthetic weights), MLAPO fused buffers like wd_qkv
-        # will not exist and the forward pass will AttributeError.
-        # Disable MLAPO on this layer so forward takes the non-fused path.
+        # Log full traceback so we can see which NPU op inside
+        # process_weights_after_loading triggers ACL errors.
+        import traceback
         print(
             f"[WARN] _process_module_weights failed: {type(e).__name__}: {e}. "
             f"Disabling MLAPO for this module (enable_mlapo=False)."
         )
+        traceback.print_exc()
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
         for _, sub in attn_module.named_modules():
             if isinstance(sub, MLAAttention) and hasattr(sub, "impl"):

@@ -55,7 +55,7 @@ def _ensure_c_ascend_loaded() -> None:
 
 
 def _ensure_npu_compile_opts() -> None:
-    """Apply NPU compile options that model_runner_v1 / worker would set.
+    """Apply NPU init sequence that model_runner_v1 / worker would set.
 
     AIConfigurator builds vllm_config manually and skips engine startup,
     so ACL_PRECISION_MODE / ACL_OP_JIT_COMPILE stay unconfigured and the
@@ -64,23 +64,28 @@ def _ensure_npu_compile_opts() -> None:
     any NPU op, ACL then errors with 500001 SetPrecisionMode /
     ACL_OP_JIT_COMPILE.
 
-    Mirror worker/worker.py:_init_device():
-      1) torch.npu.set_device(device)          ← must come first
-      2) torch.npu.config.allow_internal_format = True
-      3) torch.npu.set_compile_mode(jit_compile=False)
+    Mirrors vllm_ascend/worker/worker.py:_init_device():
+      1) torch.npu.set_device(device)
+      2) import torch_npu._inductor (warms ACL compile-opt init)
+      3) torch.npu.config.allow_internal_format = True
+      4) torch.npu.set_compile_mode(jit_compile=False)
+      5) trivial NPU op + empty_cache to finish ACL lazy-init
     """
     try:
         import torch_npu  # noqa: F401
     except ImportError:
         return
 
-    # Step 1: bind current thread to a real NPU device
     try:
         torch.npu.set_device(0)
     except Exception as e:
         print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
 
-    # Step 2+3: ACL compile options
+    try:
+        import torch_npu._inductor  # noqa: F401
+    except Exception as e:
+        print(f"[WARN] import torch_npu._inductor failed: {type(e).__name__}: {e}")
+
     try:
         torch.npu.config.allow_internal_format = True
     except Exception as e:
@@ -89,6 +94,15 @@ def _ensure_npu_compile_opts() -> None:
         torch.npu.set_compile_mode(jit_compile=False)
     except Exception as e:
         print(f"[WARN] set_compile_mode failed: {type(e).__name__}: {e}")
+
+    try:
+        import gc
+        _ = torch.zeros(1, device="npu:0") + 1
+        del _
+        gc.collect()
+        torch.npu.empty_cache()
+    except Exception as e:
+        print(f"[WARN] NPU warmup failed: {type(e).__name__}: {e}")
 
 
 _ensure_c_ascend_loaded()
