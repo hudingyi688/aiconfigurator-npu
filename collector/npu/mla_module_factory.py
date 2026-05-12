@@ -54,8 +54,9 @@ class MockW8A8Linear(nn.Module):
         self._input_size = input_size
         self._output_size = output_size
         
-        weight_data = torch.zeros(input_size, output_size, dtype=torch.int8)
-        weight_data.uniform_(-10, 10)
+        weight_float = torch.zeros(input_size, output_size, dtype=torch.float32)
+        weight_float.uniform_(-1.0, 1.0)
+        weight_data = (weight_float * 127).clamp(-127, 127).round().to(torch.int8)
         self.register_buffer("weight", weight_data)
         
         self.weight_scale = nn.Parameter(torch.ones(output_size, 1, dtype=dtype))
