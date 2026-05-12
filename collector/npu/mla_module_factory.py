@@ -786,10 +786,21 @@ def _create_kv_cache_and_metadata(
     kv_lora_rank = hf_config.kv_lora_rank
     qk_rope_head_dim = hf_config.qk_rope_head_dim
     index_head_dim = getattr(hf_config, "index_head_dim", 128)
+    # sparse_count is the number of KV slots lightning_indexer must pick
+    # from the cache; the kernel will index into kv_cache[0..num_blocks*bs-1]
+    # assuming that many valid slots exist. Without this reserve the kernel
+    # reads out of bounds and segfaults when seq_len is small.
+    index_topk = getattr(hf_config, "index_topk", 2048)
     block_size = vllm_config.cache_config.block_size
 
     blocks_per_seq = math.ceil(seq_len / block_size)
-    num_blocks = max(batch_size * blocks_per_seq, 8)
+    # num_blocks must satisfy:
+    #   1) cover every query token in block_table (batch_size * blocks_per_seq)
+    #   2) hold at least index_topk slots so sparse_flash_attention's gather
+    #      stays in-bounds (num_blocks * block_size >= index_topk)
+    #   3) a small floor so kernels with static tiling don't underflow
+    min_blocks_for_topk = math.ceil(index_topk / block_size)
+    num_blocks = max(batch_size * blocks_per_seq, min_blocks_for_topk, 8)
 
     kv_nope = torch.zeros(
         num_blocks, block_size, 1, kv_lora_rank,
@@ -810,9 +821,15 @@ def _create_kv_cache_and_metadata(
 
     kv_cache_tuple = (kv_nope, kv_pe, k_li)
 
-    block_table = torch.arange(
-        batch_size * blocks_per_seq, dtype=torch.int32, device=device
-    ).reshape(batch_size, blocks_per_seq)
+    # block_table must advertise enough blocks so downstream sparse kernels
+    # can gather up to index_topk tokens (= ceil(index_topk / block_size)
+    # blocks) per query. We tile num_blocks across each row.
+    blocks_per_row = max(blocks_per_seq, min_blocks_for_topk)
+    # Wrap-around so every entry is in [0, num_blocks).
+    block_table = (
+        torch.arange(batch_size * blocks_per_row, dtype=torch.int32, device=device)
+        % num_blocks
+    ).reshape(batch_size, blocks_per_row)
 
     if is_context:
         num_tokens = batch_size * seq_len
