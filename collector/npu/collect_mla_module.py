@@ -25,6 +25,37 @@ try:
 except ImportError:
     pass
 
+
+def _ensure_c_ascend_loaded() -> None:
+    """Force-load vllm_ascend_C.so so torch.ops._C_ascend.* are available.
+
+    vllm-ascend only dlopens this extension lazily via
+    `from vllm_ascend.vllm_ascend_C import init_module` inside
+    device_allocator/camem.py, wrapped in try/except. If that import
+    fails, the extension — and every op registered via
+    TORCH_LIBRARY(_C_ascend, ...) — silently never loads. The DSA
+    collector needs mla_preprocess / npu_sparse_flash_attention /
+    npu_lightning_indexer[_quant], so we load it explicitly.
+    """
+    import glob
+    import os
+
+    try:
+        import vllm_ascend  # type: ignore
+    except ImportError:
+        return
+
+    root = os.path.dirname(vllm_ascend.__file__)
+    candidates = sorted(glob.glob(os.path.join(root, "vllm_ascend_C*.so")))
+    for so in candidates:
+        try:
+            torch.ops.load_library(so)
+        except Exception as e:
+            print(f"[WARN] failed to load {so}: {e}")
+
+
+_ensure_c_ascend_loaded()
+
 from bench_engine import BenchResult, benchmark_npu
 from gemm_factory import _init_vllm_context
 from mla_module_factory import (

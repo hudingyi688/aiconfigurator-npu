@@ -30,6 +30,26 @@ try:
 except ImportError:
     pass
 
+
+def _ensure_c_ascend_loaded() -> None:
+    """Force-load vllm_ascend_C.so — see collect_mla_module.py for rationale."""
+    import glob
+
+    try:
+        import vllm_ascend  # type: ignore
+    except ImportError:
+        return
+
+    root = os.path.dirname(vllm_ascend.__file__)
+    for so in sorted(glob.glob(os.path.join(root, "vllm_ascend_C*.so"))):
+        try:
+            torch.ops.load_library(so)
+        except Exception as e:
+            print(f"[WARN] failed to load {so}: {e}")
+
+
+_ensure_c_ascend_loaded()
+
 from vllm.config import set_current_vllm_config
 from vllm.forward_context import set_forward_context
 
