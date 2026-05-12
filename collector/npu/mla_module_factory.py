@@ -383,6 +383,12 @@ def _create_mla_modules(
                 hidden_size=hidden_size,
             )
         indexer = indexer.to(torch.device(device))
+        
+        if hasattr(indexer, "k_norm"):
+            with torch.no_grad():
+                indexer.k_norm.weight.data = indexer.k_norm.weight.data.to(torch.bfloat16)
+                if indexer.k_norm.bias is not None:
+                    indexer.k_norm.bias.data = indexer.k_norm.bias.data.to(torch.bfloat16)
 
     from vllm.model_executor.layers.layernorm import RMSNorm
     
