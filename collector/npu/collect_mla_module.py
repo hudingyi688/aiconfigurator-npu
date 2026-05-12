@@ -250,8 +250,7 @@ def main():
     )
     parser.add_argument(
         "--model", type=str, default="zai-org/GLM-5",
-        choices=list(SUPPORTED_MODELS.keys()),
-        help="Model to benchmark",
+        help="Model to benchmark (HuggingFace name or local path)",
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Single batch size (--quick)")
     parser.add_argument("--seq-len", type=int, default=None, help="Single seq len (--quick)")
