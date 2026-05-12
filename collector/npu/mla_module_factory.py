@@ -793,12 +793,13 @@ def _create_kv_cache_and_metadata(
     index_topk = getattr(hf_config, "index_topk", 2048)
     block_size = vllm_config.cache_config.block_size
 
-    blocks_per_seq = math.ceil(seq_len / block_size)
-    # num_blocks must satisfy:
-    #   1) cover every query token in block_table (batch_size * blocks_per_seq)
-    #   2) hold at least index_topk slots so sparse_flash_attention's gather
-    #      stays in-bounds (num_blocks * block_size >= index_topk)
-    #   3) a small floor so kernels with static tiling don't underflow
+    # KV length seen by the kernels must be >= sparse_count so
+    # npu_lightning_indexer / npu_sparse_flash_attention can actually pick
+    # index_topk tokens without reading past the valid key region.
+    # The query length ("seq_len") stays as-is. This mirrors real prefill
+    # where a short query attends over a long KV history.
+    kv_seq_len = max(seq_len, index_topk)
+    blocks_per_seq = math.ceil(kv_seq_len / block_size)
     min_blocks_for_topk = math.ceil(index_topk / block_size)
     num_blocks = max(batch_size * blocks_per_seq, min_blocks_for_topk, 8)
 
@@ -833,7 +834,10 @@ def _create_kv_cache_and_metadata(
 
     if is_context:
         num_tokens = batch_size * seq_len
-        seq_lens = torch.tensor([seq_len] * batch_size, dtype=torch.int32, device=device)
+        # seq_lens advertises the KV length (= kv_seq_len), not the query
+        # length. This lets sparse kernels pick index_topk tokens.
+        seq_lens = torch.tensor([kv_seq_len] * batch_size, dtype=torch.int32, device=device)
+        # cum_query_lens is the cumulative sum of per-request query lengths.
         cum_query_lens = torch.arange(
             seq_len, num_tokens + 1, seq_len, dtype=torch.int32, device=device
         )
@@ -860,7 +864,8 @@ def _create_kv_cache_and_metadata(
         )
     else:
         num_tokens = batch_size
-        seq_lens = torch.tensor([seq_len] * batch_size, dtype=torch.int32, device=device)
+        # seq_lens = KV length, same rationale as the prefill branch.
+        seq_lens = torch.tensor([kv_seq_len] * batch_size, dtype=torch.int32, device=device)
         cum_query_lens = torch.arange(1, batch_size + 1, dtype=torch.int32, device=device)
         slot_mapping = torch.arange(batch_size, dtype=torch.int32, device=device)
         cos = torch.ones(num_tokens, 1, 1, qk_rope_head_dim, dtype=torch.bfloat16, device=device)
