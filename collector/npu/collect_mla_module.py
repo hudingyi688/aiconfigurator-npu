@@ -76,13 +76,7 @@ def _ensure_npu_compile_opts() -> None:
 
     # Step 1: bind current thread to a real NPU device
     try:
-        dev_idx = 0
-        visible = os.environ.get("ASCEND_VISIBLE_DEVICES") or os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-        if visible:
-            # Pick the first visible device (after ASCEND_VISIBLE_DEVICES remap,
-            # it is always index 0 from torch_npu's perspective).
-            dev_idx = 0
-        torch.npu.set_device(dev_idx)
+        torch.npu.set_device(0)
     except Exception as e:
         print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
 
