@@ -54,7 +54,10 @@ class MockW8A8Linear(nn.Module):
         self._input_size = input_size
         self._output_size = output_size
         
-        self.weight = nn.Parameter(torch.zeros(input_size, output_size, dtype=torch.int8))
+        weight_data = torch.zeros(input_size, output_size, dtype=torch.int8)
+        weight_data.uniform_(-10, 10)
+        self.register_buffer("weight", weight_data)
+        
         self.weight_scale = nn.Parameter(torch.ones(output_size, 1, dtype=dtype))
         self.weight_offset = nn.Parameter(torch.zeros(output_size, 1, dtype=dtype))
         self.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
@@ -62,9 +65,6 @@ class MockW8A8Linear(nn.Module):
         
         self.quant_config = None
         self.quant_method = self._get_quant_method()
-        
-        with torch.no_grad():
-            self.weight.data.uniform_(-10, 10)
 
     def _get_quant_method(self):
         try:
