@@ -37,34 +37,63 @@ os.environ.setdefault("VLLM_ASCEND_ENABLE_MLAPO", "1")
 
 
 def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
-    """Setup W8A8 quantization attributes on a linear layer for MLAPO path."""
+    """Setup W8A8 static quant attributes on a linear layer.
+
+    Mirrors the post-loading state produced by
+    AscendW8A8LinearMethod.process_weights_after_loading so that
+    apply() → torch.ops.vllm.quantize + torch_npu.npu_quant_matmul work.
+    """
     quant_method_cls = None
     try:
         from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
         quant_method_cls = AscendW8A8LinearMethod
     except ImportError:
         print(f"[WARNING] AscendW8A8LinearMethod not found, MLAPO may not work")
-    
+
     if quant_method_cls is not None:
         qm = quant_method_cls()
         qm.quant_method = qm
         layer.quant_method = qm
-    
+
+    # weight: int8, stored as (input_size, output_size) after transpose in
+    # process_weights_after_loading. We synthesize it directly in that layout.
     weight_float = layer.weight.data.float()
-    weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
-    weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).T.contiguous().to(torch.int8)
+    weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)   # (output_size,)
+    weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127)
+    weight_int8 = weight_int8.T.contiguous().to(torch.int8)               # (input_size, output_size)
     layer.weight.data = weight_int8
-    
-    layer.register_buffer("weight_scale", weight_scale.to(dtype))
+
+    # per-channel weight params (flattened to 1-D as post-loading does)
+    layer.register_buffer("weight_scale", weight_scale.to(dtype))          # bf16, (output_size,)
     layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
-    aclnn_input_scale = torch.ones(1, dtype=dtype)
-    layer.register_buffer("aclnn_input_scale", aclnn_input_scale)
-    layer.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
-    layer.register_buffer("aclnn_input_offset", torch.zeros(1, dtype=dtype))
-    layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
-    layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
-    layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))
-    layer.register_buffer("input_offset", torch.zeros(1, dtype=dtype))
+
+    # per-tensor activation params
+    layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))       # bf16, (1,)
+    layer.register_buffer("input_offset", torch.zeros(1, dtype=torch.int8))  # int8, (1,)
+
+    # aclnn_* are per-input-channel, shape = (input_size,). dtype = activation dtype (bf16).
+    aclnn_scale = layer.input_scale.data.repeat(input_size).to(dtype)      # (input_size,)
+    layer.aclnn_input_scale = nn.Parameter(aclnn_scale, requires_grad=False)
+    layer.aclnn_input_scale_reciprocal = nn.Parameter(
+        (1.0 / aclnn_scale).contiguous(), requires_grad=False
+    )
+    layer.aclnn_input_offset = nn.Parameter(
+        layer.input_offset.data.repeat(input_size).to(dtype), requires_grad=False
+    )
+
+    # deq_scale: bf16 activation path uses float32; fp16 path uses int64 packed scale.
+    deq_scale_dtype = torch.float32 if dtype == torch.bfloat16 else torch.int64
+    deq_scale_val = (layer.input_scale.data.to(torch.float32)
+                     * layer.weight_scale.data.to(torch.float32))           # (output_size,)
+    layer.deq_scale = nn.Parameter(deq_scale_val.to(deq_scale_dtype), requires_grad=False)
+
+    # quant_bias: int32, (output_size,)
+    layer.quant_bias = nn.Parameter(
+        torch.zeros(output_size, dtype=torch.int32), requires_grad=False
+    )
+
+    # npu_quant_matmul reads layer.params_dtype as output dtype
+    layer.params_dtype = dtype
 
 
 class MockW8A8Linear(nn.Module):
@@ -81,27 +110,43 @@ class MockW8A8Linear(nn.Module):
 
     def __init__(self, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
         super().__init__()
-        
+
         self._input_size = input_size
         self._output_size = output_size
-        
+
         weight_float = torch.zeros(output_size, input_size, dtype=torch.float32)
         weight_float.uniform_(-1.0, 1.0)
         weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
-        weight_data = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).to(torch.int8)
+        # int8 weight in (input_size, output_size) layout (post-loading shape)
+        weight_data = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127)
+        weight_data = weight_data.T.contiguous().to(torch.int8)
         self.register_buffer("weight", weight_data)
-        
+
         self.register_buffer("weight_scale", weight_scale.to(dtype))
         self.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
-        aclnn_input_scale = torch.ones(1, dtype=dtype)
-        self.register_buffer("aclnn_input_scale", aclnn_input_scale)
-        self.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
-        self.register_buffer("aclnn_input_offset", torch.zeros(1, dtype=dtype))
-        self.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
-        self.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
+
         self.register_buffer("input_scale", torch.ones(1, dtype=dtype))
-        self.register_buffer("input_offset", torch.zeros(1, dtype=dtype))
-        
+        self.register_buffer("input_offset", torch.zeros(1, dtype=torch.int8))
+
+        aclnn_scale = self.input_scale.data.repeat(input_size).to(dtype)
+        self.aclnn_input_scale = nn.Parameter(aclnn_scale, requires_grad=False)
+        self.aclnn_input_scale_reciprocal = nn.Parameter(
+            (1.0 / aclnn_scale).contiguous(), requires_grad=False
+        )
+        self.aclnn_input_offset = nn.Parameter(
+            self.input_offset.data.repeat(input_size).to(dtype), requires_grad=False
+        )
+
+        deq_scale_dtype = torch.float32 if dtype == torch.bfloat16 else torch.int64
+        deq_scale_val = (self.input_scale.data.to(torch.float32)
+                         * self.weight_scale.data.to(torch.float32))
+        self.deq_scale = nn.Parameter(deq_scale_val.to(deq_scale_dtype), requires_grad=False)
+        self.quant_bias = nn.Parameter(
+            torch.zeros(output_size, dtype=torch.int32), requires_grad=False
+        )
+
+        self.params_dtype = dtype
+
         self.quant_config = None
         qm = self._get_quant_method()
         if qm is not None:
