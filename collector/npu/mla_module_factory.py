@@ -51,7 +51,9 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
         
         layer.register_buffer("weight_scale", weight_scale.to(dtype))
         layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
-        layer.register_buffer("aclnn_input_scale", torch.ones(output_size, dtype=dtype))
+        aclnn_input_scale = torch.ones(output_size, dtype=dtype)
+        layer.register_buffer("aclnn_input_scale", aclnn_input_scale)
+        layer.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
         layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
         layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
         layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))
@@ -86,7 +88,9 @@ class MockW8A8Linear(nn.Module):
         
         self.register_buffer("weight_scale", weight_scale.to(dtype))
         self.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
-        self.register_buffer("aclnn_input_scale", torch.ones(output_size, dtype=dtype))
+        aclnn_input_scale = torch.ones(output_size, dtype=dtype)
+        self.register_buffer("aclnn_input_scale", aclnn_input_scale)
+        self.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
         self.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
         self.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
         self.register_buffer("input_scale", torch.ones(1, dtype=dtype))
