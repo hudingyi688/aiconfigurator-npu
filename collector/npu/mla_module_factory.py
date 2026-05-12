@@ -829,6 +829,31 @@ def create_dsa_module_func(
                 if hasattr(sub.impl, "enable_mlapo"):
                     sub.impl.enable_mlapo = False
 
+    # Diagnostic: report the MLAPO decision made by process_weights_after_loading
+    # so we can see why forward takes the non-MLAPO branch (which then hits
+    # npu_kv_rmsnorm_rope_cache's last_dim in {512,192} limitation on GLM-5).
+    try:
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+        from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
+        for name, sub in attn_module.named_modules():
+            if isinstance(sub, MLAAttention) and hasattr(sub, "impl"):
+                impl = sub.impl
+                fqa = getattr(impl, "fused_qkv_a_proj", None)
+                qm_wrap = getattr(fqa, "quant_method", None) if fqa is not None else None
+                qm_inner = getattr(qm_wrap, "quant_method", None)
+                print(
+                    f"[MLAPO DIAG {name}] "
+                    f"enable_mlapo={getattr(impl, 'enable_mlapo', None)} "
+                    f"enable_dsa_cp={getattr(impl, 'enable_dsa_cp', None)} "
+                    f"has_wd_qkv={hasattr(impl, 'wd_qkv')} "
+                    f"fused_qkv_a_proj={'set' if fqa is not None else 'None'} "
+                    f"qm_wrap_type={type(qm_wrap).__name__ if qm_wrap is not None else 'None'} "
+                    f"qm_inner_type={type(qm_inner).__name__ if qm_inner is not None else 'None'} "
+                    f"isinstance_W8A8={isinstance(qm_inner, AscendW8A8LinearMethod)}"
+                )
+    except Exception as e:
+        print(f"[MLAPO DIAG] introspection failed: {type(e).__name__}: {e}")
+
     hf_config = vllm_config.model_config.hf_config
 
     with set_current_vllm_config(vllm_config):
