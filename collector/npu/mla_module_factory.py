@@ -51,15 +51,22 @@ def _ensure_c_ascend_loaded() -> None:
 def _ensure_npu_compile_opts() -> None:
     """Apply NPU compile options that vllm-ascend normally sets inside
     model_runner_v1 / worker. AIConfigurator builds vllm_config manually
-    and skips those paths, so process_weights_after_loading hits
+    and skips those paths; without set_device + allow_internal_format +
+    set_compile_mode, MLAPO's process_weights_after_loading hits
     'AclSetCompileopt ... ACL_PRECISION_MODE error 500001' when it calls
-    npu_format_cast(wd_qkv, 29) for the MLAPO NZ layout. Setting these
-    here before we touch the engine mirrors what model_runner does.
+    npu_format_cast(wd_qkv, 29) for the MLAPO NZ layout.
     """
     try:
         import torch_npu  # noqa: F401
     except ImportError:
         return
+
+    # Step 1: bind current thread to a real NPU device — required before
+    # any ACL compile option read/write; otherwise ACL reports 500001.
+    try:
+        torch.npu.set_device(0)
+    except Exception as e:
+        print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
 
     # Mirror vllm_ascend/worker/model_runner_v1.py:156
     try:

@@ -58,15 +58,35 @@ def _ensure_npu_compile_opts() -> None:
     """Apply NPU compile options that model_runner_v1 / worker would set.
 
     AIConfigurator builds vllm_config manually and skips engine startup,
-    so ACL_PRECISION_MODE / ACL_OP_JIT_COMPILE stay unconfigured. When
-    MLAPO's process_weights_after_loading calls
-    npu_format_cast(wd_qkv, 29) it then errors with 500001.
+    so ACL_PRECISION_MODE / ACL_OP_JIT_COMPILE stay unconfigured and the
+    current NPU device is never bound. When
+    process_weights_after_loading calls npu_format_cast(wd_qkv, 29) or
+    any NPU op, ACL then errors with 500001 SetPrecisionMode /
+    ACL_OP_JIT_COMPILE.
+
+    Mirror worker/worker.py:_init_device():
+      1) torch.npu.set_device(device)          ← must come first
+      2) torch.npu.config.allow_internal_format = True
+      3) torch.npu.set_compile_mode(jit_compile=False)
     """
     try:
         import torch_npu  # noqa: F401
     except ImportError:
         return
 
+    # Step 1: bind current thread to a real NPU device
+    try:
+        dev_idx = 0
+        visible = os.environ.get("ASCEND_VISIBLE_DEVICES") or os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+        if visible:
+            # Pick the first visible device (after ASCEND_VISIBLE_DEVICES remap,
+            # it is always index 0 from torch_npu's perspective).
+            dev_idx = 0
+        torch.npu.set_device(dev_idx)
+    except Exception as e:
+        print(f"[WARN] torch.npu.set_device failed: {type(e).__name__}: {e}")
+
+    # Step 2+3: ACL compile options
     try:
         torch.npu.config.allow_internal_format = True
     except Exception as e:
