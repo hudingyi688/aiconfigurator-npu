@@ -666,6 +666,26 @@ def _create_mla_modules(
     )
 
 
+class _TupleLinear(nn.Module):
+    """nn.Linear wrapper whose __call__ returns (output, None).
+
+    vllm linear layers (ColumnParallelLinear/RowParallelLinear) return
+    an (output, bias) 2-tuple, and sfa_v1.py uses
+      q_li, _ = self.wq_b(q_c)
+      weights, _ = self.weights_proj(x)
+    Plain nn.Linear returns a single tensor, which breaks 2-tuple
+    unpacking with ValueError. Use this wrapper for any indexer Linear
+    that sfa_v1.py unpacks.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self._linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor):
+        return self._linear(x), None
+
+
 class SimpleIndexer(nn.Module):
     """Simple Indexer for DSA benchmarking when DeepseekV3Indexer is unavailable."""
 
@@ -684,7 +704,11 @@ class SimpleIndexer(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.softmax_scale = 1.0 / (head_dim ** 0.5)
 
-        self.wq_b = nn.Linear(q_lora_rank, n_head * head_dim, bias=False)
+        # vllm linear layers return (output, bias) 2-tuples; sfa_v1.py does
+        #   q_li, _ = self.wq_b(q_c)
+        #   weights, _ = self.weights_proj(x)
+        # so we wrap nn.Linear in a thin module that mimics that interface.
+        self.wq_b = _TupleLinear(q_lora_rank, n_head * head_dim)
         self._wk_linear = nn.Linear(hidden_size, head_dim, bias=False)
         # weights_proj takes hidden_states (not wq_b output) as input, and
         # produces per-head scalar weights used to combine q_li per head.
@@ -692,7 +716,7 @@ class SimpleIndexer(nn.Module):
         #   weights, _ = self.weights_proj(x)
         # and x is hidden_states with last dim = hidden_size.
         # Output dim is n_head (one weight per indexer head), NOT topk_tokens.
-        self.weights_proj = nn.Linear(hidden_size, n_head, bias=False)
+        self.weights_proj = _TupleLinear(hidden_size, n_head)
         self.k_norm = nn.LayerNorm(head_dim)
         
         with torch.no_grad():
