@@ -38,28 +38,32 @@ os.environ.setdefault("VLLM_ASCEND_ENABLE_MLAPO", "1")
 
 def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int, dtype: torch.dtype = torch.bfloat16):
     """Setup W8A8 quantization attributes on a linear layer for MLAPO path."""
+    quant_method_cls = None
     try:
         from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
-        qm = AscendW8A8LinearMethod()
+        quant_method_cls = AscendW8A8LinearMethod
+    except ImportError:
+        print(f"[WARNING] AscendW8A8LinearMethod not found, MLAPO may not work")
+    
+    if quant_method_cls is not None:
+        qm = quant_method_cls()
         qm.quant_method = qm
         layer.quant_method = qm
-        
-        weight_float = layer.weight.data.float()
-        weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
-        weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).T.contiguous().to(torch.int8)
-        layer.weight.data = weight_int8
-        
-        layer.register_buffer("weight_scale", weight_scale.to(dtype))
-        layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
-        aclnn_input_scale = torch.ones(output_size, dtype=dtype)
-        layer.register_buffer("aclnn_input_scale", aclnn_input_scale)
-        layer.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
-        layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
-        layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
-        layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))
-        layer.register_buffer("input_offset", torch.zeros(1, dtype=dtype))
-    except ImportError:
-        pass
+    
+    weight_float = layer.weight.data.float()
+    weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
+    weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127).T.contiguous().to(torch.int8)
+    layer.weight.data = weight_int8
+    
+    layer.register_buffer("weight_scale", weight_scale.to(dtype))
+    layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
+    aclnn_input_scale = torch.ones(output_size, dtype=dtype)
+    layer.register_buffer("aclnn_input_scale", aclnn_input_scale)
+    layer.register_buffer("aclnn_input_scale_reciprocal", aclnn_input_scale.reciprocal())
+    layer.deq_scale = nn.Parameter(torch.ones(output_size, dtype=dtype))
+    layer.quant_bias = nn.Parameter(torch.zeros(output_size, dtype=dtype))
+    layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))
+    layer.register_buffer("input_offset", torch.zeros(1, dtype=dtype))
 
 
 class MockW8A8Linear(nn.Module):
