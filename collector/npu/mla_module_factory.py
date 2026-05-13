@@ -628,6 +628,19 @@ def _create_mla_modules(
         input_is_parallel=True,
     )
 
+    # GLM-5 keeps kv_b_proj / o_proj in bf16 (unquantized). vllm's
+    # RowParallelLinear defaults to fp32 and leaves the weight
+    # uninitialized when no load_state_dict follows, which causes:
+    #   - W_UK_T (derived from kv_b_proj.weight) to be fp32 while
+    #     mla_preprocess expects bf16 -> stride misread -> NaN in ql_nope.
+    #   - all-zero weights -> zero matmul output -> downstream RMSNorm NaN.
+    # Force bf16 dtype + realistic random init here.
+    with torch.no_grad():
+        for _lin in (kv_b_proj, o_proj):
+            w = torch.empty_like(_lin.weight, dtype=torch.float32)
+            w.uniform_(-0.1, 0.1)
+            _lin.weight.data = w.to(torch.bfloat16)
+
     indexer = None
     if hasattr(hf_config, "index_topk"):
         if DeepseekV3Indexer is not None:
