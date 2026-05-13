@@ -17,7 +17,7 @@ export PYTHONPATH="collector:${PYTHONPATH:-}"
 LOG="/tmp/sfa_full_err.log"
 
 echo "=============================================================="
-echo "[1/3] Single direct call — full ACL traceback"
+echo "[1/4] _C_ascend.npu_sparse_flash_attention (TND / PA_BSND)"
 echo "=============================================================="
 python -X faulthandler 2>&1 <<'PYEOF' | tee "$LOG"
 import torch, torch_npu, vllm_ascend, glob, os
@@ -39,68 +39,112 @@ aslq = torch.tensor([T], dtype=i32, device=dev)
 aslk = torch.tensor([NB*BS], dtype=i32, device=dev)
 
 print("--- calling _C_ascend.npu_sparse_flash_attention ---", flush=True)
-torch.ops._C_ascend.npu_sparse_flash_attention(
-    query=q, key=kv, value=kv, sparse_indices=si,
-    scale_value=1.0/(D**0.5), sparse_block_size=1,
-    block_table=bt,
-    actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
-    query_rope=qr, key_rope=kr,
-    layout_query="TND", layout_kv="PA_BSND", sparse_mode=3,
-)
+try:
+    torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=q, key=kv, value=kv, sparse_indices=si,
+        scale_value=1.0/(D**0.5), sparse_block_size=1,
+        block_table=bt,
+        actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
+        query_rope=qr, key_rope=kr,
+        layout_query="TND", layout_kv="PA_BSND", sparse_mode=3,
+    )
+    print("OK", flush=True)
+except Exception as e:
+    # print full message — do NOT split on newline
+    print("EXCEPTION:", flush=True)
+    print(repr(e), flush=True)
 PYEOF
-echo "exit code: $?"
 
 echo
 echo "=============================================================="
-echo "[2/3] Find vllm-ascend tests that exercise SparseFlashAttention"
+echo "[2/4] torch.ops.npu.npu_sparse_flash_attention (BSND, the real one)"
+echo "=============================================================="
+python -X faulthandler 2>&1 <<'PYEOF'
+import torch, torch_npu
+torch.npu.config.allow_internal_format = True
+torch.npu.set_device(0)
+
+dev, bf16, i32 = "npu:0", torch.bfloat16, torch.int32
+B, S, N, D = 1, 512, 64, 512
+R = 64
+T_kv = 4096
+SC = 2048
+
+q  = torch.randn(B, S, N, D, dtype=bf16, device=dev)
+qr = torch.randn(B, S, N, R, dtype=bf16, device=dev)
+k  = torch.randn(B, T_kv, N, D, dtype=bf16, device=dev)
+v  = torch.randn(B, T_kv, N, D, dtype=bf16, device=dev)
+kr = torch.randn(B, T_kv, N, R, dtype=bf16, device=dev)
+si = torch.randint(0, T_kv, (B, S, N, SC), dtype=i32, device=dev)
+aslq = torch.tensor([S], dtype=i32, device=dev)
+aslk = torch.tensor([T_kv], dtype=i32, device=dev)
+
+print("--- calling torch.ops.npu.npu_sparse_flash_attention (BSND, no block_table) ---", flush=True)
+try:
+    out = torch.ops.npu.npu_sparse_flash_attention(
+        q, k, v, si,
+        1.0/(D**0.5),
+        actual_seq_lengths_query=aslq,
+        actual_seq_lengths_kv=aslk,
+        query_rope=qr,
+        key_rope=kr,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=3,
+    )
+    torch.npu.synchronize()
+    if isinstance(out, (tuple, list)):
+        print(f"OK tuple len={len(out)}, out[0] shape={tuple(out[0].shape)} dtype={out[0].dtype}")
+    else:
+        print(f"OK out shape={tuple(out.shape)}")
+except Exception as e:
+    print("EXCEPTION:")
+    print(repr(e))
+PYEOF
+
+echo
+echo "=============================================================="
+echo "[3/4] Find vllm-ascend tests that exercise SparseFlashAttention"
 echo "=============================================================="
 SP=/usr/local/python3.11.14/lib/python3.11/site-packages
 find "$SP/vllm_ascend" -name "*.py" 2>/dev/null \
     | xargs grep -l "npu_sparse_flash_attention\|SparseFlashAttention" 2>/dev/null \
     | grep -i test 2>/dev/null \
     | head -10
-echo "--- and any non-test call sites ---"
+echo "--- and any non-test call sites (vllm_ascend + torch_npu) ---"
 grep -rn "npu_sparse_flash_attention" "$SP/vllm_ascend" "$SP/torch_npu" 2>/dev/null \
     | grep -v __pycache__ \
     | head -30
 
 echo
 echo "=============================================================="
-echo "[3/3] torch_npu.npu_sparse_flash_attention signature (if any)"
+echo "[4/4] Op signature inspection"
 echo "=============================================================="
 python <<'PYEOF'
-import torch_npu, inspect
+import torch, torch_npu, inspect
 fn = getattr(torch_npu, "npu_sparse_flash_attention", None)
 print("torch_npu.npu_sparse_flash_attention:", fn)
 if fn:
-    try:
-        print("  signature:", inspect.signature(fn))
-    except Exception as e:
-        print("  signature: <unavailable> (", e, ")")
-    try:
-        print("  doc       :", (fn.__doc__ or "")[:1000])
-    except Exception:
-        pass
+    try: print("  signature:", inspect.signature(fn))
+    except Exception as e: print("  signature err:", e)
 
-import torch
 ns = torch.ops._C_ascend
-ops = [x for x in dir(ns) if not x.startswith("_")]
 print()
-print("torch.ops._C_ascend visible attrs (count={}):".format(len(ops)))
-print(" ", ops)
+print("torch.ops._C_ascend visible attrs:")
+print(" ", [x for x in dir(ns) if not x.startswith("_")])
 
+ns2 = torch.ops.npu
+ops = [x for x in dir(ns2) if "sparse_flash" in x.lower()]
 print()
-op = ns.npu_sparse_flash_attention
-print("op:", op)
-print("dir:", [x for x in dir(op) if not x.startswith("_")][:30])
-try:
-    print("schema:", op.schemas)
-except Exception:
-    pass
-try:
-    overloads = op.overloads()
-    for ov in overloads:
-        print("  overload:", ov, " schema:", op.__getattr__(ov)._schema)
-except Exception as e:
-    print("  overload introspect err:", e)
+print("torch.ops.npu sparse_flash* attrs:")
+print(" ", ops)
+for o in ops:
+    op = getattr(ns2, o)
+    print(f"  {o}: {op}")
+    try:
+        for ov in op.overloads():
+            print(f"    overload {ov!r}  schema = {getattr(op, ov)._schema}")
+    except Exception as e:
+        print("    overloads err:", e)
 PYEOF
