@@ -331,6 +331,20 @@ def _build_attention_module(
         max_num_batched_tokens=max_num_batched_tokens,
     )
 
+    # vllm-ascend registers AscendMultiHeadLatentAttention / AscendRMSNorm /
+    # AscendColumnParallelLinear etc. via CustomOp.register_oot(). Without
+    # that registration, vllm's `MultiHeadLatentAttentionWrapper(...)`
+    # returns the generic vllm-upstream wrapper which doesn't forward
+    # `rotary_emb` (and several other MLA-module kwargs) to AscendSFAImpl,
+    # making its __init__ raise KeyError('rotary_emb'). The registration
+    # normally happens inside vllm_ascend.worker.worker.Worker, which
+    # AIConfigurator bypasses -- so trigger it manually here.
+    try:
+        from vllm_ascend.utils import register_ascend_customop
+        register_ascend_customop(vllm_config)
+    except ImportError as e:
+        print(f"[WARN] register_ascend_customop unavailable: {e}")
+
     hf_config = vllm_config.model_config.hf_config
     num_heads = hf_config.num_attention_heads
 
