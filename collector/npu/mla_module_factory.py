@@ -793,12 +793,15 @@ def _create_kv_cache_and_metadata(
     index_topk = getattr(hf_config, "index_topk", 2048)
     block_size = vllm_config.cache_config.block_size
 
-    # KV length seen by the kernels must be >= sparse_count so
-    # npu_lightning_indexer / npu_sparse_flash_attention can actually pick
-    # index_topk tokens without reading past the valid key region.
-    # The query length ("seq_len") stays as-is. This mirrors real prefill
-    # where a short query attends over a long KV history.
-    kv_seq_len = max(seq_len, index_topk)
+    # KV length seen by the kernels must strictly exceed sparse_count
+    # so npu_lightning_indexer can always pick index_topk *valid* tokens
+    # without emitting -1 paddings. When indexer emits -1,
+    # npu_sparse_flash_attention dereferences index -1 and segfaults
+    # (at least on CANN 8.5). Keeping kv_seq_len > index_topk gives the
+    # indexer enough candidates that top-k selection stays fully valid.
+    # The query length ("seq_len") stays as-is — this mirrors real
+    # prefill where a short query attends over a long KV history.
+    kv_seq_len = max(seq_len, index_topk * 2)
     blocks_per_seq = math.ceil(kv_seq_len / block_size)
     min_blocks_for_topk = math.ceil(index_topk / block_size)
     num_blocks = max(batch_size * blocks_per_seq, min_blocks_for_topk, 8)
