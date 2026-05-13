@@ -412,12 +412,29 @@ def _build_attention_module(
     # which AIConfigurator bypasses.
     try:
         import vllm_ascend.ops.rotary_embedding as _rope_mod
+
+        # Initialise _cos_mla / _sin_mla on NPU. Without this,
+        # get_cos_and_sin_mla(use_cache=True) does
+        # _cos_mla[:num_tokens, ...] = cos
+        # and crashes with "'NoneType' object does not support item
+        # assignment". model_runner_v1 normally calls this.
+        if getattr(_rope_mod, "_cos_mla", None) is None or getattr(_rope_mod, "_sin_mla", None) is None:
+            _rope_mod.set_cos_and_sin(
+                vllm_config,
+                max_num_reqs=vllm_config.scheduler_config.max_num_seqs,
+                decode_token_per_req=1,
+                dtype=torch.bfloat16,
+                device=torch.device(device),
+            )
+
+        # Pull _cos_cache / _sin_cache onto NPU if they were created on CPU
+        # by the base RotaryEmbedding ctor.
         for _attr in ("_cos_cache", "_sin_cache"):
             t = getattr(_rope_mod, _attr, None)
             if isinstance(t, torch.Tensor) and t.device != torch.device(device):
                 setattr(_rope_mod, _attr, t.to(device))
     except Exception as e:
-        print(f"[WARN] cos/sin cache device sync failed: {type(e).__name__}: {e}")
+        print(f"[WARN] cos/sin cache setup failed: {type(e).__name__}: {e}")
 
     return attn_module, vllm_config
 
