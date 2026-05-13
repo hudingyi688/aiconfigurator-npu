@@ -79,28 +79,43 @@ si = torch.randint(0, T_kv, (B, S, N, SC), dtype=i32, device=dev)
 aslq = torch.tensor([S], dtype=i32, device=dev)
 aslk = torch.tensor([T_kv], dtype=i32, device=dev)
 
-print("--- calling torch.ops.npu.npu_sparse_flash_attention (BSND, no block_table) ---", flush=True)
-try:
-    out = torch.ops.npu.npu_sparse_flash_attention(
-        q, k, v, si,
-        1.0/(D**0.5),
-        actual_seq_lengths_query=aslq,
-        actual_seq_lengths_kv=aslk,
-        query_rope=qr,
-        key_rope=kr,
-        sparse_block_size=1,
-        layout_query="BSND",
-        layout_kv="BSND",
-        sparse_mode=3,
-    )
-    torch.npu.synchronize()
-    if isinstance(out, (tuple, list)):
-        print(f"OK tuple len={len(out)}, out[0] shape={tuple(out[0].shape)} dtype={out[0].dtype}")
-    else:
-        print(f"OK out shape={tuple(out.shape)}")
-except Exception as e:
-    print("EXCEPTION:")
-    print(repr(e))
+print("--- sweep attention_mode with query_rope/key_rope ---", flush=True)
+for am in [0, 1, 2]:
+    try:
+        out = torch.ops.npu.npu_sparse_flash_attention(
+            q, k, v, si, 1.0/(D**0.5),
+            actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
+            query_rope=qr, key_rope=kr,
+            sparse_block_size=1, layout_query="BSND", layout_kv="BSND",
+            sparse_mode=3, attention_mode=am,
+        )
+        torch.npu.synchronize()
+        if isinstance(out, (tuple, list)):
+            print(f"attention_mode={am}: OK tuple len={len(out)} out[0]={tuple(out[0].shape)}", flush=True)
+        else:
+            print(f"attention_mode={am}: OK shape={tuple(out.shape)}", flush=True)
+    except Exception as e:
+        print(f"attention_mode={am}: EXCEPTION:", flush=True)
+        print("    " + repr(e)[:400], flush=True)
+
+print()
+print("--- sweep attention_mode WITHOUT query_rope/key_rope ---", flush=True)
+for am in [0, 1, 2]:
+    try:
+        out = torch.ops.npu.npu_sparse_flash_attention(
+            q, k, v, si, 1.0/(D**0.5),
+            actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
+            sparse_block_size=1, layout_query="BSND", layout_kv="BSND",
+            sparse_mode=3, attention_mode=am,
+        )
+        torch.npu.synchronize()
+        if isinstance(out, (tuple, list)):
+            print(f"attention_mode={am} no_rope: OK tuple len={len(out)} out[0]={tuple(out[0].shape)}", flush=True)
+        else:
+            print(f"attention_mode={am} no_rope: OK shape={tuple(out.shape)}", flush=True)
+    except Exception as e:
+        print(f"attention_mode={am} no_rope: EXCEPTION:", flush=True)
+        print("    " + repr(e)[:400], flush=True)
 PYEOF
 
 echo
