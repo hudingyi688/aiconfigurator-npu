@@ -57,7 +57,7 @@ PYEOF
 
 echo
 echo "=============================================================="
-echo "[2/4] torch.ops.npu.npu_sparse_flash_attention (BSND, the real one)"
+echo "[2/4] torch.ops.npu.npu_sparse_flash_attention (MLA: kv_head=1, attention_mode=2)"
 echo "=============================================================="
 python -X faulthandler 2>&1 <<'PYEOF'
 import torch, torch_npu
@@ -69,53 +69,43 @@ B, S, N, D = 1, 512, 64, 512
 R = 64
 T_kv = 4096
 SC = 2048
+KV_HEAD = 1     # MLA requires kv_head_num == 1
 
 q  = torch.randn(B, S, N, D, dtype=bf16, device=dev)
 qr = torch.randn(B, S, N, R, dtype=bf16, device=dev)
-k  = torch.randn(B, T_kv, N, D, dtype=bf16, device=dev)
-v  = torch.randn(B, T_kv, N, D, dtype=bf16, device=dev)
-kr = torch.randn(B, T_kv, N, R, dtype=bf16, device=dev)
-si = torch.randint(0, T_kv, (B, S, N, SC), dtype=i32, device=dev)
+k  = torch.randn(B, T_kv, KV_HEAD, D, dtype=bf16, device=dev)
+v  = torch.randn(B, T_kv, KV_HEAD, D, dtype=bf16, device=dev)
+kr = torch.randn(B, T_kv, KV_HEAD, R, dtype=bf16, device=dev)
+# sparse_indices layout for BSND + attention_mode=2:
+# try both (B, S, N, SC) and (B, S, KV_HEAD, SC) shapes
+si_n  = torch.randint(0, T_kv, (B, S, N,       SC), dtype=i32, device=dev)
+si_kv = torch.randint(0, T_kv, (B, S, KV_HEAD, SC), dtype=i32, device=dev)
 aslq = torch.tensor([S], dtype=i32, device=dev)
 aslk = torch.tensor([T_kv], dtype=i32, device=dev)
 
-print("--- sweep attention_mode with query_rope/key_rope ---", flush=True)
-for am in [0, 1, 2]:
+def try_call(label, **kw):
     try:
         out = torch.ops.npu.npu_sparse_flash_attention(
-            q, k, v, si, 1.0/(D**0.5),
+            q, k, v,
+            kw.pop("si"),
+            1.0/(D**0.5),
             actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
             query_rope=qr, key_rope=kr,
             sparse_block_size=1, layout_query="BSND", layout_kv="BSND",
-            sparse_mode=3, attention_mode=am,
+            sparse_mode=3, attention_mode=2, **kw,
         )
         torch.npu.synchronize()
         if isinstance(out, (tuple, list)):
-            print(f"attention_mode={am}: OK tuple len={len(out)} out[0]={tuple(out[0].shape)}", flush=True)
+            print(f"{label}: OK tuple len={len(out)} out[0]={tuple(out[0].shape)}", flush=True)
         else:
-            print(f"attention_mode={am}: OK shape={tuple(out.shape)}", flush=True)
+            print(f"{label}: OK shape={tuple(out.shape)}", flush=True)
     except Exception as e:
-        print(f"attention_mode={am}: EXCEPTION:", flush=True)
+        print(f"{label}: EXCEPTION:", flush=True)
         print("    " + repr(e)[:400], flush=True)
 
-print()
-print("--- sweep attention_mode WITHOUT query_rope/key_rope ---", flush=True)
-for am in [0, 1, 2]:
-    try:
-        out = torch.ops.npu.npu_sparse_flash_attention(
-            q, k, v, si, 1.0/(D**0.5),
-            actual_seq_lengths_query=aslq, actual_seq_lengths_kv=aslk,
-            sparse_block_size=1, layout_query="BSND", layout_kv="BSND",
-            sparse_mode=3, attention_mode=am,
-        )
-        torch.npu.synchronize()
-        if isinstance(out, (tuple, list)):
-            print(f"attention_mode={am} no_rope: OK tuple len={len(out)} out[0]={tuple(out[0].shape)}", flush=True)
-        else:
-            print(f"attention_mode={am} no_rope: OK shape={tuple(out.shape)}", flush=True)
-    except Exception as e:
-        print(f"attention_mode={am} no_rope: EXCEPTION:", flush=True)
-        print("    " + repr(e)[:400], flush=True)
+print("--- attention_mode=2 + kv_head=1 with various sparse_indices shapes ---")
+try_call("si_shape=(B,S,N,SC)",       si=si_n)
+try_call("si_shape=(B,S,KV_HEAD,SC)", si=si_kv)
 PYEOF
 
 echo
