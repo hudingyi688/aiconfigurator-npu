@@ -50,40 +50,82 @@ f = "$SFA_FILE"
 with open(f, 'r', encoding='utf-8') as fp:
     lines = fp.readlines()
 
-target = 'attn_output = torch.ops._C_ascend.npu_sparse_flash_attention('
-for i, l in enumerate(lines):
-    if target in l:
-        indent = l[: len(l) - len(l.lstrip())]
+# Probe 1: just before npu_sparse_flash_attention (the original probe)
+target_sfa = 'attn_output = torch.ops._C_ascend.npu_sparse_flash_attention('
+# Probe 2: just before mla_preprocess (the most likely NaN source)
+target_mlapo = 'torch.ops._C_ascend.mla_preprocess('
+
+def stat_block(indent):
+    return (
+        indent + "import torch as _t\n"
+        + indent + "def _st(name, x):\n"
+        + indent + "    if x is None: return f'{name}=None'\n"
+        + indent + "    if not hasattr(x, 'shape'): return f'{name}={x!r}'\n"
+        + indent + "    xf = x.float() if x.is_floating_point() else x\n"
+        + indent + "    return (f'{name} shape={tuple(x.shape)} dtype={x.dtype} '\n"
+        + indent + "            f'min={float(xf.min()):.4e} max={float(xf.max()):.4e} '\n"
+        + indent + "            f'mean={float(xf.float().mean()):.4e} '\n"
+        + indent + "            f'nan={_t.isnan(xf.float()).any().item() if x.is_floating_point() else False} '\n"
+        + indent + "            f'inf={_t.isinf(xf.float()).any().item() if x.is_floating_point() else False} '\n"
+        + indent + "            f'contig={x.is_contiguous()}')\n"
+    )
+
+# Pass 1: insert MLAPO probe (must process BEFORE the SFA probe so line numbers stay valid)
+inserted_mlapo = False
+inserted_sfa = False
+new_lines = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if (not inserted_mlapo) and (target_mlapo in line):
+        indent = line[: len(line) - len(line.lstrip())]
         probe = (
-            indent
-            + "import torch as _t\n"
-            + indent + "def _st(name, x):\n"
-            + indent + "    if x is None: return f'{name}=None'\n"
-            + indent + "    if not hasattr(x, 'shape'): return f'{name}={x!r}'\n"
-            + indent + "    xf = x.float()\n"
-            + indent + "    return (f'{name} shape={tuple(x.shape)} dtype={x.dtype} '\n"
-            + indent + "            f'min={xf.min().item():.4e} max={xf.max().item():.4e} '\n"
-            + indent + "            f'mean={xf.mean().item():.4e} '\n"
-            + indent + "            f'nan={_t.isnan(xf).any().item()} inf={_t.isinf(xf).any().item()} '\n"
-            + indent + "            f'stride={x.stride()} contig={x.is_contiguous()}')\n"
+            stat_block(indent)
+            + indent + "print('[MLAPO IN]', _st('hidden_states', hidden_states), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('wd_qkv', self.wd_qkv), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('deq_scale_qkv', self.deq_scale_qkv), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('gamma1', self.gamma1), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('beta1', self.beta1), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('wu_q', self.wu_q), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('qb_deq_scl', self.qb_deq_scl), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('gamma2', self.gamma2), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('cos', cos), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('sin', sin), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('W_UK_T', self.W_UK_T), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('quant_scale0', self.quant_scale0), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('quant_offset0', self.quant_offset0), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('quant_bias_qkv', self.quant_bias_qkv), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('quant_scale1', self.quant_scale1), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('quant_offset1', self.quant_offset1), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('qb_qt_bias', self.qb_qt_bias), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('ctkv_scale', self.ctkv_scale), flush=True)\n"
+            + indent + "print('[MLAPO IN]', _st('q_nope_scale', self.q_nope_scale), flush=True)\n"
+        )
+        new_lines.append(probe)
+        inserted_mlapo = True
+    if (not inserted_sfa) and (target_sfa in line):
+        indent = line[: len(line) - len(line.lstrip())]
+        probe = (
+            stat_block(indent)
             + indent + "print('[SFA DBG]', _st('ql_nope', ql_nope), flush=True)\n"
             + indent + "print('[SFA DBG]', _st('q_pe', q_pe), flush=True)\n"
             + indent + "print('[SFA DBG]', _st('kv', kv), flush=True)\n"
-            + indent + "print('[SFA DBG]', _st('key_rope', key_rope), flush=True)\n"
             + indent + "print('[SFA DBG]', _st('topk_indices', topk_indices), flush=True)\n"
-            + indent + "print('[SFA DBG]', _st('block_table', block_table), flush=True)\n"
-            + indent + "print(f'[SFA DBG] aslq={actual_seq_lengths_query.tolist()} aslk={actual_seq_lengths_key.tolist()} '\n"
-            + indent + "      f'aslq.dtype={actual_seq_lengths_query.dtype} aslk.dtype={actual_seq_lengths_key.dtype} '\n"
-            + indent + "      f'scale={self.scale} sparse_block_size=1 sparse_mode=3 '\n"
-            + indent + "      f'layout_q=TND layout_kv=PA_BSND', flush=True)\n"
         )
-        lines.insert(i, probe)
-        with open(f, 'w', encoding='utf-8') as fp:
-            fp.writelines(lines)
-        print(f"patched at line {i+1}")
-        break
-else:
-    raise SystemExit("ERROR: target line not found in sfa_v1.py")
+        new_lines.append(probe)
+        inserted_sfa = True
+    new_lines.append(line)
+    i += 1
+
+if not inserted_mlapo:
+    raise SystemExit("ERROR: mla_preprocess call site not found")
+if not inserted_sfa:
+    raise SystemExit("ERROR: npu_sparse_flash_attention call site not found")
+
+with open(f, 'w', encoding='utf-8') as fp:
+    fp.writelines(new_lines)
+
+print(f"patched MLAPO + SFA probes")
 PYEOF
 
 rc=$?
@@ -119,7 +161,10 @@ echo "restored $SFA_FILE from $BAK"
 echo
 echo "PY_EXIT: $PY_EXIT"
 echo
-echo "=== SFA DBG lines ==="
+echo "=== MLAPO IN lines (inputs to mla_preprocess) ==="
+grep "MLAPO IN" "$LOG" || echo "(no MLAPO IN)"
+echo
+echo "=== SFA DBG lines (inputs to sparse_flash_attention) ==="
 grep "SFA DBG" "$LOG" || echo "(no SFA DBG line printed — crashed before the probe)"
 echo
 echo "=== MLAPO DIAG lines ==="
