@@ -37,77 +37,64 @@ for so in sorted(glob.glob(os.path.join(os.path.dirname(vllm_ascend.__file__), "
     except Exception as e:
         print(f"[WARN] load_library failed: {e}", flush=True)
 
-print("_C_ascend ops sample:", [x for x in dir(torch.ops._C_ascend) if "sparse_flash" in x], flush=True)
+# --- 2. sweep T values to find which shapes CANN has prebuilt binaries for
+def try_call(num_tokens, num_heads=64, sparse_count=2048,
+             num_blocks=None, block_size=128, kv_lora=512, rope_dim=64):
+    if num_blocks is None:
+        num_blocks = max(2, (max(num_tokens, sparse_count) + block_size - 1) // block_size)
+    dev, bf16, i32 = "npu:0", torch.bfloat16, torch.int32
 
-# --- 2. build inputs with the SAME shapes AIConfigurator produces --------
-dev = "npu:0"
-bf16 = torch.bfloat16
-i32 = torch.int32
+    torch.manual_seed(0)
+    ql_nope = torch.empty(num_tokens, num_heads, kv_lora, dtype=bf16, device=dev).uniform_(-1, 1)
+    q_pe    = torch.empty(num_tokens, num_heads, rope_dim, dtype=bf16, device=dev).uniform_(-1, 1)
+    kv      = torch.empty(num_blocks, block_size, 1, kv_lora, dtype=bf16, device=dev).uniform_(-1, 1)
+    key_rope= torch.empty(num_blocks, block_size, 1, rope_dim, dtype=bf16, device=dev).uniform_(-1, 1)
+    topk = torch.randint(0, num_blocks * block_size, (num_tokens, 1, sparse_count),
+                         dtype=i32, device=dev)
+    block_table = torch.arange(num_blocks, dtype=i32, device=dev).unsqueeze(0)
+    aslq = torch.tensor([num_tokens], dtype=i32, device=dev)
+    aslk = torch.tensor([num_blocks * block_size], dtype=i32, device=dev)
 
-num_tokens = 512
-num_heads = 64
-rope_dim = 64
-kv_lora = 512
-num_blocks = 32
-block_size = 128
-sparse_count = 2048
+    try:
+        out = torch.ops._C_ascend.npu_sparse_flash_attention(
+            query=ql_nope, key=kv, value=kv, sparse_indices=topk,
+            scale_value=1.0 / (kv_lora ** 0.5),
+            sparse_block_size=1,
+            block_table=block_table,
+            actual_seq_lengths_query=aslq,
+            actual_seq_lengths_kv=aslk,
+            query_rope=q_pe, key_rope=key_rope,
+            layout_query="TND", layout_kv="PA_BSND", sparse_mode=3,
+        )
+        torch.npu.synchronize()
+        return f"OK out={tuple(out.shape)} {out.dtype}"
+    except Exception as e:
+        msg = str(e).split("\n")[0][:120]
+        return f"FAIL {type(e).__name__}: {msg}"
 
-torch.manual_seed(0)
-ql_nope = torch.empty(num_tokens, num_heads, kv_lora, dtype=bf16, device=dev).uniform_(-4, 4)
-q_pe    = torch.empty(num_tokens, num_heads, rope_dim, dtype=bf16, device=dev).uniform_(-12, 12)
-kv      = torch.empty(num_blocks, block_size, 1, kv_lora, dtype=bf16, device=dev).uniform_(-4, 4)
-key_rope= torch.empty(num_blocks, block_size, 1, rope_dim, dtype=bf16, device=dev).uniform_(-1, 1)
+# Test shapes typical for prefill / decode + a few extreme small/large
+test_T = [1, 16, 32, 64, 128, 256, 512, 1024, 2048]
+print("--- sweeping T (num_tokens) ---", flush=True)
+for t in test_T:
+    print(f"T={t:5d}  num_heads=64 sparse_count=2048  ->  {try_call(t)}", flush=True)
 
-# topk_indices: (T, 1, sparse_count), all in [0, num_blocks*block_size)
-topk = torch.randint(0, num_blocks * block_size, (num_tokens, 1, sparse_count),
-                     dtype=i32, device=dev)
+# Also test sparse_count variants (kernel may only have certain values prebuilt)
+print()
+print("--- sweeping sparse_count at T=2048 ---", flush=True)
+for sc in [128, 256, 512, 1024, 2048, 4096]:
+    print(f"T=2048 sparse_count={sc:5d}  ->  {try_call(2048, sparse_count=sc)}", flush=True)
 
-block_table = torch.arange(num_blocks, dtype=i32, device=dev).unsqueeze(0)  # (1, num_blocks)
-
-aslq = torch.tensor([num_tokens], dtype=i32, device=dev)
-aslk = torch.tensor([num_blocks * block_size], dtype=i32, device=dev)
-
-print("--- inputs ---", flush=True)
-print(f"ql_nope {tuple(ql_nope.shape)} {ql_nope.dtype} contig={ql_nope.is_contiguous()}", flush=True)
-print(f"q_pe    {tuple(q_pe.shape)} {q_pe.dtype} contig={q_pe.is_contiguous()}", flush=True)
-print(f"kv      {tuple(kv.shape)} {kv.dtype} contig={kv.is_contiguous()}", flush=True)
-print(f"key_rope{tuple(key_rope.shape)} {key_rope.dtype} contig={key_rope.is_contiguous()}", flush=True)
-print(f"topk    {tuple(topk.shape)} {topk.dtype} min={topk.min().item()} max={topk.max().item()}", flush=True)
-print(f"block_table {tuple(block_table.shape)} {block_table.dtype} max={block_table.max().item()}", flush=True)
-print(f"aslq={aslq.tolist()} aslk={aslk.tolist()}", flush=True)
-
-torch.npu.synchronize()
-print("--- calling npu_sparse_flash_attention ---", flush=True)
-
-try:
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
-        query=ql_nope,
-        key=kv,
-        value=kv,
-        sparse_indices=topk,
-        scale_value=1.0 / (kv_lora ** 0.5),
-        sparse_block_size=1,
-        block_table=block_table,
-        actual_seq_lengths_query=aslq,
-        actual_seq_lengths_kv=aslk,
-        query_rope=q_pe,
-        key_rope=key_rope,
-        layout_query="TND",
-        layout_kv="PA_BSND",
-        sparse_mode=3,
-    )
-    torch.npu.synchronize()
-    print(f"[OK] out shape={tuple(out.shape)} dtype={out.dtype} "
-          f"min={out.float().min().item()} max={out.float().max().item()}", flush=True)
-except Exception as e:
-    print(f"[ERR] {type(e).__name__}: {e}", flush=True)
-    raise
+# And num_heads (DSA usually has 1, 8, 16, 32, 64, 128)
+print()
+print("--- sweeping num_heads at T=2048 sparse_count=2048 ---", flush=True)
+for nh in [1, 8, 16, 32, 64, 128]:
+    print(f"T=2048 num_heads={nh:3d}  ->  {try_call(2048, num_heads=nh)}", flush=True)
 PYEOF
 
 rc=$?
 echo
 echo "PY_EXIT: $rc"
-echo "=== log tail (60 lines) ==="
-tail -60 "$LOG"
+echo "=== full log ==="
+cat "$LOG"
 
 exit $rc
