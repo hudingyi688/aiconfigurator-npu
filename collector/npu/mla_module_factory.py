@@ -436,6 +436,16 @@ def _build_attention_module(
     except Exception as e:
         print(f"[WARN] cos/sin cache setup failed: {type(e).__name__}: {e}")
 
+    # init_device_properties_triton populates module-level _NUM_AICORE /
+    # _NUM_VECTORCORE counters used by triton-based RoPE etc. Worker
+    # normally invokes it (worker.py:299); AIConfigurator bypasses worker
+    # so we trigger it ourselves.
+    try:
+        from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+        init_device_properties_triton()
+    except Exception as e:
+        print(f"[WARN] init_device_properties_triton failed: {type(e).__name__}: {e}")
+
     return attn_module, vllm_config
 
 
