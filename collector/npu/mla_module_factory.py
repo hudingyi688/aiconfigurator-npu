@@ -145,6 +145,19 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
 
     # weight: int8, stored as (input_size, output_size) after transpose in
     # process_weights_after_loading. We synthesize it directly in that layout.
+    #
+    # ColumnParallelLinear created under set_current_vllm_config may produce
+    # an uninitialized (or all-zero) weight because vllm's lazy init path
+    # is designed to be followed by load_state_dict(). Force a realistic
+    # random initialization here so the downstream MLAPO fused weight
+    # (wd_qkv / wu_q) isn't all zeros — which causes the kernel's RMSNorm
+    # to divide by zero and emit NaN into ql_nope.
+    weight_float = torch.empty(
+        output_size, input_size, dtype=torch.float32, device=layer.weight.device
+    )
+    weight_float.uniform_(-0.1, 0.1)
+    layer.weight.data = weight_float.to(layer.weight.dtype)
+
     weight_float = layer.weight.data.float()
     # per-channel: scale = max(|w|, dim=1) / 127, clamp to avoid div-by-zero
     weight_absmax = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
