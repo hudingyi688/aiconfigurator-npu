@@ -133,24 +133,42 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
         qm.quant_method = qm
         layer.quant_method = qm
 
+    # Real W8A8 per-tensor activation / per-channel weight quantization:
+    #   input_scale  = max(|x|) / 127                           (per-tensor)
+    #   weight_scale = max(|W|, dim=in).values / 127             (per-channel)
+    #   weight_int8  = clamp(round(W / weight_scale), -127, 127)
+    #   deq_scale    = input_scale * weight_scale                (fp32, per-channel)
+    # We use a small but realistic dynamic range for the synthetic
+    # activation (assuming hidden_states ~ N(0, 1) like the collector
+    # generates). The kernel cares mostly that the
+    # int32_matmul * deq_scale product stays well within bf16 range.
+
     # weight: int8, stored as (input_size, output_size) after transpose in
     # process_weights_after_loading. We synthesize it directly in that layout.
     weight_float = layer.weight.data.float()
-    weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)   # (output_size,)
+    # per-channel: scale = max(|w|, dim=1) / 127, clamp to avoid div-by-zero
+    weight_absmax = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
+    weight_scale = (weight_absmax / 127.0)                                   # (output_size,)
     weight_int8 = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127)
-    weight_int8 = weight_int8.T.contiguous().to(torch.int8)               # (input_size, output_size)
+    weight_int8 = weight_int8.T.contiguous().to(torch.int8)                  # (input_size, output_size)
     layer.weight.data = weight_int8
 
     # per-channel weight params (flattened to 1-D as post-loading does)
-    layer.register_buffer("weight_scale", weight_scale.to(dtype))          # bf16, (output_size,)
+    layer.register_buffer("weight_scale", weight_scale.to(dtype))
     layer.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
 
-    # per-tensor activation params
-    layer.register_buffer("input_scale", torch.ones(1, dtype=dtype))       # bf16, (1,)
-    layer.register_buffer("input_offset", torch.zeros(1, dtype=torch.int8))  # int8, (1,)
+    # per-tensor activation params. Assume hidden_states is bf16 N(0, 1)
+    # which gives |x|_max ~= 4 in practice for hidden_size large enough.
+    # Use 4.0 as the activation absmax so input_scale = 4/127 ~= 0.0315.
+    activation_absmax = 4.0
+    input_scale_val = activation_absmax / 127.0
+    layer.register_buffer(
+        "input_scale", torch.full((1,), input_scale_val, dtype=dtype)
+    )
+    layer.register_buffer("input_offset", torch.zeros(1, dtype=torch.int8))
 
     # aclnn_* are per-input-channel, shape = (input_size,). dtype = activation dtype (bf16).
-    aclnn_scale = layer.input_scale.data.repeat(input_size).to(dtype)      # (input_size,)
+    aclnn_scale = layer.input_scale.data.repeat(input_size).to(dtype)
     layer.aclnn_input_scale = nn.Parameter(aclnn_scale, requires_grad=False)
     layer.aclnn_input_scale_reciprocal = nn.Parameter(
         (1.0 / aclnn_scale).contiguous(), requires_grad=False
@@ -160,9 +178,10 @@ def _setup_w8a8_quant_method(layer: nn.Module, input_size: int, output_size: int
     )
 
     # deq_scale: bf16 activation path uses float32; fp16 path uses int64 packed scale.
+    # value = input_scale * weight_scale, per output channel.
     deq_scale_dtype = torch.float32 if dtype == torch.bfloat16 else torch.int64
     deq_scale_val = (layer.input_scale.data.to(torch.float32)
-                     * layer.weight_scale.data.to(torch.float32))           # (output_size,)
+                     * layer.weight_scale.data.to(torch.float32))             # (output_size,)
     layer.deq_scale = nn.Parameter(deq_scale_val.to(deq_scale_dtype), requires_grad=False)
 
     # quant_bias: int32, (output_size,)
@@ -194,8 +213,10 @@ class MockW8A8Linear(nn.Module):
 
         weight_float = torch.zeros(output_size, input_size, dtype=torch.float32)
         weight_float.uniform_(-1.0, 1.0)
-        weight_scale = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
-        # int8 weight in (input_size, output_size) layout (post-loading shape)
+        # Per-channel quantization, same formula as _setup_w8a8_quant_method:
+        #   weight_scale = max(|w|, dim=1) / 127
+        weight_absmax = weight_float.abs().max(dim=1).values.clamp(min=1e-5)
+        weight_scale = weight_absmax / 127.0
         weight_data = (weight_float / weight_scale.unsqueeze(1)).round().clamp(-127, 127)
         weight_data = weight_data.T.contiguous().to(torch.int8)
         self.register_buffer("weight", weight_data)
@@ -203,7 +224,13 @@ class MockW8A8Linear(nn.Module):
         self.register_buffer("weight_scale", weight_scale.to(dtype))
         self.register_buffer("weight_offset", torch.zeros(output_size, dtype=dtype))
 
-        self.register_buffer("input_scale", torch.ones(1, dtype=dtype))
+        # per-tensor activation: input_scale = activation_absmax / 127.
+        # Use 4.0 as absmax assumption (hidden_states ~ N(0,1) bf16).
+        activation_absmax = 4.0
+        input_scale_val = activation_absmax / 127.0
+        self.register_buffer(
+            "input_scale", torch.full((1,), input_scale_val, dtype=dtype)
+        )
         self.register_buffer("input_offset", torch.zeros(1, dtype=torch.int8))
 
         aclnn_scale = self.input_scale.data.repeat(input_size).to(dtype)
