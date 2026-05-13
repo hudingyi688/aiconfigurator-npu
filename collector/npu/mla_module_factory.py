@@ -399,6 +399,26 @@ def _build_attention_module(
             else:
                 param.normal_(mean=0.0, std=0.02)
 
+    # Move global rope cos/sin caches to the NPU device. The base
+    # RotaryEmbedding class constructs cos_sin_cache on CPU (torch.arange
+    # default). vllm-ascend's AscendRotaryEmbedding stores it into the
+    # module-level _cos_cache / _sin_cache globals via
+    # _record_cos_and_sin_cache_interleaved(). When AscendSFAMetadataBuilder
+    # later calls get_cos_and_sin_mla(positions_npu), it indexes
+    # _cos_cache[positions_npu] and hits "Expected all tensors to be on
+    # the same device" because _cos_cache is still on CPU. Production
+    # skips this because a separate device-side _cos_mla / _sin_mla is
+    # used via set_cos_and_sin(vllm_config, ...) inside model_runner,
+    # which AIConfigurator bypasses.
+    try:
+        import vllm_ascend.ops.rotary_embedding as _rope_mod
+        for _attr in ("_cos_cache", "_sin_cache"):
+            t = getattr(_rope_mod, _attr, None)
+            if isinstance(t, torch.Tensor) and t.device != torch.device(device):
+                setattr(_rope_mod, _attr, t.to(device))
+    except Exception as e:
+        print(f"[WARN] cos/sin cache device sync failed: {type(e).__name__}: {e}")
+
     return attn_module, vllm_config
 
 
