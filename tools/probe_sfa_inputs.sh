@@ -56,18 +56,26 @@ for i, l in enumerate(lines):
         indent = l[: len(l) - len(l.lstrip())]
         probe = (
             indent
-            + "print(f'[SFA DBG] "
-            + "ql_nope={tuple(ql_nope.shape)} {ql_nope.dtype} | "
-            + "q_pe={tuple(q_pe.shape)} | "
-            + "kv={tuple(kv.shape)} {kv.dtype} | "
-            + "key_rope={tuple(key_rope.shape)} | "
-            + "topk={tuple(topk_indices.shape)} {topk_indices.dtype} "
-            + "min={topk_indices.min().item()} max={topk_indices.max().item()} | "
-            + "block_table={tuple(block_table.shape)} {block_table.dtype} "
-            + "max={block_table.max().item()} | "
-            + "aslq={actual_seq_lengths_query.tolist()} | "
-            + "aslk={actual_seq_lengths_key.tolist()} | "
-            + "kv_slots={kv.shape[0]*kv.shape[1]}', flush=True)\n"
+            + "import torch as _t\n"
+            + indent + "def _st(name, x):\n"
+            + indent + "    if x is None: return f'{name}=None'\n"
+            + indent + "    if not hasattr(x, 'shape'): return f'{name}={x!r}'\n"
+            + indent + "    xf = x.float()\n"
+            + indent + "    return (f'{name} shape={tuple(x.shape)} dtype={x.dtype} '\n"
+            + indent + "            f'min={xf.min().item():.4e} max={xf.max().item():.4e} '\n"
+            + indent + "            f'mean={xf.mean().item():.4e} '\n"
+            + indent + "            f'nan={_t.isnan(xf).any().item()} inf={_t.isinf(xf).any().item()} '\n"
+            + indent + "            f'stride={x.stride()} contig={x.is_contiguous()}')\n"
+            + indent + "print('[SFA DBG]', _st('ql_nope', ql_nope), flush=True)\n"
+            + indent + "print('[SFA DBG]', _st('q_pe', q_pe), flush=True)\n"
+            + indent + "print('[SFA DBG]', _st('kv', kv), flush=True)\n"
+            + indent + "print('[SFA DBG]', _st('key_rope', key_rope), flush=True)\n"
+            + indent + "print('[SFA DBG]', _st('topk_indices', topk_indices), flush=True)\n"
+            + indent + "print('[SFA DBG]', _st('block_table', block_table), flush=True)\n"
+            + indent + "print(f'[SFA DBG] aslq={actual_seq_lengths_query.tolist()} aslk={actual_seq_lengths_key.tolist()} '\n"
+            + indent + "      f'aslq.dtype={actual_seq_lengths_query.dtype} aslk.dtype={actual_seq_lengths_key.dtype} '\n"
+            + indent + "      f'scale={self.scale} sparse_block_size=1 sparse_mode=3 '\n"
+            + indent + "      f'layout_q=TND layout_kv=PA_BSND', flush=True)\n"
         )
         lines.insert(i, probe)
         with open(f, 'w', encoding='utf-8') as fp:
