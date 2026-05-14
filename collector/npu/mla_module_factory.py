@@ -865,6 +865,61 @@ def create_dsa_module_func(
         flush=True,
     )
 
+    # Standalone FIA self-test — no vllm context, fully synthetic, standard
+    # MLA-ish dimensions. If this passes, the previous 561002s are
+    # specific to GLM-5's head_dim=192 / scale / etc. If it fails, the
+    # OPP install on this box is missing prebuilt FIA kernels entirely.
+    try:
+        import torch_npu
+        for hd_nope, hd_rope, n_heads, sl, label in [
+            (128, 64, 16, 128, "small/standard"),
+            (192, 64, 64, 512, "GLM-5 actual"),
+        ]:
+            try:
+                q_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                k_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                v_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                q_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
+                k_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
+                out, _ = torch_npu.npu_fused_infer_attention_score(
+                    q_n, k_n, v_n,
+                    query_rope=q_r,
+                    key_rope=k_r,
+                    num_heads=n_heads,
+                    num_key_value_heads=n_heads,
+                    input_layout="TND",
+                    atten_mask=None,
+                    sparse_mode=0,
+                    scale=1.0 / ((hd_nope + hd_rope) ** 0.5),
+                    softmax_lse_flag=False,
+                    actual_seq_lengths=[sl],
+                    actual_seq_lengths_kv=[sl],
+                )
+                torch.npu.synchronize()
+                print(f"[SELF] FIA {label} hd_nope={hd_nope} hd_rope={hd_rope} "
+                      f"n_heads={n_heads} sl={sl}: OK out={tuple(out.shape)}",
+                      flush=True)
+            except Exception as e:
+                print(f"[SELF] FIA {label} hd_nope={hd_nope} hd_rope={hd_rope} "
+                      f"n_heads={n_heads} sl={sl}: FAILED {type(e).__name__}: {e}",
+                      flush=True)
+        # Also try the decode-only kernel: npu_paged_attention_mla
+        try:
+            block_size = 128
+            num_blocks = max(1, math.ceil(512 / block_size))
+            kc = torch.randn(num_blocks, block_size, 1, 512,
+                             dtype=torch.bfloat16, device=device)
+            kp = torch.randn(num_blocks, block_size, 1, 64,
+                             dtype=torch.bfloat16, device=device)
+            print(f"[SELF] paged_attention_mla cache built kc={tuple(kc.shape)} "
+                  f"kp={tuple(kp.shape)}", flush=True)
+        except Exception as e:
+            print(f"[SELF] paged cache build FAILED: {type(e).__name__}: {e}",
+                  flush=True)
+    except Exception as e:
+        print(f"[SELF] standalone harness FAILED: {type(e).__name__}: {e}",
+              flush=True)
+
     # Drill into the MLAAttention leaf and run the first preprocess steps
     # one at a time, with explicit synchronize, so we can pinpoint which
     # ATB op truly fails before mla_v1.forward (the reported "AtbRingMLA"
