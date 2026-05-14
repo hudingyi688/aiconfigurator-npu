@@ -897,6 +897,84 @@ def create_dsa_module_func(
                         torch.npu.synchronize()
                         print(f"[PROBE] q_a_layernorm OK out={tuple(q_c2.shape)}",
                               flush=True)
+                        # q_proj (Linear) on the post-LN q_c
+                        q_proj = getattr(impl, "q_proj", None)
+                        if q_proj is not None:
+                            q = q_proj(q_c2)[0].view(
+                                -1, impl.num_heads, impl.qk_head_dim
+                            )
+                            torch.npu.synchronize()
+                            print(f"[PROBE] q_proj OK out={tuple(q.shape)} "
+                                  f"dtype={q.dtype}", flush=True)
+                            q_pe = q[..., impl.qk_nope_head_dim:].contiguous()
+                            q_nope = q[..., : impl.qk_nope_head_dim].contiguous()
+                            # Pull cos/sin from the prefill metadata
+                            prefill_md = getattr(attn_metadata, "prefill", None)
+                            if prefill_md is not None:
+                                cos = prefill_md.cos
+                                sin = prefill_md.sin
+                                print(f"[PROBE] prefill cos={tuple(cos.shape)} "
+                                      f"sin={tuple(sin.shape)}",
+                                      flush=True)
+                                # rope_single on q_pe — calls npu_interleave_rope
+                                q_pe_roped = impl.rope_single(q_pe, cos, sin)
+                                torch.npu.synchronize()
+                                print(f"[PROBE] rope_single(q_pe) OK "
+                                      f"out={tuple(q_pe_roped.shape)}",
+                                      flush=True)
+                                # exec_kv_prefill — npu_kv_rmsnorm_rope_cache
+                                kv_no_split_c = kv_no_split.contiguous()
+                                slot_mapping = attn_metadata.slot_mapping[: kv_no_split_c.shape[0]]
+                                k_pe, k_c_normed = impl.exec_kv_prefill(
+                                    kv_no_split_c, cos, sin,
+                                    [kv_cache_tuple[0], kv_cache_tuple[1]],
+                                    slot_mapping,
+                                )
+                                torch.npu.synchronize()
+                                print(f"[PROBE] exec_kv_prefill OK "
+                                      f"k_pe={tuple(k_pe.shape)} "
+                                      f"k_c_normed={tuple(k_c_normed.shape)}",
+                                      flush=True)
+                                # kv_b_proj on the rmsnormed k_c
+                                k_b = impl.kv_b_proj(k_c_normed)[0].view(
+                                    -1, impl.num_heads,
+                                    impl.qk_nope_head_dim + impl.v_head_dim,
+                                )
+                                k_nope, value = k_b.split(
+                                    [impl.qk_nope_head_dim, impl.v_head_dim], dim=-1
+                                )
+                                torch.npu.synchronize()
+                                print(f"[PROBE] kv_b_proj split OK "
+                                      f"k_nope={tuple(k_nope.shape)} "
+                                      f"value={tuple(value.shape)}",
+                                      flush=True)
+                                # Now the FIA call that mla_v1._forward_prefill makes
+                                k_pe_view = k_pe.view(
+                                    q.shape[0], impl.num_kv_heads, -1
+                                ).expand((*k_nope.shape[:-1], -1)).contiguous()
+                                actual_seq_lengths_q = prefill_md.actual_seq_lengths_q
+                                attn_out, attn_lse = torch_npu.npu_fused_infer_attention_score(
+                                    q_nope, k_nope, value,
+                                    query_rope=q_pe_roped,
+                                    key_rope=k_pe_view,
+                                    num_heads=impl.num_heads,
+                                    num_key_value_heads=impl.num_heads,
+                                    input_layout="TND",
+                                    atten_mask=prefill_md.attn_mask,
+                                    sparse_mode=3,
+                                    scale=impl.scale,
+                                    antiquant_mode=0,
+                                    antiquant_scale=None,
+                                    block_table=None,
+                                    block_size=0,
+                                    softmax_lse_flag=True,
+                                    actual_seq_lengths=actual_seq_lengths_q,
+                                    actual_seq_lengths_kv=actual_seq_lengths_q.copy(),
+                                )
+                                torch.npu.synchronize()
+                                print(f"[PROBE] FIA(sparse_mode=3, TND) OK "
+                                      f"out={tuple(attn_out.shape)}",
+                                      flush=True)
                 else:
                     print("[PROBE] fused_qkv_a_proj is None — model uses kv_a_proj_with_mqa path",
                           flush=True)
