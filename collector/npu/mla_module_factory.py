@@ -952,29 +952,80 @@ def create_dsa_module_func(
                                 k_pe_view = k_pe.view(
                                     q.shape[0], impl.num_kv_heads, -1
                                 ).expand((*k_nope.shape[:-1], -1)).contiguous()
-                                actual_seq_lengths_q = prefill_md.actual_seq_lengths_q
-                                attn_out, attn_lse = torch_npu.npu_fused_infer_attention_score(
-                                    q_nope, k_nope, value,
-                                    query_rope=q_pe_roped,
-                                    key_rope=k_pe_view,
-                                    num_heads=impl.num_heads,
-                                    num_key_value_heads=impl.num_heads,
-                                    input_layout="TND",
-                                    atten_mask=prefill_md.attn_mask,
-                                    sparse_mode=3,
-                                    scale=impl.scale,
-                                    antiquant_mode=0,
-                                    antiquant_scale=None,
-                                    block_table=None,
-                                    block_size=0,
-                                    softmax_lse_flag=True,
-                                    actual_seq_lengths=actual_seq_lengths_q,
-                                    actual_seq_lengths_kv=actual_seq_lengths_q.copy(),
+                                # actual_seq_lengths_q = cumsum of query lens
+                                # — pull straight from common metadata if
+                                # the dataclass field is None on this build.
+                                actual_seq_lengths_q = (
+                                    getattr(prefill_md, "actual_seq_lengths_q", None)
+                                    or list(range(spec.seq_len, spec.seq_len * (spec.batch + 1), spec.seq_len))
                                 )
-                                torch.npu.synchronize()
-                                print(f"[PROBE] FIA(sparse_mode=3, TND) OK "
-                                      f"out={tuple(attn_out.shape)}",
+                                print(f"[PROBE] FIA inputs "
+                                      f"q_nope={tuple(q_nope.shape)} "
+                                      f"k_nope={tuple(k_nope.shape)} "
+                                      f"value={tuple(value.shape)} "
+                                      f"q_pe={tuple(q_pe_roped.shape)} "
+                                      f"k_pe={tuple(k_pe_view.shape)} "
+                                      f"asl_q={actual_seq_lengths_q} "
+                                      f"scale={impl.scale} "
+                                      f"head_dim_v={impl.v_head_dim} "
+                                      f"head_dim_qk_nope={impl.qk_nope_head_dim}",
                                       flush=True)
+                                # First try with v_head_dim==qk_nope_head_dim
+                                # (use k_nope as the value tensor) to isolate
+                                # whether the head-dim mismatch is the cause.
+                                try:
+                                    out_eq, _ = torch_npu.npu_fused_infer_attention_score(
+                                        q_nope, k_nope, k_nope,
+                                        query_rope=q_pe_roped,
+                                        key_rope=k_pe_view,
+                                        num_heads=impl.num_heads,
+                                        num_key_value_heads=impl.num_heads,
+                                        input_layout="TND",
+                                        atten_mask=prefill_md.attn_mask,
+                                        sparse_mode=3,
+                                        scale=impl.scale,
+                                        antiquant_mode=0,
+                                        antiquant_scale=None,
+                                        block_table=None,
+                                        block_size=0,
+                                        softmax_lse_flag=True,
+                                        actual_seq_lengths=actual_seq_lengths_q,
+                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                    )
+                                    torch.npu.synchronize()
+                                    print(f"[PROBE] FIA(v=k_nope, head_dim=192) OK "
+                                          f"out={tuple(out_eq.shape)}",
+                                          flush=True)
+                                except Exception as e:
+                                    print(f"[PROBE] FIA(v=k_nope, head_dim=192) FAILED: "
+                                          f"{type(e).__name__}: {e}", flush=True)
+                                # Now the real call with v_head_dim=256
+                                try:
+                                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                                        q_nope, k_nope, value,
+                                        query_rope=q_pe_roped,
+                                        key_rope=k_pe_view,
+                                        num_heads=impl.num_heads,
+                                        num_key_value_heads=impl.num_heads,
+                                        input_layout="TND",
+                                        atten_mask=prefill_md.attn_mask,
+                                        sparse_mode=3,
+                                        scale=impl.scale,
+                                        antiquant_mode=0,
+                                        antiquant_scale=None,
+                                        block_table=None,
+                                        block_size=0,
+                                        softmax_lse_flag=True,
+                                        actual_seq_lengths=actual_seq_lengths_q,
+                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                    )
+                                    torch.npu.synchronize()
+                                    print(f"[PROBE] FIA(v=value, head_dim_v=256) OK "
+                                          f"out={tuple(attn_out.shape)}",
+                                          flush=True)
+                                except Exception as e:
+                                    print(f"[PROBE] FIA(v=value, head_dim_v=256) FAILED: "
+                                          f"{type(e).__name__}: {e}", flush=True)
                 else:
                     print("[PROBE] fused_qkv_a_proj is None — model uses kv_a_proj_with_mqa path",
                           flush=True)
