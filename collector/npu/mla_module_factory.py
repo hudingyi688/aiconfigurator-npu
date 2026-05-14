@@ -999,6 +999,76 @@ def create_dsa_module_func(
                                 except Exception as e:
                                     print(f"[PROBE] FIA(v=k_nope, head_dim=192) FAILED: "
                                           f"{type(e).__name__}: {e}", flush=True)
+                                # Print mask metadata so we can see why ATB
+                                # rejects sparse_mode=3 dispatch.
+                                _m = prefill_md.attn_mask
+                                _m_info = (
+                                    f"shape={tuple(_m.shape)} dtype={_m.dtype} "
+                                    f"device={_m.device}"
+                                    if _m is not None else "None"
+                                )
+                                print(f"[PROBE] prefill attn_mask: {_m_info}", flush=True)
+                                # Try sparse_mode=0 (no implicit causal) +
+                                # explicit bf16 lower-tri mask matching seq_len.
+                                try:
+                                    seq_len = q_nope.shape[0]
+                                    custom_mask = torch.triu(
+                                        torch.full(
+                                            (seq_len, seq_len), float("-inf"),
+                                            dtype=torch.bfloat16, device=device,
+                                        ),
+                                        diagonal=1,
+                                    )
+                                    out_sm0, _ = torch_npu.npu_fused_infer_attention_score(
+                                        q_nope, k_nope, k_nope,
+                                        query_rope=q_pe_roped,
+                                        key_rope=k_pe_view,
+                                        num_heads=impl.num_heads,
+                                        num_key_value_heads=impl.num_heads,
+                                        input_layout="TND",
+                                        atten_mask=custom_mask,
+                                        sparse_mode=0,
+                                        scale=impl.scale,
+                                        antiquant_mode=0,
+                                        antiquant_scale=None,
+                                        block_table=None,
+                                        block_size=0,
+                                        softmax_lse_flag=True,
+                                        actual_seq_lengths=actual_seq_lengths_q,
+                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                    )
+                                    torch.npu.synchronize()
+                                    print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) OK "
+                                          f"out={tuple(out_sm0.shape)}",
+                                          flush=True)
+                                except Exception as e:
+                                    print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) FAILED: "
+                                          f"{type(e).__name__}: {e}", flush=True)
+                                # Try BSND layout (B=1, S=512, N=64, D=192).
+                                try:
+                                    q_bsnd = q_nope.unsqueeze(0)  # (1,512,64,192)
+                                    k_bsnd = k_nope.unsqueeze(0)
+                                    qpe_bsnd = q_pe_roped.unsqueeze(0)
+                                    kpe_bsnd = k_pe_view.unsqueeze(0)
+                                    out_bsnd, _ = torch_npu.npu_fused_infer_attention_score(
+                                        q_bsnd, k_bsnd, k_bsnd,
+                                        query_rope=qpe_bsnd,
+                                        key_rope=kpe_bsnd,
+                                        num_heads=impl.num_heads,
+                                        num_key_value_heads=impl.num_heads,
+                                        input_layout="BSND",
+                                        atten_mask=None,
+                                        sparse_mode=0,
+                                        scale=impl.scale,
+                                        softmax_lse_flag=False,
+                                    )
+                                    torch.npu.synchronize()
+                                    print(f"[PROBE] FIA(BSND, no mask) OK "
+                                          f"out={tuple(out_bsnd.shape)}",
+                                          flush=True)
+                                except Exception as e:
+                                    print(f"[PROBE] FIA(BSND, no mask) FAILED: "
+                                          f"{type(e).__name__}: {e}", flush=True)
                                 # Now the real call with v_head_dim=256
                                 try:
                                     attn_out, _ = torch_npu.npu_fused_infer_attention_score(
