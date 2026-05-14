@@ -359,6 +359,28 @@ def _build_attention_module(
     except ImportError as e:
         print(f"[WARN] register_ascend_customop unavailable: {e}")
 
+    # vllm_ascend.worker.worker registers ATB extensions and runs an ATB
+    # matmul warmup before the first model forward. AIConfigurator bypasses
+    # the worker, so the first ATB-backed kernel (eg. npu_fused_infer_
+    # attention_score(input_layout='TND', sparse_mode=3) which dispatches
+    # to AtbRingMLA on prefill) hits an uninitialised workspace and crashes
+    # with "AtbRingMLAGetWorkspaceSize failed / ERR00100 PTA call acl api
+    # failed". Register + warm up here to mirror worker.py:105 / 464.
+    try:
+        from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+        _register_atb_extensions()
+    except ImportError as e:
+        print(f"[WARN] _register_atb_extensions unavailable: {e}")
+    try:
+        import torch_npu
+        _x = torch.rand((2, 4), dtype=torch.float16, device=device)
+        _w = torch.rand((2, 4), dtype=torch.float16, device=device)
+        _c = torch.rand((4, 4), dtype=torch.float32, device=device)
+        torch_npu._npu_matmul_add_fp32(_x, _w, _c)
+        torch.npu.synchronize()
+    except Exception as e:
+        print(f"[WARN] ATB matmul warmup failed (non-fatal): {e}")
+
     hf_config = vllm_config.model_config.hf_config
     num_heads = hf_config.num_attention_heads
 
