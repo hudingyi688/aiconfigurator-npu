@@ -378,10 +378,12 @@ def _build_attention_module(
             init_workspace_manager(torch.device(device), num_ubatches=1)
     except ImportError as e:
         print(f"[WARN] init_workspace_manager unavailable: {e}")
+    _aic_probe = os.environ.get("AIC_PROBE_FIA") in {"1", "true", "TRUE"}
     try:
         from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
         _register_atb_extensions()
-        print("[ATB] _register_atb_extensions OK", flush=True)
+        if _aic_probe:
+            print("[ATB] _register_atb_extensions OK", flush=True)
     except ImportError as e:
         print(f"[WARN] _register_atb_extensions unavailable: {e}", flush=True)
     try:
@@ -391,7 +393,8 @@ def _build_attention_module(
         _c = torch.rand((4, 4), dtype=torch.float32, device=device)
         torch_npu._npu_matmul_add_fp32(_x, _w, _c)
         torch.npu.synchronize()
-        print("[ATB] _npu_matmul_add_fp32 warmup OK", flush=True)
+        if _aic_probe:
+            print("[ATB] _npu_matmul_add_fp32 warmup OK", flush=True)
     except Exception as e:
         print(f"[ATB] WARMUP FAILED: {type(e).__name__}: {e}", flush=True)
 
@@ -843,326 +846,333 @@ def create_dsa_module_func(
     def forward_fn() -> None:
         attn_module.forward(positions, hidden_states, None)
 
-    # 7. Dry run — surface failures here instead of during benchmarking.
+    # Diagnostic probes (gated). The whole block below was written to
+    # localise an OPP-binary-missing failure on this CANN install for
+    # GLM-5 (head_dim=192) attention. CANN plog confirmed
+    # errno[561003] OpName:[SparseFlashAttention_*] / [FIA_*] -
+    # "binary bin not found", so the probes are no longer needed for
+    # day-to-day runs. Set AIC_PROBE_FIA=1 to re-enable the harness.
+    if _aic_probe:
+        # 7. Dry run — surface failures here instead of during benchmarking.
     # Probe rms_norm in isolation first so we can tell whether the kernel
     # itself fails, or whether something *earlier* (ATB op cache, attn
-    # forward) tripped a stale async error that surfaces at the next sync.
-    try:
-        import torch_npu
-        _probe_x = torch.randn(8, 32, dtype=torch.bfloat16, device=device)
-        _probe_w = torch.ones(32, dtype=torch.bfloat16, device=device)
-        _probe_y, _ = torch_npu.npu_rms_norm(_probe_x, _probe_w, 1e-6)
-        torch.npu.synchronize()
-        print(f"[PROBE] npu_rms_norm OK out={tuple(_probe_y.shape)}", flush=True)
-    except Exception as e:
-        print(f"[PROBE] npu_rms_norm FAILED (pre-forward): "
-              f"{type(e).__name__}: {e}", flush=True)
-    print(
-        f"[PROBE] attn_module={type(attn_module).__name__} "
-        f"is_v32={getattr(attn_module, 'is_v32', None)} "
-        f"hidden={tuple(hidden_states.shape)} pos={tuple(positions.shape)} "
-        f"is_sparse={getattr(getattr(attn_module, 'mla_modules', None), 'is_sparse', None)}",
-        flush=True,
-    )
-
-    # Standalone FIA self-test — no vllm context, fully synthetic, standard
-    # MLA-ish dimensions. If this passes, the previous 561002s are
-    # specific to GLM-5's head_dim=192 / scale / etc. If it fails, the
-    # OPP install on this box is missing prebuilt FIA kernels entirely.
-    try:
-        import torch_npu
-
-        def _try_fia(hd_nope, hd_rope, n_heads, sl, label):
-            try:
-                q_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
-                k_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
-                v_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
-                q_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
-                k_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
-                out, _ = torch_npu.npu_fused_infer_attention_score(
-                    q_n, k_n, v_n,
-                    query_rope=q_r, key_rope=k_r,
-                    num_heads=n_heads, num_key_value_heads=n_heads,
-                    input_layout="TND",
-                    atten_mask=None, sparse_mode=0,
-                    scale=1.0 / ((hd_nope + hd_rope) ** 0.5),
-                    softmax_lse_flag=False,
-                    actual_seq_lengths=[sl],
-                    actual_seq_lengths_kv=[sl],
-                )
-                torch.npu.synchronize()
-                print(f"[BISECT] {label} hd_nope={hd_nope} hd_rope={hd_rope} "
-                      f"n_heads={n_heads} sl={sl}: OK", flush=True)
-                return True
-            except Exception as e:
-                msg = str(e)
-                code = "561002" if "561002" in msg else (
-                    "OOM" if "out of memory" in msg.lower() else "OTHER"
-                )
-                print(f"[BISECT] {label} hd_nope={hd_nope} hd_rope={hd_rope} "
-                      f"n_heads={n_heads} sl={sl}: FAILED({code})", flush=True)
-                return False
-
-        # Baseline (known good) and final (known bad).
-        _try_fia(128, 64, 16, 128, "baseline")
-        _try_fia(192, 64, 64, 512, "GLM-5-full")
-
-        # Bisect each axis from baseline-good toward GLM-5-bad.
-        # n_heads bisect (hd held at 128, sl at 128).
-        for nh in (8, 16, 32, 64, 128):
-            _try_fia(128, 64, nh, 128, f"nh-bisect-{nh}")
-        # hd_nope bisect (n_heads=16, sl=128).
-        for hd in (128, 144, 160, 176, 192, 256):
-            _try_fia(hd, 64, 16, 128, f"hd-bisect-{hd}")
-        # sl bisect (hd_nope=128, n_heads=16).
-        for sl in (128, 256, 512, 1024):
-            _try_fia(128, 64, 16, sl, f"sl-bisect-{sl}")
-        # Production-shape combos: (per-rank n_heads with TP=8/16, hd=192)
-        for nh in (4, 8, 16, 32):
-            _try_fia(192, 64, nh, 512, f"glm5-tp-nh{nh}")
-    except Exception as e:
-        print(f"[SELF] standalone harness FAILED: {type(e).__name__}: {e}",
-              flush=True)
-
-    # Drill into the MLAAttention leaf and run the first preprocess steps
-    # one at a time, with explicit synchronize, so we can pinpoint which
-    # ATB op truly fails before mla_v1.forward (the reported "AtbRingMLA"
-    # is the stale thread-local cache name, not the real culprit).
-    try:
-        import torch_npu
-        from vllm.model_executor.layers.attention.mla_attention import (
-            MLAAttention,
+        # forward) tripped a stale async error that surfaces at the next sync.
+        try:
+            import torch_npu
+            _probe_x = torch.randn(8, 32, dtype=torch.bfloat16, device=device)
+            _probe_w = torch.ones(32, dtype=torch.bfloat16, device=device)
+            _probe_y, _ = torch_npu.npu_rms_norm(_probe_x, _probe_w, 1e-6)
+            torch.npu.synchronize()
+            print(f"[PROBE] npu_rms_norm OK out={tuple(_probe_y.shape)}", flush=True)
+        except Exception as e:
+            print(f"[PROBE] npu_rms_norm FAILED (pre-forward): "
+                  f"{type(e).__name__}: {e}", flush=True)
+        print(
+            f"[PROBE] attn_module={type(attn_module).__name__} "
+            f"is_v32={getattr(attn_module, 'is_v32', None)} "
+            f"hidden={tuple(hidden_states.shape)} pos={tuple(positions.shape)} "
+            f"is_sparse={getattr(getattr(attn_module, 'mla_modules', None), 'is_sparse', None)}",
+            flush=True,
         )
-        leaf = next(
-            (m for m in attn_module.modules() if isinstance(m, MLAAttention)),
-            None,
-        )
-        impl = getattr(leaf, "impl", None) if leaf is not None else None
-        if impl is None:
-            print("[PROBE] MLAAttention impl not found, skipping preprocess drill",
-                  flush=True)
-        else:
-            with torch.inference_mode():
-                if getattr(impl, "fused_qkv_a_proj", None) is not None:
-                    qkv_lora = impl.fused_qkv_a_proj(hidden_states)[0]
+
+        # Standalone FIA self-test — no vllm context, fully synthetic, standard
+        # MLA-ish dimensions. If this passes, the previous 561002s are
+        # specific to GLM-5's head_dim=192 / scale / etc. If it fails, the
+        # OPP install on this box is missing prebuilt FIA kernels entirely.
+        try:
+            import torch_npu
+
+            def _try_fia(hd_nope, hd_rope, n_heads, sl, label):
+                try:
+                    q_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                    k_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                    v_n = torch.randn(sl, n_heads, hd_nope, dtype=torch.bfloat16, device=device)
+                    q_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
+                    k_r = torch.randn(sl, n_heads, hd_rope, dtype=torch.bfloat16, device=device)
+                    out, _ = torch_npu.npu_fused_infer_attention_score(
+                        q_n, k_n, v_n,
+                        query_rope=q_r, key_rope=k_r,
+                        num_heads=n_heads, num_key_value_heads=n_heads,
+                        input_layout="TND",
+                        atten_mask=None, sparse_mode=0,
+                        scale=1.0 / ((hd_nope + hd_rope) ** 0.5),
+                        softmax_lse_flag=False,
+                        actual_seq_lengths=[sl],
+                        actual_seq_lengths_kv=[sl],
+                    )
                     torch.npu.synchronize()
-                    print(f"[PROBE] fused_qkv_a_proj OK out={tuple(qkv_lora.shape)} "
-                          f"dtype={qkv_lora.dtype}", flush=True)
-                    q_lora_rank = impl.q_lora_rank
-                    kv_dim = impl.kv_lora_rank + impl.qk_rope_head_dim
-                    q_c, kv_no_split = qkv_lora.split([q_lora_rank, kv_dim], dim=-1)
-                    if getattr(impl, "q_a_layernorm", None) is not None:
-                        q_c2 = impl.q_a_layernorm(q_c)
+                    print(f"[BISECT] {label} hd_nope={hd_nope} hd_rope={hd_rope} "
+                          f"n_heads={n_heads} sl={sl}: OK", flush=True)
+                    return True
+                except Exception as e:
+                    msg = str(e)
+                    code = "561002" if "561002" in msg else (
+                        "OOM" if "out of memory" in msg.lower() else "OTHER"
+                    )
+                    print(f"[BISECT] {label} hd_nope={hd_nope} hd_rope={hd_rope} "
+                          f"n_heads={n_heads} sl={sl}: FAILED({code})", flush=True)
+                    return False
+
+            # Baseline (known good) and final (known bad).
+            _try_fia(128, 64, 16, 128, "baseline")
+            _try_fia(192, 64, 64, 512, "GLM-5-full")
+
+            # Bisect each axis from baseline-good toward GLM-5-bad.
+            # n_heads bisect (hd held at 128, sl at 128).
+            for nh in (8, 16, 32, 64, 128):
+                _try_fia(128, 64, nh, 128, f"nh-bisect-{nh}")
+            # hd_nope bisect (n_heads=16, sl=128).
+            for hd in (128, 144, 160, 176, 192, 256):
+                _try_fia(hd, 64, 16, 128, f"hd-bisect-{hd}")
+            # sl bisect (hd_nope=128, n_heads=16).
+            for sl in (128, 256, 512, 1024):
+                _try_fia(128, 64, 16, sl, f"sl-bisect-{sl}")
+            # Production-shape combos: (per-rank n_heads with TP=8/16, hd=192)
+            for nh in (4, 8, 16, 32):
+                _try_fia(192, 64, nh, 512, f"glm5-tp-nh{nh}")
+        except Exception as e:
+            print(f"[SELF] standalone harness FAILED: {type(e).__name__}: {e}",
+                  flush=True)
+
+        # Drill into the MLAAttention leaf and run the first preprocess steps
+        # one at a time, with explicit synchronize, so we can pinpoint which
+        # ATB op truly fails before mla_v1.forward (the reported "AtbRingMLA"
+        # is the stale thread-local cache name, not the real culprit).
+        try:
+            import torch_npu
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLAAttention,
+            )
+            leaf = next(
+                (m for m in attn_module.modules() if isinstance(m, MLAAttention)),
+                None,
+            )
+            impl = getattr(leaf, "impl", None) if leaf is not None else None
+            if impl is None:
+                print("[PROBE] MLAAttention impl not found, skipping preprocess drill",
+                      flush=True)
+            else:
+                with torch.inference_mode():
+                    if getattr(impl, "fused_qkv_a_proj", None) is not None:
+                        qkv_lora = impl.fused_qkv_a_proj(hidden_states)[0]
                         torch.npu.synchronize()
-                        print(f"[PROBE] q_a_layernorm OK out={tuple(q_c2.shape)}",
-                              flush=True)
-                        # q_proj (Linear) on the post-LN q_c
-                        q_proj = getattr(impl, "q_proj", None)
-                        if q_proj is not None:
-                            q = q_proj(q_c2)[0].view(
-                                -1, impl.num_heads, impl.qk_head_dim
-                            )
+                        print(f"[PROBE] fused_qkv_a_proj OK out={tuple(qkv_lora.shape)} "
+                              f"dtype={qkv_lora.dtype}", flush=True)
+                        q_lora_rank = impl.q_lora_rank
+                        kv_dim = impl.kv_lora_rank + impl.qk_rope_head_dim
+                        q_c, kv_no_split = qkv_lora.split([q_lora_rank, kv_dim], dim=-1)
+                        if getattr(impl, "q_a_layernorm", None) is not None:
+                            q_c2 = impl.q_a_layernorm(q_c)
                             torch.npu.synchronize()
-                            print(f"[PROBE] q_proj OK out={tuple(q.shape)} "
-                                  f"dtype={q.dtype}", flush=True)
-                            q_pe = q[..., impl.qk_nope_head_dim:].contiguous()
-                            q_nope = q[..., : impl.qk_nope_head_dim].contiguous()
-                            # Pull cos/sin from the prefill metadata
-                            prefill_md = getattr(attn_metadata, "prefill", None)
-                            if prefill_md is not None:
-                                cos = prefill_md.cos
-                                sin = prefill_md.sin
-                                print(f"[PROBE] prefill cos={tuple(cos.shape)} "
-                                      f"sin={tuple(sin.shape)}",
-                                      flush=True)
-                                # rope_single on q_pe — calls npu_interleave_rope
-                                q_pe_roped = impl.rope_single(q_pe, cos, sin)
-                                torch.npu.synchronize()
-                                print(f"[PROBE] rope_single(q_pe) OK "
-                                      f"out={tuple(q_pe_roped.shape)}",
-                                      flush=True)
-                                # exec_kv_prefill — npu_kv_rmsnorm_rope_cache
-                                kv_no_split_c = kv_no_split.contiguous()
-                                slot_mapping = attn_metadata.slot_mapping[: kv_no_split_c.shape[0]]
-                                k_pe, k_c_normed = impl.exec_kv_prefill(
-                                    kv_no_split_c, cos, sin,
-                                    [kv_cache_tuple[0], kv_cache_tuple[1]],
-                                    slot_mapping,
+                            print(f"[PROBE] q_a_layernorm OK out={tuple(q_c2.shape)}",
+                                  flush=True)
+                            # q_proj (Linear) on the post-LN q_c
+                            q_proj = getattr(impl, "q_proj", None)
+                            if q_proj is not None:
+                                q = q_proj(q_c2)[0].view(
+                                    -1, impl.num_heads, impl.qk_head_dim
                                 )
                                 torch.npu.synchronize()
-                                print(f"[PROBE] exec_kv_prefill OK "
-                                      f"k_pe={tuple(k_pe.shape)} "
-                                      f"k_c_normed={tuple(k_c_normed.shape)}",
-                                      flush=True)
-                                # kv_b_proj on the rmsnormed k_c
-                                k_b = impl.kv_b_proj(k_c_normed)[0].view(
-                                    -1, impl.num_heads,
-                                    impl.qk_nope_head_dim + impl.v_head_dim,
-                                )
-                                k_nope, value = k_b.split(
-                                    [impl.qk_nope_head_dim, impl.v_head_dim], dim=-1
-                                )
-                                torch.npu.synchronize()
-                                print(f"[PROBE] kv_b_proj split OK "
-                                      f"k_nope={tuple(k_nope.shape)} "
-                                      f"value={tuple(value.shape)}",
-                                      flush=True)
-                                # Now the FIA call that mla_v1._forward_prefill makes
-                                k_pe_view = k_pe.view(
-                                    q.shape[0], impl.num_kv_heads, -1
-                                ).expand((*k_nope.shape[:-1], -1)).contiguous()
-                                # actual_seq_lengths_q = cumsum of query lens
-                                # — pull straight from common metadata if
-                                # the dataclass field is None on this build.
-                                actual_seq_lengths_q = (
-                                    getattr(prefill_md, "actual_seq_lengths_q", None)
-                                    or list(range(spec.seq_len, spec.seq_len * (spec.batch + 1), spec.seq_len))
-                                )
-                                print(f"[PROBE] FIA inputs "
-                                      f"q_nope={tuple(q_nope.shape)} "
-                                      f"k_nope={tuple(k_nope.shape)} "
-                                      f"value={tuple(value.shape)} "
-                                      f"q_pe={tuple(q_pe_roped.shape)} "
-                                      f"k_pe={tuple(k_pe_view.shape)} "
-                                      f"asl_q={actual_seq_lengths_q} "
-                                      f"scale={impl.scale} "
-                                      f"head_dim_v={impl.v_head_dim} "
-                                      f"head_dim_qk_nope={impl.qk_nope_head_dim}",
-                                      flush=True)
-                                # First try with v_head_dim==qk_nope_head_dim
-                                # (use k_nope as the value tensor) to isolate
-                                # whether the head-dim mismatch is the cause.
-                                try:
-                                    out_eq, _ = torch_npu.npu_fused_infer_attention_score(
-                                        q_nope, k_nope, k_nope,
-                                        query_rope=q_pe_roped,
-                                        key_rope=k_pe_view,
-                                        num_heads=impl.num_heads,
-                                        num_key_value_heads=impl.num_heads,
-                                        input_layout="TND",
-                                        atten_mask=prefill_md.attn_mask,
-                                        sparse_mode=3,
-                                        scale=impl.scale,
-                                        antiquant_mode=0,
-                                        antiquant_scale=None,
-                                        block_table=None,
-                                        block_size=0,
-                                        softmax_lse_flag=True,
-                                        actual_seq_lengths=actual_seq_lengths_q,
-                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                print(f"[PROBE] q_proj OK out={tuple(q.shape)} "
+                                      f"dtype={q.dtype}", flush=True)
+                                q_pe = q[..., impl.qk_nope_head_dim:].contiguous()
+                                q_nope = q[..., : impl.qk_nope_head_dim].contiguous()
+                                # Pull cos/sin from the prefill metadata
+                                prefill_md = getattr(attn_metadata, "prefill", None)
+                                if prefill_md is not None:
+                                    cos = prefill_md.cos
+                                    sin = prefill_md.sin
+                                    print(f"[PROBE] prefill cos={tuple(cos.shape)} "
+                                          f"sin={tuple(sin.shape)}",
+                                          flush=True)
+                                    # rope_single on q_pe — calls npu_interleave_rope
+                                    q_pe_roped = impl.rope_single(q_pe, cos, sin)
+                                    torch.npu.synchronize()
+                                    print(f"[PROBE] rope_single(q_pe) OK "
+                                          f"out={tuple(q_pe_roped.shape)}",
+                                          flush=True)
+                                    # exec_kv_prefill — npu_kv_rmsnorm_rope_cache
+                                    kv_no_split_c = kv_no_split.contiguous()
+                                    slot_mapping = attn_metadata.slot_mapping[: kv_no_split_c.shape[0]]
+                                    k_pe, k_c_normed = impl.exec_kv_prefill(
+                                        kv_no_split_c, cos, sin,
+                                        [kv_cache_tuple[0], kv_cache_tuple[1]],
+                                        slot_mapping,
                                     )
                                     torch.npu.synchronize()
-                                    print(f"[PROBE] FIA(v=k_nope, head_dim=192) OK "
-                                          f"out={tuple(out_eq.shape)}",
+                                    print(f"[PROBE] exec_kv_prefill OK "
+                                          f"k_pe={tuple(k_pe.shape)} "
+                                          f"k_c_normed={tuple(k_c_normed.shape)}",
                                           flush=True)
-                                except Exception as e:
-                                    print(f"[PROBE] FIA(v=k_nope, head_dim=192) FAILED: "
-                                          f"{type(e).__name__}: {e}", flush=True)
-                                # Print mask metadata so we can see why ATB
-                                # rejects sparse_mode=3 dispatch.
-                                _m = prefill_md.attn_mask
-                                _m_info = (
-                                    f"shape={tuple(_m.shape)} dtype={_m.dtype} "
-                                    f"device={_m.device}"
-                                    if _m is not None else "None"
-                                )
-                                print(f"[PROBE] prefill attn_mask: {_m_info}", flush=True)
-                                # Try sparse_mode=0 (no implicit causal) +
-                                # explicit bf16 lower-tri mask matching seq_len.
-                                try:
-                                    seq_len = q_nope.shape[0]
-                                    custom_mask = torch.triu(
-                                        torch.full(
-                                            (seq_len, seq_len), float("-inf"),
-                                            dtype=torch.bfloat16, device=device,
-                                        ),
-                                        diagonal=1,
+                                    # kv_b_proj on the rmsnormed k_c
+                                    k_b = impl.kv_b_proj(k_c_normed)[0].view(
+                                        -1, impl.num_heads,
+                                        impl.qk_nope_head_dim + impl.v_head_dim,
                                     )
-                                    out_sm0, _ = torch_npu.npu_fused_infer_attention_score(
-                                        q_nope, k_nope, k_nope,
-                                        query_rope=q_pe_roped,
-                                        key_rope=k_pe_view,
-                                        num_heads=impl.num_heads,
-                                        num_key_value_heads=impl.num_heads,
-                                        input_layout="TND",
-                                        atten_mask=custom_mask,
-                                        sparse_mode=0,
-                                        scale=impl.scale,
-                                        antiquant_mode=0,
-                                        antiquant_scale=None,
-                                        block_table=None,
-                                        block_size=0,
-                                        softmax_lse_flag=True,
-                                        actual_seq_lengths=actual_seq_lengths_q,
-                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                    k_nope, value = k_b.split(
+                                        [impl.qk_nope_head_dim, impl.v_head_dim], dim=-1
                                     )
                                     torch.npu.synchronize()
-                                    print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) OK "
-                                          f"out={tuple(out_sm0.shape)}",
+                                    print(f"[PROBE] kv_b_proj split OK "
+                                          f"k_nope={tuple(k_nope.shape)} "
+                                          f"value={tuple(value.shape)}",
                                           flush=True)
-                                except Exception as e:
-                                    print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) FAILED: "
-                                          f"{type(e).__name__}: {e}", flush=True)
-                                # Try BSND layout (B=1, S=512, N=64, D=192).
-                                try:
-                                    q_bsnd = q_nope.unsqueeze(0)  # (1,512,64,192)
-                                    k_bsnd = k_nope.unsqueeze(0)
-                                    qpe_bsnd = q_pe_roped.unsqueeze(0)
-                                    kpe_bsnd = k_pe_view.unsqueeze(0)
-                                    out_bsnd, _ = torch_npu.npu_fused_infer_attention_score(
-                                        q_bsnd, k_bsnd, k_bsnd,
-                                        query_rope=qpe_bsnd,
-                                        key_rope=kpe_bsnd,
-                                        num_heads=impl.num_heads,
-                                        num_key_value_heads=impl.num_heads,
-                                        input_layout="BSND",
-                                        atten_mask=None,
-                                        sparse_mode=0,
-                                        scale=impl.scale,
-                                        softmax_lse_flag=False,
+                                    # Now the FIA call that mla_v1._forward_prefill makes
+                                    k_pe_view = k_pe.view(
+                                        q.shape[0], impl.num_kv_heads, -1
+                                    ).expand((*k_nope.shape[:-1], -1)).contiguous()
+                                    # actual_seq_lengths_q = cumsum of query lens
+                                    # — pull straight from common metadata if
+                                    # the dataclass field is None on this build.
+                                    actual_seq_lengths_q = (
+                                        getattr(prefill_md, "actual_seq_lengths_q", None)
+                                        or list(range(spec.seq_len, spec.seq_len * (spec.batch + 1), spec.seq_len))
                                     )
-                                    torch.npu.synchronize()
-                                    print(f"[PROBE] FIA(BSND, no mask) OK "
-                                          f"out={tuple(out_bsnd.shape)}",
+                                    print(f"[PROBE] FIA inputs "
+                                          f"q_nope={tuple(q_nope.shape)} "
+                                          f"k_nope={tuple(k_nope.shape)} "
+                                          f"value={tuple(value.shape)} "
+                                          f"q_pe={tuple(q_pe_roped.shape)} "
+                                          f"k_pe={tuple(k_pe_view.shape)} "
+                                          f"asl_q={actual_seq_lengths_q} "
+                                          f"scale={impl.scale} "
+                                          f"head_dim_v={impl.v_head_dim} "
+                                          f"head_dim_qk_nope={impl.qk_nope_head_dim}",
                                           flush=True)
-                                except Exception as e:
-                                    print(f"[PROBE] FIA(BSND, no mask) FAILED: "
-                                          f"{type(e).__name__}: {e}", flush=True)
-                                # Now the real call with v_head_dim=256
-                                try:
-                                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
-                                        q_nope, k_nope, value,
-                                        query_rope=q_pe_roped,
-                                        key_rope=k_pe_view,
-                                        num_heads=impl.num_heads,
-                                        num_key_value_heads=impl.num_heads,
-                                        input_layout="TND",
-                                        atten_mask=prefill_md.attn_mask,
-                                        sparse_mode=3,
-                                        scale=impl.scale,
-                                        antiquant_mode=0,
-                                        antiquant_scale=None,
-                                        block_table=None,
-                                        block_size=0,
-                                        softmax_lse_flag=True,
-                                        actual_seq_lengths=actual_seq_lengths_q,
-                                        actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                    # First try with v_head_dim==qk_nope_head_dim
+                                    # (use k_nope as the value tensor) to isolate
+                                    # whether the head-dim mismatch is the cause.
+                                    try:
+                                        out_eq, _ = torch_npu.npu_fused_infer_attention_score(
+                                            q_nope, k_nope, k_nope,
+                                            query_rope=q_pe_roped,
+                                            key_rope=k_pe_view,
+                                            num_heads=impl.num_heads,
+                                            num_key_value_heads=impl.num_heads,
+                                            input_layout="TND",
+                                            atten_mask=prefill_md.attn_mask,
+                                            sparse_mode=3,
+                                            scale=impl.scale,
+                                            antiquant_mode=0,
+                                            antiquant_scale=None,
+                                            block_table=None,
+                                            block_size=0,
+                                            softmax_lse_flag=True,
+                                            actual_seq_lengths=actual_seq_lengths_q,
+                                            actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                        )
+                                        torch.npu.synchronize()
+                                        print(f"[PROBE] FIA(v=k_nope, head_dim=192) OK "
+                                              f"out={tuple(out_eq.shape)}",
+                                              flush=True)
+                                    except Exception as e:
+                                        print(f"[PROBE] FIA(v=k_nope, head_dim=192) FAILED: "
+                                              f"{type(e).__name__}: {e}", flush=True)
+                                    # Print mask metadata so we can see why ATB
+                                    # rejects sparse_mode=3 dispatch.
+                                    _m = prefill_md.attn_mask
+                                    _m_info = (
+                                        f"shape={tuple(_m.shape)} dtype={_m.dtype} "
+                                        f"device={_m.device}"
+                                        if _m is not None else "None"
                                     )
-                                    torch.npu.synchronize()
-                                    print(f"[PROBE] FIA(v=value, head_dim_v=256) OK "
-                                          f"out={tuple(attn_out.shape)}",
-                                          flush=True)
-                                except Exception as e:
-                                    print(f"[PROBE] FIA(v=value, head_dim_v=256) FAILED: "
-                                          f"{type(e).__name__}: {e}", flush=True)
-                else:
-                    print("[PROBE] fused_qkv_a_proj is None — model uses kv_a_proj_with_mqa path",
-                          flush=True)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print(f"[PROBE] preprocess drill FAILED: {type(e).__name__}: {e}",
-              flush=True)
+                                    print(f"[PROBE] prefill attn_mask: {_m_info}", flush=True)
+                                    # Try sparse_mode=0 (no implicit causal) +
+                                    # explicit bf16 lower-tri mask matching seq_len.
+                                    try:
+                                        seq_len = q_nope.shape[0]
+                                        custom_mask = torch.triu(
+                                            torch.full(
+                                                (seq_len, seq_len), float("-inf"),
+                                                dtype=torch.bfloat16, device=device,
+                                            ),
+                                            diagonal=1,
+                                        )
+                                        out_sm0, _ = torch_npu.npu_fused_infer_attention_score(
+                                            q_nope, k_nope, k_nope,
+                                            query_rope=q_pe_roped,
+                                            key_rope=k_pe_view,
+                                            num_heads=impl.num_heads,
+                                            num_key_value_heads=impl.num_heads,
+                                            input_layout="TND",
+                                            atten_mask=custom_mask,
+                                            sparse_mode=0,
+                                            scale=impl.scale,
+                                            antiquant_mode=0,
+                                            antiquant_scale=None,
+                                            block_table=None,
+                                            block_size=0,
+                                            softmax_lse_flag=True,
+                                            actual_seq_lengths=actual_seq_lengths_q,
+                                            actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                        )
+                                        torch.npu.synchronize()
+                                        print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) OK "
+                                              f"out={tuple(out_sm0.shape)}",
+                                              flush=True)
+                                    except Exception as e:
+                                        print(f"[PROBE] FIA(sparse_mode=0, custom bf16 mask) FAILED: "
+                                              f"{type(e).__name__}: {e}", flush=True)
+                                    # Try BSND layout (B=1, S=512, N=64, D=192).
+                                    try:
+                                        q_bsnd = q_nope.unsqueeze(0)  # (1,512,64,192)
+                                        k_bsnd = k_nope.unsqueeze(0)
+                                        qpe_bsnd = q_pe_roped.unsqueeze(0)
+                                        kpe_bsnd = k_pe_view.unsqueeze(0)
+                                        out_bsnd, _ = torch_npu.npu_fused_infer_attention_score(
+                                            q_bsnd, k_bsnd, k_bsnd,
+                                            query_rope=qpe_bsnd,
+                                            key_rope=kpe_bsnd,
+                                            num_heads=impl.num_heads,
+                                            num_key_value_heads=impl.num_heads,
+                                            input_layout="BSND",
+                                            atten_mask=None,
+                                            sparse_mode=0,
+                                            scale=impl.scale,
+                                            softmax_lse_flag=False,
+                                        )
+                                        torch.npu.synchronize()
+                                        print(f"[PROBE] FIA(BSND, no mask) OK "
+                                              f"out={tuple(out_bsnd.shape)}",
+                                              flush=True)
+                                    except Exception as e:
+                                        print(f"[PROBE] FIA(BSND, no mask) FAILED: "
+                                              f"{type(e).__name__}: {e}", flush=True)
+                                    # Now the real call with v_head_dim=256
+                                    try:
+                                        attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                                            q_nope, k_nope, value,
+                                            query_rope=q_pe_roped,
+                                            key_rope=k_pe_view,
+                                            num_heads=impl.num_heads,
+                                            num_key_value_heads=impl.num_heads,
+                                            input_layout="TND",
+                                            atten_mask=prefill_md.attn_mask,
+                                            sparse_mode=3,
+                                            scale=impl.scale,
+                                            antiquant_mode=0,
+                                            antiquant_scale=None,
+                                            block_table=None,
+                                            block_size=0,
+                                            softmax_lse_flag=True,
+                                            actual_seq_lengths=actual_seq_lengths_q,
+                                            actual_seq_lengths_kv=list(actual_seq_lengths_q),
+                                        )
+                                        torch.npu.synchronize()
+                                        print(f"[PROBE] FIA(v=value, head_dim_v=256) OK "
+                                              f"out={tuple(attn_out.shape)}",
+                                              flush=True)
+                                    except Exception as e:
+                                        print(f"[PROBE] FIA(v=value, head_dim_v=256) FAILED: "
+                                              f"{type(e).__name__}: {e}", flush=True)
+                    else:
+                        print("[PROBE] fused_qkv_a_proj is None — model uses kv_a_proj_with_mqa path",
+                              flush=True)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[PROBE] preprocess drill FAILED: {type(e).__name__}: {e}",
+                  flush=True)
 
     try:
         with torch.inference_mode():
