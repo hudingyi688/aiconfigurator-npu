@@ -6,3 +6,6 @@ dist/
 build/
 .eggs/
 checkpoint*.json
+
+# Per-host collected data
+data/
