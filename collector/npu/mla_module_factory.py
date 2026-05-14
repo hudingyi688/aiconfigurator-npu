@@ -865,6 +865,47 @@ def create_dsa_module_func(
         flush=True,
     )
 
+    # Drill into the MLAAttention leaf and run the first preprocess steps
+    # one at a time, with explicit synchronize, so we can pinpoint which
+    # ATB op truly fails before mla_v1.forward (the reported "AtbRingMLA"
+    # is the stale thread-local cache name, not the real culprit).
+    try:
+        import torch_npu
+        from vllm.model_executor.layers.attention.mla_attention import (
+            MLAAttention,
+        )
+        leaf = next(
+            (m for m in attn_module.modules() if isinstance(m, MLAAttention)),
+            None,
+        )
+        impl = getattr(leaf, "impl", None) if leaf is not None else None
+        if impl is None:
+            print("[PROBE] MLAAttention impl not found, skipping preprocess drill",
+                  flush=True)
+        else:
+            with torch.inference_mode():
+                if getattr(impl, "fused_qkv_a_proj", None) is not None:
+                    qkv_lora = impl.fused_qkv_a_proj(hidden_states)[0]
+                    torch.npu.synchronize()
+                    print(f"[PROBE] fused_qkv_a_proj OK out={tuple(qkv_lora.shape)} "
+                          f"dtype={qkv_lora.dtype}", flush=True)
+                    q_lora_rank = impl.q_lora_rank
+                    kv_dim = impl.kv_lora_rank + impl.qk_rope_head_dim
+                    q_c, kv_no_split = qkv_lora.split([q_lora_rank, kv_dim], dim=-1)
+                    if getattr(impl, "q_a_layernorm", None) is not None:
+                        q_c2 = impl.q_a_layernorm(q_c)
+                        torch.npu.synchronize()
+                        print(f"[PROBE] q_a_layernorm OK out={tuple(q_c2.shape)}",
+                              flush=True)
+                else:
+                    print("[PROBE] fused_qkv_a_proj is None — model uses kv_a_proj_with_mqa path",
+                          flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[PROBE] preprocess drill FAILED: {type(e).__name__}: {e}",
+              flush=True)
+
     try:
         with torch.inference_mode():
             forward_fn()
