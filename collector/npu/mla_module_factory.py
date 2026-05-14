@@ -216,6 +216,7 @@ def _create_npu_vllm_config(
         dtype="bfloat16",
         seed=0,
         max_model_len=max_model_len,
+        enforce_eager=True,
     )
 
     cache_config = CacheConfig(
@@ -365,7 +366,18 @@ def _build_attention_module(
     # attention_score(input_layout='TND', sparse_mode=3) which dispatches
     # to AtbRingMLA on prefill) hits an uninitialised workspace and crashes
     # with "AtbRingMLAGetWorkspaceSize failed / ERR00100 PTA call acl api
-    # failed". Register + warm up here to mirror worker.py:105 / 464.
+    # failed". Register + warm up here to mirror worker.py:105 / 464, and
+    # initialize the v1 WorkspaceManager singleton (worker.py:310) so any
+    # workspace consumer downstream finds it ready.
+    try:
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+        if not is_workspace_manager_initialized():
+            init_workspace_manager(torch.device(device), num_ubatches=1)
+    except ImportError as e:
+        print(f"[WARN] init_workspace_manager unavailable: {e}")
     try:
         from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
         _register_atb_extensions()
