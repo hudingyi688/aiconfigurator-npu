@@ -381,8 +381,9 @@ def _build_attention_module(
     try:
         from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
         _register_atb_extensions()
+        print("[ATB] _register_atb_extensions OK", flush=True)
     except ImportError as e:
-        print(f"[WARN] _register_atb_extensions unavailable: {e}")
+        print(f"[WARN] _register_atb_extensions unavailable: {e}", flush=True)
     try:
         import torch_npu
         _x = torch.rand((2, 4), dtype=torch.float16, device=device)
@@ -390,8 +391,9 @@ def _build_attention_module(
         _c = torch.rand((4, 4), dtype=torch.float32, device=device)
         torch_npu._npu_matmul_add_fp32(_x, _w, _c)
         torch.npu.synchronize()
+        print("[ATB] _npu_matmul_add_fp32 warmup OK", flush=True)
     except Exception as e:
-        print(f"[WARN] ATB matmul warmup failed (non-fatal): {e}")
+        print(f"[ATB] WARMUP FAILED: {type(e).__name__}: {e}", flush=True)
 
     hf_config = vllm_config.model_config.hf_config
     num_heads = hf_config.num_attention_heads
@@ -842,6 +844,27 @@ def create_dsa_module_func(
         attn_module.forward(positions, hidden_states, None)
 
     # 7. Dry run — surface failures here instead of during benchmarking.
+    # Probe rms_norm in isolation first so we can tell whether the kernel
+    # itself fails, or whether something *earlier* (ATB op cache, attn
+    # forward) tripped a stale async error that surfaces at the next sync.
+    try:
+        import torch_npu
+        _probe_x = torch.randn(8, 32, dtype=torch.bfloat16, device=device)
+        _probe_w = torch.ones(32, dtype=torch.bfloat16, device=device)
+        _probe_y, _ = torch_npu.npu_rms_norm(_probe_x, _probe_w, 1e-6)
+        torch.npu.synchronize()
+        print(f"[PROBE] npu_rms_norm OK out={tuple(_probe_y.shape)}", flush=True)
+    except Exception as e:
+        print(f"[PROBE] npu_rms_norm FAILED (pre-forward): "
+              f"{type(e).__name__}: {e}", flush=True)
+    print(
+        f"[PROBE] attn_module={type(attn_module).__name__} "
+        f"is_v32={getattr(attn_module, 'is_v32', None)} "
+        f"hidden={tuple(hidden_states.shape)} pos={tuple(positions.shape)} "
+        f"is_sparse={getattr(getattr(attn_module, 'mla_modules', None), 'is_sparse', None)}",
+        flush=True,
+    )
+
     try:
         with torch.inference_mode():
             forward_fn()
