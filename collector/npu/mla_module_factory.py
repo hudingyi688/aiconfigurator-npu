@@ -132,6 +132,12 @@ class DsaModuleSpec:
     seq_len: int       # prefill seq len (context) or KV cache len (generation)
     model_path: str    # HuggingFace model name or local path
     dtype: torch.dtype = torch.bfloat16
+    force_mla: bool = False   # Strip index_topk from hf_config so the
+                              # platform selector picks AscendMLABackend
+                              # instead of AscendSFABackend. Lets us
+                              # collect a non-sparse MLA baseline on
+                              # GLM-5-style configs while the SFA kernel
+                              # path is unstable on synthetic inputs.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -295,6 +301,7 @@ def _build_attention_module(
     max_batch_size: int,
     is_context: bool,
     device: str,
+    force_mla: bool = False,
 ):
     """Build a DeepseekV2MLAAttention module with real vllm-ascend wiring.
 
@@ -305,6 +312,13 @@ def _build_attention_module(
          + bf16 default dtype.
       4. Move to NPU; fill parameters with random bf16 values (real
          post-loading layout emerges from process_weights_after_loading).
+
+    When ``force_mla`` is True, ``index_topk`` is stripped from the HF
+    config so DeepseekV2MLAAttention's ``is_v32`` detection is False —
+    no indexer is built, and the platform selector dispatches to
+    AscendMLABackend instead of AscendSFABackend. The KV cache becomes
+    a 2-tuple (k_nope, k_pe) and the unstable SparseFlashAttention
+    kernel path is bypassed entirely.
     """
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
 
@@ -347,6 +361,17 @@ def _build_attention_module(
 
     hf_config = vllm_config.model_config.hf_config
     num_heads = hf_config.num_attention_heads
+
+    # Optional: strip DSA / sparse fields from hf_config so the platform
+    # selector dispatches to AscendMLABackend instead of AscendSFABackend.
+    # DeepseekV2MLAAttention.__init__ uses ``hasattr(config, 'index_topk')``
+    # to set self.is_v32 — when False, no indexer is built and the
+    # generated MLAModules has indexer=None / is_sparse=False.
+    if force_mla:
+        for _attr in ("index_topk", "index_head_dim", "index_n_heads",
+                      "indexer_rope_interleave"):
+            if hasattr(hf_config, _attr):
+                delattr(hf_config, _attr)
 
     # DSA indexer (GlmMoeDsa / DeepSeek-V3.2) needs a pre-allocated
     # topk_indices_buffer sized to max_num_batched_tokens × index_topk.
@@ -589,29 +614,42 @@ def _create_kv_cache_and_metadata(
     seq_len: int,
     is_context: bool,
     device: str,
+    force_mla: bool = False,
 ):
-    """Create the 3-tensor KV cache tuple and AscendSFAMetadata.
+    """Create the KV cache tuple and attention metadata.
 
-    vllm-ascend's AscendSFAImpl expects kv_cache as a 3-tuple:
-      [0] k_nope  (num_blocks, block_size, 1, kv_lora_rank)
-      [1] k_pe    (num_blocks, block_size, 1, qk_rope_head_dim)
-      [2] k_li    (num_blocks, block_size, 1, index_head_dim)  DSA only
-    Builder is obtained through AscendSFABackend.get_builder_cls().
+    Two backends are supported:
+      AscendSFABackend (DSA, default for GLM-5):
+        kv_cache is a 3-tuple
+          [0] k_nope  (num_blocks, block_size, 1, kv_lora_rank)
+          [1] k_pe    (num_blocks, block_size, 1, qk_rope_head_dim)
+          [2] k_li    (num_blocks, block_size, 1, index_head_dim)
+        Builder: AscendSFABackend.get_builder_cls()
+
+      AscendMLABackend (when force_mla=True or index_topk absent):
+        kv_cache is a 2-tuple
+          [0] k_nope  (num_blocks, block_size, 1, kv_lora_rank)
+          [1] k_pe    (num_blocks, block_size, 1, qk_rope_head_dim)
+        Builder: AscendMLABackend.get_builder_cls()
     """
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
-    from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 
     hf_config = vllm_config.model_config.hf_config
     kv_lora_rank = hf_config.kv_lora_rank
     qk_rope_head_dim = hf_config.qk_rope_head_dim
     head_dim = kv_lora_rank + qk_rope_head_dim
-    index_head_dim = getattr(hf_config, "index_head_dim", 128)
-    index_topk = getattr(hf_config, "index_topk", 2048)
     block_size = vllm_config.cache_config.block_size
 
-    # Scale num_blocks to cover both this request's KV and the sparse
-    # kernel's index_topk reach.
-    min_blocks = math.ceil(max(seq_len, index_topk) / block_size)
+    use_sparse = (not force_mla) and hasattr(hf_config, "index_topk")
+    if use_sparse:
+        index_head_dim = getattr(hf_config, "index_head_dim", 128)
+        index_topk = getattr(hf_config, "index_topk", 2048)
+        # Cover this request's KV plus the sparse kernel's index_topk reach.
+        min_blocks = math.ceil(max(seq_len, index_topk) / block_size)
+    else:
+        index_head_dim = None
+        min_blocks = math.ceil(seq_len / block_size) if seq_len > 0 else 1
+
     num_blocks = max(batch_size * min_blocks, 8)
 
     kv_nope = torch.randn(
@@ -620,10 +658,14 @@ def _create_kv_cache_and_metadata(
     kv_pe = torch.randn(
         num_blocks, block_size, 1, qk_rope_head_dim, dtype=torch.bfloat16, device=device
     )
-    k_li = torch.randn(
-        num_blocks, block_size, 1, index_head_dim, dtype=torch.bfloat16, device=device
-    )
-    kv_cache_tuple = (kv_nope, kv_pe, k_li)
+    if use_sparse:
+        k_li = torch.randn(
+            num_blocks, block_size, 1, index_head_dim,
+            dtype=torch.bfloat16, device=device,
+        )
+        kv_cache_tuple = (kv_nope, kv_pe, k_li)
+    else:
+        kv_cache_tuple = (kv_nope, kv_pe)
 
     common_meta = _create_common_attn_metadata(
         batch_size=batch_size,
@@ -644,7 +686,12 @@ def _create_kv_cache_and_metadata(
     )
 
     layer_names = ["model.layers.0.self_attn.attn"]
-    builder_cls = AscendSFABackend.get_builder_cls()
+    if use_sparse:
+        from vllm_ascend.attention.sfa_v1 import AscendSFABackend
+        builder_cls = AscendSFABackend.get_builder_cls()
+    else:
+        from vllm_ascend.attention.mla_v1 import AscendMLABackend
+        builder_cls = AscendMLABackend.get_builder_cls()
     builder = builder_cls(
         kv_cache_spec, layer_names, vllm_config, torch.device(device)
     )
@@ -686,6 +733,7 @@ def create_dsa_module_func(
         max_batch_size=spec.batch,
         is_context=is_context,
         device=device,
+        force_mla=spec.force_mla,
     )
 
     # 2. Post-load hooks (FP8 packing, W_UK_T materialisation, etc).
@@ -699,6 +747,7 @@ def create_dsa_module_func(
             seq_len=spec.seq_len,
             is_context=is_context,
             device=device,
+            force_mla=spec.force_mla,
         )
 
     # 4. Bind KV cache to the attn layer so its forward() can read it.

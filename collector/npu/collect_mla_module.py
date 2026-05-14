@@ -275,19 +275,22 @@ def run_dsa_module(
     device: str = "npu:0",
     warmup_iters: int = 10,
     bench_iters: int = 50,
+    force_mla: bool = False,
 ) -> float | None:
     """Benchmark one (seq_len, batch_size) point for DSA module on NPU."""
     is_context = mode == "context"
     op_type = OP_CONTEXT if is_context else OP_GENERATION
     phase = "context" if is_context else "generation"
 
-    print(f"\n[DSA module] {phase} b={batch_size}, s={seq_len}, model={model_path}")
+    label = "MLA" if force_mla else "DSA"
+    print(f"\n[{label} module] {phase} b={batch_size}, s={seq_len}, model={model_path}")
 
     spec = DsaModuleSpec(
         op_type=op_type,
         batch=batch_size,
         seq_len=seq_len,
         model_path=model_path,
+        force_mla=force_mla,
     )
 
     try:
@@ -369,6 +372,15 @@ def main():
     parser.add_argument("--device", type=str, default="npu:0")
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--bench-iters", type=int, default=50)
+    parser.add_argument(
+        "--force-mla",
+        action="store_true",
+        help="Strip index_topk from hf_config so the platform selector "
+             "picks AscendMLABackend instead of AscendSFABackend. "
+             "Use this to collect a non-sparse MLA baseline on GLM-5 / "
+             "DSA configs while the SparseFlashAttention kernel path is "
+             "unstable on synthetic inputs.",
+    )
     args = parser.parse_args()
 
     print("Initializing vLLM + Ascend context...")
@@ -386,6 +398,7 @@ def main():
             device=args.device,
             warmup_iters=args.warmup_iters,
             bench_iters=args.bench_iters,
+            force_mla=args.force_mla,
         )
         return
 
@@ -394,7 +407,8 @@ def main():
     else:
         test_cases = get_generation_test_cases(args.model)
 
-    print(f"Running {len(test_cases)} {args.mode} DSA module test cases...")
+    label = "MLA" if args.force_mla else "DSA"
+    print(f"Running {len(test_cases)} {args.mode} {label} module test cases...")
 
     for i, (s, b) in enumerate(test_cases):
         print(f"[{i + 1}/{len(test_cases)}]", end="")
@@ -408,6 +422,7 @@ def main():
                 device=args.device,
                 warmup_iters=args.warmup_iters,
                 bench_iters=args.bench_iters,
+                force_mla=args.force_mla,
             )
         except Exception as e:
             print(f"  FAILED b={b}, s={s}: {e}")
