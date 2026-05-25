@@ -9,3 +9,6 @@ checkpoint*.json
 
 # Per-host collected data
 data/
+
+# macOS
+.DS_Store
