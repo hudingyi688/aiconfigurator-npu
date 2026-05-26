@@ -872,6 +872,7 @@ def create_dsa_module_func(
     # errno[561003] OpName:[SparseFlashAttention_*] / [FIA_*] -
     # "binary bin not found", so the probes are no longer needed for
     # day-to-day runs. Set AIC_PROBE_FIA=1 to re-enable the harness.
+    _aic_probe = os.environ.get("AIC_PROBE_FIA") in {"1", "true", "TRUE"}
     if _aic_probe:
         # 7. Dry run — surface failures here instead of during benchmarking.
     # Probe rms_norm in isolation first so we can tell whether the kernel
