@@ -88,7 +88,7 @@ exported the path in the shell).
 ### Sweep status
 
 `dsa_context_module_perf.txt` and `dsa_generation_module_perf.txt`
-are being filled by
+are filled by
 
 ```sh
 python collector/npu/collect_mla_module.py --mode context    --resume \
@@ -100,6 +100,26 @@ python collector/npu/collect_mla_module.py --mode generation --resume \
 `--resume` makes the run idempotent against the existing perf .txt,
 so a 2-3 day sweep that crashes mid-way can be re-launched without
 re-running already-collected (batch, seq) points.
+
+Sweep result on this NPU box (single 910_93, 61 GiB HBM):
+
+| Mode | Total points | Collected | OOM (HBM) |
+|---|---:|---:|---:|
+| context | 184 | 184 | 0 |
+| generation | 184 | 181 | 3 |
+
+The 3 OOM points (extreme top-right of the (batch, seq) grid):
+
+| batch | seq_len | total tokens | reason |
+|---:|---:|---:|---|
+| 256 | 131072 | 33.5 M | KV cache > 61 GiB single-card capacity |
+| 512 | 65536  | 33.5 M | same |
+| 1024| 32768+ | ≥ 33.5 M | same |
+
+**Effect on AIConfigurator**: none. Real config search uses TP/EP
+sharding so per-rank batch×kv never lands in this corner. The
+interpolator can extrapolate the upper-right corner from
+neighbouring points if a query ever needs to.
 
 ### Historical: bisection that pointed at head_dim>128 (incorrect)
 
