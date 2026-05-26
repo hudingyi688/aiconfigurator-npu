@@ -57,6 +57,25 @@ def _ensure_c_ascend_loaded() -> None:
             print(f"[WARN] failed to load {so}: {e}")
 
 
+def _ensure_custom_opp_path() -> None:
+    """Set ASCEND_CUSTOM_OPP_PATH so ACL runtime finds vllm-ascend's OOT
+    op binaries (npu_sparse_flash_attention etc.).
+
+    Without this, calls to torch.ops._C_ascend.npu_sparse_flash_attention
+    fail with errno 561003 "binary bin not found": the schema is visible
+    to the dispatcher (load_library above), but the OOT bin under
+    `_cann_ops_custom/vendors/vllm-ascend/` is not registered with ACL.
+    A real `LLM(...)` startup goes through NPUPlatform.import_kernels()
+    which sets this; collector skips that path so we call it directly.
+    """
+    try:
+        from vllm_ascend.platform import NPUPlatform  # type: ignore
+        NPUPlatform.import_kernels()
+    except Exception as e:
+        print(f"[WARN] NPUPlatform.import_kernels() failed: "
+              f"{type(e).__name__}: {e}")
+
+
 def _ensure_npu_compile_opts() -> None:
     """Mirror vllm_ascend/worker/worker.py:_init_device() init sequence.
 
@@ -101,6 +120,7 @@ def _ensure_npu_compile_opts() -> None:
 
 
 _ensure_c_ascend_loaded()
+_ensure_custom_opp_path()
 _ensure_npu_compile_opts()
 
 from vllm.config import set_current_vllm_config
