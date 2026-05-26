@@ -382,7 +382,12 @@ def _build_attention_module(
         8192,
     )
     max_num_batched_tokens = (
-        max(max_batch_size * max_seq_len, 131072) if is_context else max_batch_size
+        max(max_batch_size * max_seq_len, 131072)
+        if is_context
+        # generation: 1 token per request, but pad to a generous floor so
+        # vllm-ascend's _cos_mla[:num_tokens] cache survives sweep points
+        # with larger batch sizes (we sweep up to b=1024 in generation).
+        else max(max_batch_size, 1024)
     )
 
     vllm_config = _create_npu_vllm_config(
@@ -524,6 +529,19 @@ def _build_attention_module(
     # which AIConfigurator bypasses.
     try:
         import vllm_ascend.ops.rotary_embedding as _rope_mod
+
+        # Reset module-global cos/sin caches before re-allocating. They
+        # were sized to the FIRST run's max_num_batched_tokens; when the
+        # collector iterates to a larger (batch, seq) point the cached
+        # tensor's leading dim is too small and SFA builder crashes:
+        #   _cos_mla[:num_tokens, ...] = cos     # left=(1,1,1,64), right=(32,1,1,64)
+        # set_cos_and_sin's idempotency guard returns early if any of
+        # these are non-None, so we have to clear them ourselves.
+        for _attr in ("_cos_mla", "_sin_mla", "_cos", "_sin",
+                      "_cos_cache", "_sin_cache",
+                      "_cos_slice", "_sin_slice"):
+            if hasattr(_rope_mod, _attr):
+                setattr(_rope_mod, _attr, None)
 
         # Initialise _cos_mla / _sin_mla on NPU. Without this,
         # get_cos_and_sin_mla(use_cache=True) does
