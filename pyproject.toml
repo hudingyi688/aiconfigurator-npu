@@ -20,6 +20,7 @@ dependencies = [
     "munch>=4.0",
     "matplotlib>=3.7",
     "plotext>=5.2",
+    "prettytable>=3.0",
 ]
 
 [project.optional-dependencies]
