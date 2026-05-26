@@ -376,7 +376,19 @@ def _build_attention_module(
     # Scale num_kv_cache_blocks so every query can be placed and the
     # indexer/sparse kernels have enough KV slots.
     block_size = 64
-    max_model_len = max(max_seq_len + 1, 4096)
+    # Cap max_model_len to the model's max_position_embeddings to avoid
+    # vllm's ModelConfig validation error for the boundary sweep point
+    # (s=131072 + 1 token for generation step exceeds GLM-5's 131072
+    # cap). Read from local model config json so we don't hit HF Hub.
+    _hf_cfg_path = os.path.join(local_model_path, "config.json")
+    try:
+        import json
+        with open(_hf_cfg_path) as _f:
+            _hf_cfg_raw = json.load(_f)
+        _model_max = int(_hf_cfg_raw.get("max_position_embeddings", 131072))
+    except Exception:
+        _model_max = 131072
+    max_model_len = max(min(max_seq_len + 1, _model_max), 4096)
     num_kv_cache_blocks = max(
         1 + math.ceil((max_seq_len + 1) / block_size) * max_batch_size,
         8192,
