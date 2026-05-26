@@ -7,8 +7,8 @@ build/
 .eggs/
 checkpoint*.json
 
-# Per-host collected data
-data/
+# Per-host collected raw data (only repo-root data/, not systems/data/)
+/data/
 
 # macOS
 .DS_Store
