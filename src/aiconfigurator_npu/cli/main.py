@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from aiconfigurator import __version__
+from aiconfigurator_npu import __version__
 from aiconfigurator_npu.cli.report_and_save import log_final_summary, save_results
 from aiconfigurator_npu.cli.utils import merge_experiment_results_by_mode, process_experiment_result
 from aiconfigurator_npu.generator.api import (
