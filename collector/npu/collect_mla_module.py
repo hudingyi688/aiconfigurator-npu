@@ -310,6 +310,34 @@ def _write_row(
         writer.writerow(row)
 
 
+def _load_completed_keys(output_dir: Path, is_context: bool) -> set[tuple[int, int]]:
+    """Read the perf .txt and return the set of already-collected keys.
+
+    Used by --resume to skip (b, s) points whose latency row is already
+    on disk. Each row covers one (batch_size, seq_len) point — for
+    generation rows seq_len is reconstructed as step + 1 since isl
+    is hard-coded to 1 in the writer.
+    """
+    fname = "dsa_context_module_perf.txt" if is_context else "dsa_generation_module_perf.txt"
+    path = output_dir / fname
+    if not path.exists():
+        return set()
+    completed: set[tuple[int, int]] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                b = int(row["batch_size"])
+                if is_context:
+                    s = int(row["isl"])
+                else:
+                    s = int(row["step"]) + 1
+            except (KeyError, ValueError):
+                continue
+            completed.add((b, s))
+    return completed
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Benchmark runner
 # ═══════════════════════════════════════════════════════════════════════
@@ -430,6 +458,13 @@ def main():
              "DSA configs while the SparseFlashAttention kernel path is "
              "unstable on synthetic inputs.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip (batch, seq) points whose latency row is already in "
+             "the output txt. Useful for resuming a 2-3 day sweep after "
+             "a crash without re-running already-collected points.",
+    )
     args = parser.parse_args()
 
     print("Initializing vLLM + Ascend context...")
@@ -455,6 +490,12 @@ def main():
         test_cases = get_context_test_cases(args.model)
     else:
         test_cases = get_generation_test_cases(args.model)
+
+    if args.resume:
+        completed = _load_completed_keys(output_dir, is_context=args.mode == "context")
+        skipped = sum(1 for s, b in test_cases if (b, s) in completed)
+        test_cases = [(s, b) for s, b in test_cases if (b, s) not in completed]
+        print(f"Resume: {skipped} points already collected, {len(test_cases)} remaining.")
 
     label = "MLA" if args.force_mla else "DSA"
     print(f"Running {len(test_cases)} {args.mode} {label} module test cases...")
