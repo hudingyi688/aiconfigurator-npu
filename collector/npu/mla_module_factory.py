@@ -537,8 +537,15 @@ def _build_attention_module(
         #   _cos_mla[:num_tokens, ...] = cos     # left=(1,1,1,64), right=(32,1,1,64)
         # set_cos_and_sin's idempotency guard returns early if any of
         # these are non-None, so we have to clear them ourselves.
+        #
+        # IMPORTANT: only clear the caches that set_cos_and_sin allocates
+        # (sized by max_num_batched_tokens). Do NOT clear _cos_cache /
+        # _sin_cache / _cos_sin_cache — those are filled by
+        # RotaryEmbedding.forward via _record_cos_and_sin_cache(), sized
+        # by max_position_embeddings, and are read by get_cos_and_sin_mla
+        # before the SFA builder ever runs. Clearing them turns
+        # `_cos_cache[positions]` into None.subscript -> TypeError.
         for _attr in ("_cos_mla", "_sin_mla", "_cos", "_sin",
-                      "_cos_cache", "_sin_cache",
                       "_cos_slice", "_sin_slice"):
             if hasattr(_rope_mod, _attr):
                 setattr(_rope_mod, _attr, None)
