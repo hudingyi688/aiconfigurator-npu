@@ -17,8 +17,11 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || true
 
-# Source vllm-ascend's own set_env.bash if it exists (the install
-# script that sets ASCEND_CUSTOM_OPP_PATH for OOT dispatch).
+# vllm-ascend's set_env.bash assumes ASCEND_CUSTOM_OPP_PATH is already
+# bound (it concatenates it). With `set -u` that errors out, so we
+# pre-bind the variable to empty, then source it.
+export ASCEND_CUSTOM_OPP_PATH="${ASCEND_CUSTOM_OPP_PATH:-}"
+
 OOT_SET_ENV="/usr/local/python3.11.14/lib/python3.11/site-packages/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/bin/set_env.bash"
 if [[ -f "${OOT_SET_ENV}" ]]; then
     echo "Sourcing ${OOT_SET_ENV}"
@@ -26,7 +29,7 @@ if [[ -f "${OOT_SET_ENV}" ]]; then
     source "${OOT_SET_ENV}"
 else
     echo "Manually exporting ASCEND_CUSTOM_OPP_PATH (set_env.bash not found)"
-    export ASCEND_CUSTOM_OPP_PATH="/usr/local/python3.11.14/lib/python3.11/site-packages/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend:${ASCEND_CUSTOM_OPP_PATH:-}"
+    export ASCEND_CUSTOM_OPP_PATH="/usr/local/python3.11.14/lib/python3.11/site-packages/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend:${ASCEND_CUSTOM_OPP_PATH}"
 fi
 echo "ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH}"
 
