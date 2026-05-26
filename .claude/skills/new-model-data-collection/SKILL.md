@@ -87,43 +87,45 @@ wc -l systems/data/ascend_910b/vllm-ascend/0.18.0/dsa_*.txt
 
 #### 4.1 GEMM 长方形 (N, K) 补采
 
-**用现有 `collect_gemm.py`，shell 循环驱动，每对 (N, K) 独立调用一次**——这样 internal cartesian product 退化为单点，配合 `--resume` 安全。
+**注册模型 + 一条命令搞定**。`collect_gemm.py` 顶部维护一个 `MODEL_GEMM_SHAPES` dict，新模型在那里加一项就够；NPU 上跑 `--model <name>` 自动 sweep 它注册的所有 (N, K)（非笛卡尔积）。
 
-```bash
-cd ~/aiconfigurator-npu
-for nk in \
-  "<N1> <K1>" \
-  "<N2> <K2>" \
-  ...; do
-    set -- $nk; N=$1; K=$2
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=collector \
-        python3 collector/npu/collect_gemm.py \
-            --output-dir ./data/gemm \
-            --resume \
-            --quant-types bf16 w8a8_dynamic \
-            --n-list $N --k-list $K
-done
+**Step 4.1.1 — 在 `collector/npu/collect_gemm.py` 顶部 `MODEL_GEMM_SHAPES` 加新条目**
+
+```python
+MODEL_GEMM_SHAPES: dict[str, list[tuple[int, int]]] = {
+    "GlmMoeDsa": [
+        (24576, 6144), (6144, 12288), (4096, 6144), (6144, 2048),
+        # ... 20 unique (N, K) pairs ...
+    ],
+    "<NewModel>": [
+        # 把 Step 2 推导出的 (N, K) 集合（去重后）填进来
+    ],
+}
 ```
 
-**禁止**新写 `collect_<model>_gemm_sweep.sh` 这种 wrapper——shell 循环就够，wrapper 只是把命令藏起来。
+注册名约定：跟 hf_config 里 `architectures[0]` 取一致前缀（GLM-5 的 `GlmMoeDsaForCausalLM` -> `GlmMoeDsa`）。
 
-GLM-5 实例（21 对，BF16+W8A8 ≈ 630 行，30-90 min）：
+**Step 4.1.2 — NPU 上一条命令跑 sweep**
 
 ```bash
-for nk in \
-  "24576 6144" "12288 6144" "6144 6144" "3072 6144" \
-  "6144 12288" "6144 3072" "6144 1536" \
-  "4096 6144" "2048 6144" "1024 6144" "512 6144" \
-  "6144 2048" "6144 1024" "6144 512" "6144 256" \
-  "256 6144" \
-  "154880 6144" "77440 6144" "38720 6144" "19360 6144"; do
-    set -- $nk; N=$1; K=$2
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=collector \
-        python3 collector/npu/collect_gemm.py \
-            --output-dir ./data/gemm --resume \
-            --quant-types bf16 w8a8_dynamic --n-list $N --k-list $K
-done
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=collector \
+    python3 collector/npu/collect_gemm.py \
+        --model <NewModel> \
+        --output-dir ./data/gemm \
+        --resume \
+        --quant-types bf16 w8a8_dynamic
 ```
+
+GLM-5 实例（20 对，BF16+W8A8 ≈ 600 行，30-90 min）：
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=collector \
+    python3 collector/npu/collect_gemm.py \
+        --model GlmMoeDsa --output-dir ./data/gemm --resume \
+        --quant-types bf16 w8a8_dynamic
+```
+
+**禁止**新写 `collect_<model>_gemm_sweep.sh` 这种 wrapper——`--model` flag 已经把"按模型采"的语义放进 collector 自己。
 
 #### 4.2 MoE GroupedMatmul 补采
 

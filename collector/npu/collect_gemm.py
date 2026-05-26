@@ -10,11 +10,16 @@ Usage:
     # BF16 only, small shape set
     python collect_gemm.py --quant-types bf16 --output-dir ./gemm_data
 
-    # BF16 + W8A8, full sweep
+    # BF16 + W8A8, full sweep (cartesian product of N x K)
     python collect_gemm.py --quant-types bf16 w8a8_dynamic --output-dir ./gemm_data
 
-    # Custom M/N/K ranges
+    # Custom M/N/K ranges (cartesian product)
     python collect_gemm.py --m-list 1 16 128 1024 --n-list 4096 8192 --k-list 4096 8192
+
+    # Per-model sweep — only the (N, K) pairs the model actually queries
+    # (no cartesian product). See MODEL_GEMM_SHAPES below.
+    python collect_gemm.py --model GlmMoeDsa --quant-types bf16 w8a8_dynamic \\
+        --output-dir ./data/gemm --resume
 
     # Resume from checkpoint
     python collect_gemm.py --output-dir ./gemm_data --resume
@@ -56,6 +61,32 @@ DEFAULT_M_LIST = [
 DEFAULT_NK_LIST = [
     256, 512, 1024, 2048, 4096, 7168, 8192, 12288, 16384,
 ]
+
+# --- Per-model GEMM (N, K) shape lists ---
+# Use --model <name> to sweep exactly the (N, K) pairs that
+# aiconfigurator's Model class will query for that architecture under
+# TP={1,2,4,8}. Cuts the cartesian product down to the real op set
+# instead of N*K combos that the model never hits.
+#
+# To add a new model, walk through src/aiconfigurator_npu/sdk/models.py
+# for the matching Model class, list every ops.GEMM(...) (N, K) under
+# the supported TP values, and dedupe. See the
+# new-model-data-collection skill for the full SOP.
+MODEL_GEMM_SHAPES: dict[str, list[tuple[int, int]]] = {
+    # GLM-5 / GlmMoeDsaForCausalLM (DeepSeekV32Model decomposition):
+    #   hidden=6144, intermediate=12288, moe_intermediate=2048,
+    #   num_experts=256, vocab=154880, first_k_dense_replace=3.
+    # 20 unique (N, K) pairs covering dense MLP layers 0..2,
+    # shared-expert MLP layers 3..77, router, and lm_head logits,
+    # under TP in {1, 2, 4, 8}.
+    "GlmMoeDsa": [
+        (24576, 6144), (6144, 12288), (4096, 6144), (6144, 2048),
+        (154880, 6144), (12288, 6144), (6144, 6144), (2048, 6144),
+        (6144, 1024), (77440, 6144), (6144, 3072), (1024, 6144),
+        (6144, 512), (38720, 6144), (3072, 6144), (6144, 1536),
+        (512, 6144), (6144, 256), (19360, 6144), (256, 6144),
+    ],
+}
 
 # --- CSV output file names (must match op_mapping.yaml kernel_type) ---
 KERNEL_TYPE_MAP = {
@@ -170,6 +201,25 @@ def _build_spec_list(
             for n in n_list:
                 for k in k_list:
                     specs.append(GemmSpec(m=m, n=n, k=k, quant_type=qt))
+    return specs
+
+
+def _build_model_spec_list(
+    m_list: list[int],
+    nk_pairs: list[tuple[int, int]],
+    quant_types: list[str],
+) -> list[GemmSpec]:
+    """Build (M, N, K, quant_type) specs from explicit (N, K) pairs.
+
+    Used by --model: only the listed (N, K) get swept across M and
+    quant types, instead of the full cartesian product over n_list
+    and k_list.
+    """
+    specs = []
+    for qt in quant_types:
+        for m in m_list:
+            for n, k in nk_pairs:
+                specs.append(GemmSpec(m=m, n=n, k=k, quant_type=qt))
     return specs
 
 
@@ -300,6 +350,13 @@ def parse_args() -> argparse.Namespace:
         help="K dimensions (default: built-in list)",
     )
     parser.add_argument(
+        "--model", type=str, default=None,
+        choices=sorted(MODEL_GEMM_SHAPES.keys()),
+        help="Sweep the (N, K) pairs registered for a specific model "
+             "in MODEL_GEMM_SHAPES. Replaces the cartesian product; "
+             "mutually exclusive with --n-list / --k-list.",
+    )
+    parser.add_argument(
         "--warmup-iters", type=int, default=20,
         help="Warmup iterations per shape",
     )
@@ -330,14 +387,26 @@ def main() -> None:
     _init_vllm_context()
 
     m_list = args.m_list or DEFAULT_M_LIST
-    n_list = args.n_list or DEFAULT_NK_LIST
-    k_list = args.k_list or DEFAULT_NK_LIST
 
-    specs = _build_spec_list(m_list, n_list, k_list, args.quant_types)
-    logger.info(
-        "Parameter space: %d M x %d N x %d K x %d quant = %d total specs",
-        len(m_list), len(n_list), len(k_list), len(args.quant_types), len(specs),
-    )
+    if args.model:
+        if args.n_list or args.k_list:
+            raise SystemExit(
+                "--model is mutually exclusive with --n-list / --k-list"
+            )
+        nk_pairs = MODEL_GEMM_SHAPES[args.model]
+        specs = _build_model_spec_list(m_list, nk_pairs, args.quant_types)
+        logger.info(
+            "Model %s: %d M x %d (N,K) pairs x %d quant = %d total specs",
+            args.model, len(m_list), len(nk_pairs), len(args.quant_types), len(specs),
+        )
+    else:
+        n_list = args.n_list or DEFAULT_NK_LIST
+        k_list = args.k_list or DEFAULT_NK_LIST
+        specs = _build_spec_list(m_list, n_list, k_list, args.quant_types)
+        logger.info(
+            "Parameter space: %d M x %d N x %d K x %d quant = %d total specs",
+            len(m_list), len(n_list), len(k_list), len(args.quant_types), len(specs),
+        )
 
     run_benchmark(
         specs=specs,
