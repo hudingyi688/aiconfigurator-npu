@@ -15,8 +15,57 @@ Usage:
 import argparse
 import csv
 import gc
+import os
 import traceback
 from pathlib import Path
+
+
+def _ensure_oot_custom_opp_path() -> None:
+    """Prepend vllm-ascend's OOT custom-op vendor dir to ASCEND_CUSTOM_OPP_PATH.
+
+    vllm-ascend ships its own SparseFlashAttention bin (5 attrs) under
+    `_cann_ops_custom/vendors/vllm-ascend/`. CANN ships another one
+    under `opp/built-in/.../sparse_flash_attention/` (9 attrs). The
+    op def in vllm_ascend_C.so registers 5 attrs, so it MUST dispatch
+    to the OOT bin, otherwise the kernel reads attr index 5/6/7/8
+    out of range 5 and segfaults.
+
+    `NPUPlatform.import_kernels()` would set this variable too, but
+    it runs AFTER `import torch_npu` and ACL has already cached the
+    dispatch search path by then. Real LLM inference works because
+    the path is exported in the shell BEFORE python launches; the
+    collector skips that startup hook so we set it here, before any
+    torch import.
+
+    set_env.bash that ships with vllm-ascend hardcodes
+    `/usr/local/package/vllm-ascend/...` which is the upstream's
+    intended install prefix — wrong for any pip-installed setup.
+    Compute the real path from the importable `vllm_ascend` instead.
+    """
+    if os.environ.get("AIC_SKIP_OOT_PATH_FIX") in {"1", "true", "TRUE"}:
+        return
+    try:
+        # NOTE: import vllm_ascend before torch_npu so we don't pin the
+        # ACL custom-opp search path before this var is set.
+        import vllm_ascend  # type: ignore
+    except ImportError:
+        return
+    oot = os.path.join(
+        os.path.dirname(vllm_ascend.__file__),
+        "_cann_ops_custom", "vendors", "vllm-ascend",
+    )
+    if not os.path.isdir(oot):
+        return
+    existing = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    if oot in existing.split(":"):
+        return
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
+        f"{oot}:{existing}" if existing else oot
+    )
+
+
+_ensure_oot_custom_opp_path()
+
 
 import torch
 

@@ -62,12 +62,40 @@ def _ensure_custom_opp_path() -> None:
     op binaries (npu_sparse_flash_attention etc.).
 
     Without this, calls to torch.ops._C_ascend.npu_sparse_flash_attention
-    fail with errno 561003 "binary bin not found": the schema is visible
-    to the dispatcher (load_library above), but the OOT bin under
-    `_cann_ops_custom/vendors/vllm-ascend/` is not registered with ACL.
-    A real `LLM(...)` startup goes through NPUPlatform.import_kernels()
-    which sets this; collector skips that path so we call it directly.
+    fail in two distinct ways:
+      a) errno 561003 "binary bin not found" — schema visible to
+         dispatcher (load_library above), but no OOT bin registered.
+      b) attr index out of range — OOT path set too late so ACL
+         dispatched to CANN's 9-attr SFA instead of vllm-ascend's
+         5-attr SFA, then read past the OOT op def's 5 attrs.
+
+    Both are fixed by prepending vllm-ascend's OOT vendor dir to
+    ASCEND_CUSTOM_OPP_PATH BEFORE torch_npu is imported. The collector
+    entry script does this in its module preamble; this function is a
+    safety net for any other entry point that imports the factory.
+
+    set_env.bash that ships with vllm-ascend hardcodes
+    /usr/local/package/vllm-ascend which doesn't match a pip install,
+    so we compute the real path from vllm_ascend.__file__.
     """
+    try:
+        import vllm_ascend  # type: ignore
+    except ImportError:
+        return
+    oot = os.path.join(
+        os.path.dirname(vllm_ascend.__file__),
+        "_cann_ops_custom", "vendors", "vllm-ascend",
+    )
+    if not os.path.isdir(oot):
+        return
+    existing = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+    if oot in existing.split(":"):
+        return
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
+        f"{oot}:{existing}" if existing else oot
+    )
+    # Best-effort: also call NPUPlatform.import_kernels() so anything
+    # else it gates on _CUSTOM_OP_REGISTERED stays consistent.
     try:
         from vllm_ascend.platform import NPUPlatform  # type: ignore
         NPUPlatform.import_kernels()
