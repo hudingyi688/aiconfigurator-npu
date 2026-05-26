@@ -1478,14 +1478,23 @@ def main(args):
             pareto_fronts=pareto_fronts,
             task_configs=task_configs,
             save_dir=args.save_dir,
-            generated_backend_version=args.generated_config_version,
+            generated_backend_version=getattr(args, "generated_config_version", None),
             backend=args.backend if args.mode == "default" else None,
         )
 
 
 if __name__ == "__main__":
+    sys.exit(_console_entry())
+
+
+def _console_entry() -> int:
+    """Console-script entry point (`aic-npu` in pyproject [project.scripts]).
+
+    Parses argv and calls main(args). Kept separate so library callers
+    can build their own argparse Namespace and call main() directly.
+    """
     if generator_cli_helper(sys.argv[1:]):
-        sys.exit(0)
+        return 0
     parser = argparse.ArgumentParser(
         description="Dynamo AIConfigurator for Disaggregated Serving Deployment",
         epilog=_USAGE_EXAMPLES,
@@ -1494,3 +1503,4 @@ if __name__ == "__main__":
     configure_parser(parser)
     args = parser.parse_args()
     main(args)
+    return 0

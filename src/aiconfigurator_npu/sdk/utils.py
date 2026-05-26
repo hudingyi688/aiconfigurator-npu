@@ -282,12 +282,15 @@ def safe_mkdir(target_path: str, exist_ok: bool = True) -> Path:
 
         # Check if the parent path is within allowed locations
         current_dir = Path.cwd().resolve()
+        # NB: resolve() the well-known dirs so macOS's /tmp -> /private/tmp
+        # symlink does not break the prefix check (resolved_parent is also
+        # resolved above).
         allowed_prefixes = [
             current_dir,
-            Path.home(),
-            Path("/tmp"),
-            Path("/workspace"),
-            Path("/var/tmp"),
+            Path.home().resolve(),
+            Path("/tmp").resolve(),
+            Path("/workspace").resolve() if Path("/workspace").exists() else Path("/workspace"),
+            Path("/var/tmp").resolve(),
             Path(tempfile.gettempdir()).resolve(),
         ]
 

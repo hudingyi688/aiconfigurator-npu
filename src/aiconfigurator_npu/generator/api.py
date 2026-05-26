@@ -47,8 +47,23 @@ def generate_backend_artifacts(*args: Any, **kwargs: Any) -> None:
     raise NotImplementedError(_GENERATOR_DISABLED_MSG)
 
 
-def get_default_dynamo_version_mapping() -> dict[str, str]:
-    return {}
+def get_default_dynamo_version_mapping() -> tuple[str | None, dict[str, str]]:
+    """Caller unpacks (default_dynamo_version, default_backend_versions).
+
+    Returning a populated dict here only affects the auxiliary
+    artifact-version label written into reports; the backend search
+    itself does not depend on this. We mirror upstream-style entries
+    so callers find a value for the common backends.
+    """
+    return (
+        "stub",
+        {
+            "vllm": "0.18.0",
+            "vllm-ascend": "0.18.0",
+            "trtllm": "1.2.0",
+            "sglang": "0.4.0",
+        },
+    )
 
 
 def load_generator_overrides_from_args(args) -> dict[str, Any]:

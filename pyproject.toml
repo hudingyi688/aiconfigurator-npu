@@ -30,13 +30,18 @@ dev = [
 ]
 
 [project.scripts]
-aic-npu = "aiconfigurator_npu.cli.main:main"
+aic-npu = "aiconfigurator_npu.cli.main:_console_entry"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-aiconfigurator_npu = ["systems/*.yaml", "systems/data/**/*"]
+aiconfigurator_npu = [
+    "systems/*.yaml",
+    "systems/data/**/*",
+    "model_configs/*.json",
+    "cli/example.yaml",
+]
 
 [tool.ruff]
 line-length = 120

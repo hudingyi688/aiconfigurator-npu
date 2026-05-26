@@ -225,21 +225,30 @@ def build_disagg_parallel_lists(
                 decode_worker_config["moe_tp_list"] = parallel_config_list
                 decode_worker_config["moe_ep_list"] = [1]
         elif backend_name in ("vllm", "vllm-ascend"):
-            parallel_config_list = [1, 2, 4, 8]
+            # vllm / vllm-ascend cannot run MoE TP and MoE EP at the same
+            # time (asserted in operations.MoEDispatch.query for the vllm
+            # backends). Pin moe_tp to 1 and let moe_ep sweep, mirroring
+            # the sglang non-wideep branch above. Without this every
+            # (moe_tp>1, moe_ep>1) combo raises and we end up with empty
+            # summaries → "No results found for any parallel config".
+            # Wide range needed for large MoE like GLM-5 (671B): EP must
+            # reach 16+ for the model to fit in HBM.
+            wide_list = [1, 2, 4, 8, 16, 32, 64]
+            tp_list = [1, 2, 4, 8]
 
-            prefill_worker_config["num_gpu_per_worker"] = parallel_config_list
-            prefill_worker_config["tp_list"] = parallel_config_list
-            prefill_worker_config["pp_list"] = parallel_config_list if should_enable_pp else [1]
-            prefill_worker_config["dp_list"] = parallel_config_list
-            prefill_worker_config["moe_tp_list"] = parallel_config_list
-            prefill_worker_config["moe_ep_list"] = parallel_config_list
+            prefill_worker_config["num_gpu_per_worker"] = wide_list
+            prefill_worker_config["tp_list"] = tp_list
+            prefill_worker_config["pp_list"] = wide_list if should_enable_pp else [1]
+            prefill_worker_config["dp_list"] = wide_list
+            prefill_worker_config["moe_tp_list"] = [1]
+            prefill_worker_config["moe_ep_list"] = wide_list
 
-            decode_worker_config["num_gpu_per_worker"] = parallel_config_list
-            decode_worker_config["tp_list"] = parallel_config_list
-            decode_worker_config["pp_list"] = parallel_config_list if should_enable_pp else [1]
-            decode_worker_config["dp_list"] = parallel_config_list
-            decode_worker_config["moe_tp_list"] = parallel_config_list
-            decode_worker_config["moe_ep_list"] = parallel_config_list
+            decode_worker_config["num_gpu_per_worker"] = wide_list
+            decode_worker_config["tp_list"] = tp_list
+            decode_worker_config["pp_list"] = wide_list if should_enable_pp else [1]
+            decode_worker_config["dp_list"] = wide_list
+            decode_worker_config["moe_tp_list"] = [1]
+            decode_worker_config["moe_ep_list"] = wide_list
         else:
             raise ValueError(f"Invalid backend: {backend_name}")
 
@@ -415,12 +424,19 @@ class TaskConfigFactory:
                     worker_config["moe_tp_list"] = [1, 2, 4, 8]
                     worker_config["moe_ep_list"] = [1]
             elif ctx.backend_name in ("vllm", "vllm-ascend"):
-                worker_config["num_gpu_per_worker"] = [1, 2, 4, 8]
+                # vllm / vllm-ascend forbids MoE TP and MoE EP > 1
+                # simultaneously; pin moe_tp to 1 and sweep moe_ep.
+                # See operations.MoEDispatch.query and the matching
+                # disagg branch in build_disagg_parallel_lists.
+                # Wide range needed for very large MoE models like
+                # GLM-5 (671B) that need EP >= 16 to fit in HBM.
+                wide_list = [1, 2, 4, 8, 16, 32, 64]
+                worker_config["num_gpu_per_worker"] = wide_list
                 worker_config["tp_list"] = [1, 2, 4, 8]
-                worker_config["pp_list"] = [1, 2, 4, 8] if should_enable_pp else [1]
-                worker_config["dp_list"] = [1, 2, 4, 8]
-                worker_config["moe_tp_list"] = [1, 2, 4, 8]
-                worker_config["moe_ep_list"] = [1, 2, 4, 8]
+                worker_config["pp_list"] = wide_list if should_enable_pp else [1]
+                worker_config["dp_list"] = wide_list
+                worker_config["moe_tp_list"] = [1]
+                worker_config["moe_ep_list"] = wide_list
             else:
                 raise ValueError(f"Invalid backend: {ctx.backend_name}")
 
