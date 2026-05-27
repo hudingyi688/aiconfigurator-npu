@@ -43,13 +43,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("convert")
 
 
-# Map collector quant-type tags -> upstream dtype tags. Upstream uses
-# `float16` for "BF16/FP16 attention" historically, but for GEMM /
-# MoE the typical token is `bfloat16` / `int8`. Keep both BF16 and
-# W8A8 distinguishable.
+# Map collector quant-type tags -> GEMMQuantMode/MoEQuantMode tag names
+# in src/aiconfigurator_npu/sdk/common.py. The aiconfigurator perf
+# loader compares the perf.txt's *dtype column to these enum names,
+# so values must match exactly:
+#   GEMMQuantMode.float16        -> "float16"   (BF16 / FP16)
+#   GEMMQuantMode.w8a8_dynamic   -> "w8a8_dynamic"
 DTYPE_MAP = {
-    "bf16": "bfloat16",
-    "w8a8_dynamic": "int8",
+    "bf16": "float16",
+    "w8a8_dynamic": "w8a8_dynamic",
 }
 
 US_TO_MS = 1.0 / 1000.0
