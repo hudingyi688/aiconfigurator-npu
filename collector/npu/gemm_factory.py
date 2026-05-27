@@ -128,7 +128,21 @@ def _create_bf16_gemm(
 
 
 def _create_single_w8a8_gemm(spec: GemmSpec, device: torch.device, qc):
-    """Create a single W8A8_DYNAMIC GEMM instance."""
+    """Create a single W8A8_DYNAMIC GEMM instance.
+
+    We bypass `process_weights_after_loading` and inline the same logic
+    here, because that function's first step (`maybe_trans_nz`) calls
+    `torch_npu.npu_format_cast(FRACTAL_NZ)`, which on this CANN install
+    fails with `AclSetCompileopt(ACL_OP_JIT_COMPILE) error 500001`
+    (no `tbe` python module, AOE InitCannKB fails). When that throws,
+    the rest of the function (weight/scale flatten, scale_fp32, offset
+    flatten) never runs, leaving the layer in a half-initialised state
+    that later trips `aclnnQuantMatmulV4` with `error 161002`
+    (scale shape mismatch). Doing it ourselves means we can:
+      - try NZ cast and silently fall back to ND on failure
+      - still flatten scale/offset and produce weight_scale_fp32
+        regardless of whether NZ succeeded
+    """
     from vllm_ascend.ops.linear import AscendRowParallelLinear
 
     gemm = AscendRowParallelLinear(
@@ -153,7 +167,28 @@ def _create_single_w8a8_gemm(spec: GemmSpec, device: torch.device, qc):
         )
         gemm.weight_offset.data.zero_()
 
-    gemm.quant_method.process_weights_after_loading(gemm)
+    # Inline of vllm_ascend AscendW8A8DynamicLinearMethod.process_weights_after_loading:
+    #   1. transpose weight (out, in) -> (in, out)
+    #   2. cast to FRACTAL_NZ for kernel speed (best-effort; ND also works)
+    #   3. flatten scale + offset
+    #   4. produce weight_scale_fp32
+    with torch.no_grad():
+        gemm.weight.data = gemm.weight.data.transpose(0, 1).contiguous()
+        try:
+            import torch_npu
+            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+            gemm.weight.data = torch_npu.npu_format_cast(
+                gemm.weight.data, ACL_FORMAT_FRACTAL_NZ
+            )
+        except Exception as e:
+            # ACL JIT compile / tbe missing — fall back to ND format.
+            # aclnnQuantMatmulV4 accepts both NZ and ND for the weight.
+            print(f"[WARN] FRACTAL_NZ cast failed, using ND: {type(e).__name__}: {e}")
+
+        gemm.weight_scale.data = gemm.weight_scale.data.flatten()
+        gemm.weight_scale_fp32 = gemm.weight_scale.data.to(torch.float32)
+        gemm.weight_offset.data = gemm.weight_offset.data.flatten()
+
     return gemm
 
 
