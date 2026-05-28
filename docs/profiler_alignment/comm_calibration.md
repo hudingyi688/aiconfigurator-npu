@@ -85,6 +85,76 @@ factor of the nearest measured EP (ties broken toward the larger EP),
 not to 1.0 — silent 1.0 fallback was letting unmeasured EP points look
 artificially fast in Pareto search and outranking calibrated points.
 
+## Production vs prediction (4k/1.5k benchmark)
+
+Real-host benchmark, 32× Ascend 910B, GLM-5, isl=4096, osl=1536,
+production deployment with chunked prefill enabled:
+
+| Concurrency | TPOT_P50 (ms) | QPS  | tokens/s/gpu |
+|-------------|---------------|------|--------------|
+| 34          | 30.2          | 0.64 | 30.7         |
+| 102         | 37.3          | 1.53 | 73.4         |
+| 170         | 44.2          | 2.09 | 100.4        |
+| 204         | 51.3          | 2.22 | 106.5        |
+| 272         | 53.0          | 2.73 | 131.0        |
+
+aic-npu Pareto top-1, same model, total_gpus=32, isl=4000, osl=1000,
+ttft=8000, tpot=200:
+
+| Stage                        | Top-1 config           | bs | tokens/s/gpu | gap to prod |
+|------------------------------|------------------------|----|--------------|-------------|
+| baseline (no calibration)    | tp8 dp4 ep32           | 24 | 27.94        | -75%        |
+| v2 (single-phase, wrong M)   | tp8 dp4 ep32           | 20 | 22.80        | -78%        |
+| **v3 (phase-split)**         | **tp2 dp16 ep32**      | 12 | **80.65**    | **-25%**    |
+
+Calibration takes the prediction error from 4× too pessimistic to
+~1.3× too pessimistic, **and** flips the recommended config from
+tp8 dp4 (sub-optimal) to tp2 dp16 (matches the regime production
+actually runs in).
+
+The ~25% residual is **systematic and not addressable by calibration**;
+see Blind spots below.
+
+## Blind spots
+
+These are gaps the multiplicative-factor approach cannot close. They
+explain why predictions stay ~25% below real-host throughput at the
+optimum and why predictions diverge further on long-context inputs.
+
+1. **Attention/comm overlap**. vllm-ascend uses CUDA-graph-style
+   capture and overlaps comm with the next layer's compute. The
+   analytical model sums the two as if serial. No factor on a comm
+   op can recover this — overlap is a scheduling property, not a
+   per-op latency property.
+2. **Chunked prefill**. Production prefill is chunked and interleaved
+   with decode. TTFT in the model assumes a single contiguous prefill
+   pass, so model TTFT grows linearly with isl while real TTFT grows
+   sub-linearly (the 4k/60k production runs differ by ~3.6× TTFT for
+   ~15× isl).
+3. **TPOT-vs-isl inversion**. Real TPOT decreases slightly as isl
+   grows (37 ms → 30 ms from 5k to 60k input) because the scheduler
+   amortizes fixed overheads across more tokens. The analytical
+   model has TPOT growing with KV cache length (attention SOL ~ s).
+   Calibration cannot reverse this trend.
+4. **Single-shape profiler reference**. Each `(op, ep, phase)` factor
+   is anchored at one (M, H, K) point. HCCL latency is roughly
+   alpha + beta·msg_size, so the ratio profiler/SOL drifts with
+   actual message size. We accept this and re-anchor only when the
+   reference shape moves to a new band (e.g. H=6144 → H=8192).
+5. **EP coverage holes**. profiler data covers ep ∈ {8, 10, 16};
+   ep=2/4 fall back to ep=8, ep=24/32 fall back to ep=16. Topology
+   crossings inside those ranges (e.g. ep=8 fully intra-node vs
+   ep=16 cross-node) bias the fallback in either direction.
+6. **DSA module data is single-point**. `dsa_generation_module_perf.txt`
+   only covers num_heads=64 (TP=1). Search at TP>1 forces HYBRID
+   mode for the attention component, so attention latency in the
+   prediction is itself SOL+empirical, not silicon. Calibration has
+   no signal there to work with.
+
+For accuracy improvements beyond ~25%, build a scheduling-aware
+runtime model (overlap, chunked prefill, KV scheduling). That is out
+of scope for the perf-database approach.
+
 ## When to refresh
 
 Re-run `tools/build_comm_calibration.py <profiler_root> <output_json>`
