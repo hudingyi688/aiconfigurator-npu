@@ -108,6 +108,7 @@ def build_disagg_parallel_lists(
     *,
     prefill_enable_wideep: bool | None = None,
     decode_enable_wideep: bool | None = None,
+    model_family: str | None = None,
 ) -> tuple[dict, dict]:
     """Build the TP/PP/DP/MoE-TP/MoE-EP search-space lists for disagg enumeration.
 
@@ -234,12 +235,21 @@ def build_disagg_parallel_lists(
             # Wide range needed for large MoE like GLM-5 (671B): EP must
             # reach 16+ for the model to fit in HBM.
             wide_list = [1, 2, 4, 8, 16, 32, 64]
-            # GLM-5 production prefill uses tp=16 (one A3 host = 16 cards).
-            # The earlier tp_list=[1,2,4,8] cap silently excluded this from
-            # the disagg search; prefill tp must reach 16 to cover the
-            # canonical PD-disaggregated deployment shape.
             prefill_tp_list = [1, 2, 4, 8, 16]
             decode_tp_list = [1, 2, 4, 8]
+
+            # DEEPSEEKV32 covers DeepSeek-V3.2 + GLM-5: 671B-class MoE
+            # where the aiconfigurator memory model is too optimistic
+            # about low-TP fit (it spreads expert weights across ep
+            # ranks but ignores per-rank KV pool / activation overhead
+            # that vllm-ascend's actual deployment requires). Production
+            # GLM-5 on Ascend 910B uses prefill tp=16 (one A3 host) and
+            # decode tp=4 — pin the search to those values so disagg
+            # recommendations stay deployable. Without this pin, search
+            # returns prefill tp=2 dp=16 which the runtime can't fit.
+            if backend_name == "vllm-ascend" and model_family == "DEEPSEEKV32":
+                prefill_tp_list = [16]
+                decode_tp_list = [4]
 
             prefill_worker_config["num_gpu_per_worker"] = wide_list
             prefill_worker_config["tp_list"] = prefill_tp_list
@@ -460,6 +470,7 @@ class TaskConfigFactory:
             decode_system=decode_system,
             is_moe=ctx.is_moe,
             enable_wideep=ctx.enable_wideep,
+            model_family=ctx.model_family,
         )
 
         # Attach runtime metadata that _disagg_defaults_layer needs but
