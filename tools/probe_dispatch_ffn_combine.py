@@ -272,12 +272,23 @@ def main() -> None:
             try:
                 comm = FusedMC2CommImpl(moe_cfg)
                 _ok(f"FusedMC2CommImpl built")
+                # MoEWeights.w1 / w2 / w1_scale / w2_scale must be
+                # list[Tensor] (one tensor per local expert) — the
+                # underlying op signature is `Tensor[]` and
+                # fused_experts passes the field straight through.
+                w1_list = list(w1.unbind(0))
+                w2_list = list(w2.unbind(0))
+                s1_list = list(s1.unbind(0))
+                s2_list = list(s2.unbind(0))
                 # If we got here, try fused_experts()
                 input_ = MoEFusedExpertsInput(
                     hidden_states=x,
                     topk_weights=probs,
                     topk_ids=topk_ids,
-                    weights=MoEWeights(w1=w1, w2=w2, w1_scale=s1, w2_scale=s2),
+                    weights=MoEWeights(
+                        w1=w1_list, w2=w2_list,
+                        w1_scale=s1_list, w2_scale=s2_list,
+                    ),
                     routing=MoERoutingParams(
                         expert_map=torch.arange(NL, dtype=i32, device=dev),
                         global_redundant_expert_num=0,
