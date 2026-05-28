@@ -131,22 +131,26 @@ def main() -> None:
         # Per profiler: w1 = (NL, H, 2*I) when fused gate_up; w2 = (NL, I, H)
         w1 = torch.randint(-128, 127, (NL, H, 2 * I), dtype=i8, device=dev)
         w2 = torch.randint(-128, 127, (NL, I, H), dtype=i8, device=dev)
+
         # ACL says scale must be INT64 — npu_trans_quant_param packs
         # weight_scale (fp32) into int64 (Ascend deq_scale convention).
-        # Use torch_npu.npu_trans_quant_param to build it correctly.
+        # The trans op only accepts 1D scale (n,) — call it per-expert.
+        def _trans(per_expert_fp32: torch.Tensor) -> torch.Tensor:
+            """per_expert_fp32: (NL, n) -> int64 (NL, n)."""
+            outs = []
+            for i in range(per_expert_fp32.shape[0]):
+                out = torch_npu.npu_trans_quant_param(
+                    per_expert_fp32[i].contiguous(), None,
+                )
+                outs.append(out.unsqueeze(0))
+            return torch.cat(outs, dim=0).to(torch.int64)
+
         w1_scale_fp32 = (torch.rand(NL, 2 * I, dtype=f32, device=dev) * 0.1 + 0.01)
         w2_scale_fp32 = (torch.rand(NL, H,     dtype=f32, device=dev) * 0.1 + 0.01)
-        try:
-            s1 = torch_npu.npu_trans_quant_param(w1_scale_fp32, None)
-            s2 = torch_npu.npu_trans_quant_param(w2_scale_fp32, None)
-            print(f"  scale1 dtype after trans_quant_param: {s1.dtype} shape={tuple(s1.shape)}")
-        except Exception as e:
-            print(f"  npu_trans_quant_param failed: {e}; falling back to int64 view")
-            # Fallback: bitcast fp32 to int32, pad to int64
-            s1 = torch.zeros(NL, 2 * I, dtype=i64, device=dev)
-            s2 = torch.zeros(NL, H,     dtype=i64, device=dev)
-            s1.view(torch.float32).copy_(w1_scale_fp32.unsqueeze(-1).expand(-1, -1, 2).reshape(NL, -1)[:, ::2])
-            s2.view(torch.float32).copy_(w2_scale_fp32.unsqueeze(-1).expand(-1, -1, 2).reshape(NL, -1)[:, ::2])
+        s1 = _trans(w1_scale_fp32)
+        s2 = _trans(w2_scale_fp32)
+        print(f"  scale1: dtype={s1.dtype} shape={tuple(s1.shape)}")
+        print(f"  scale2: dtype={s2.dtype} shape={tuple(s2.shape)}")
 
         topk_ids = torch.randint(0, NE, (M, TOPK), dtype=i32, device=dev)
         probs = torch.rand(M, TOPK, dtype=f32, device=dev)
@@ -219,54 +223,74 @@ def main() -> None:
             )
             _ok(f"manually set parallel_state._MC2")
 
-        parallel_cfg = FusedMoEParallelConfig(
-            tp_size=1, pcp_size=1, dp_size=1, ep_size=1,
-            tp_rank=0, pcp_rank=0, dp_rank=0, ep_rank=0,
-            sp_size=1, use_ep=True,
-            all2all_backend="naive", enable_eplb=False,
-        )
-        moe_cfg = FusedMoEConfig(
-            num_experts=NE,
-            experts_per_token=TOPK,
-            hidden_dim=H,
-            intermediate_size_per_partition=I,
-            num_local_experts=NL,
-            num_logical_experts=NE,
-            activation=MoEActivation.SILU,
-            device=torch.device(dev),
-            routing_method=RoutingMethodType.Renormalize,
-            moe_parallel_config=parallel_cfg,
-            in_dtype=bf16,
-        )
-        _ok(f"FusedMoEConfig built: {moe_cfg.num_experts=} {moe_cfg.hidden_dim=}")
-
+        # TokenDispatcherWithMC2.__init__ also calls
+        # get_current_vllm_config() — we need a vllm context active.
+        # Build the smallest VllmConfig with required fields, like
+        # collect_mla_module.py does.
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.config.parallel import ParallelConfig
+        # ParallelConfig defaults are fine for a single-rank probe.
+        vllm_config = VllmConfig()
+        # If parallel_config is required:
         try:
-            comm = FusedMC2CommImpl(moe_cfg)
-            _ok(f"FusedMC2CommImpl built")
-            # If we got here, try fused_experts()
-            input_ = MoEFusedExpertsInput(
-                hidden_states=x,
-                topk_weights=probs,
-                topk_ids=topk_ids,
-                weights=MoEWeights(w1=w1, w2=w2, w1_scale=s1, w2_scale=s2),
-                routing=MoERoutingParams(
-                    expert_map=torch.arange(NL, dtype=i32, device=dev),
-                    global_redundant_expert_num=0,
-                    mc2_mask=None,
-                    apply_router_weight_on_input=False,
-                ),
-                quant=MoEQuantParams(),
+            vllm_config.parallel_config = ParallelConfig(
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
             )
+        except Exception:
+            pass
+
+        with set_current_vllm_config(vllm_config):
+            parallel_cfg = FusedMoEParallelConfig(
+                tp_size=1, pcp_size=1, dp_size=1, ep_size=1,
+                tp_rank=0, pcp_rank=0, dp_rank=0, ep_rank=0,
+                sp_size=1, use_ep=True,
+                all2all_backend="naive", enable_eplb=False,
+            )
+            moe_cfg = FusedMoEConfig(
+                num_experts=NE,
+                experts_per_token=TOPK,
+                hidden_dim=H,
+                intermediate_size_per_partition=I,
+                num_local_experts=NL,
+                num_logical_experts=NE,
+                activation=MoEActivation.SILU,
+                device=torch.device(dev),
+                routing_method=RoutingMethodType.Renormalize,
+                moe_parallel_config=parallel_cfg,
+                in_dtype=bf16,
+            )
+            _ok(f"FusedMoEConfig built: {moe_cfg.num_experts=} {moe_cfg.hidden_dim=}")
+
             try:
-                result = comm.fused_experts(input_)
-                torch.npu.synchronize()
-                _ok(f"fused_experts ok: {tuple(result.routed_out.shape)}")
+                comm = FusedMC2CommImpl(moe_cfg)
+                _ok(f"FusedMC2CommImpl built")
+                # If we got here, try fused_experts()
+                input_ = MoEFusedExpertsInput(
+                    hidden_states=x,
+                    topk_weights=probs,
+                    topk_ids=topk_ids,
+                    weights=MoEWeights(w1=w1, w2=w2, w1_scale=s1, w2_scale=s2),
+                    routing=MoERoutingParams(
+                        expert_map=torch.arange(NL, dtype=i32, device=dev),
+                        global_redundant_expert_num=0,
+                        mc2_mask=None,
+                        apply_router_weight_on_input=False,
+                    ),
+                    quant=MoEQuantParams(),
+                )
+                try:
+                    result = comm.fused_experts(input_)
+                    torch.npu.synchronize()
+                    _ok(f"fused_experts ok: {tuple(result.routed_out.shape)}")
+                except Exception as e:
+                    _fail("fused_experts call", e)
+                    traceback.print_exc()
             except Exception as e:
-                _fail("fused_experts call", e)
+                _fail("FusedMC2CommImpl ctor", e)
                 traceback.print_exc()
-        except Exception as e:
-            _fail("FusedMC2CommImpl ctor", e)
-            traceback.print_exc()
 
     except Exception as e:
         _fail("imports for path 5", e)
