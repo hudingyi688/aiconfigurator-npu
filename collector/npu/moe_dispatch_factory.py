@@ -307,16 +307,14 @@ def create_dispatch_combine_func(
     if spec.quant_type == "w8a8_dynamic":
         dtype = torch.bfloat16
         w1_list, w2_list, s1_list, s2_list = _make_w8a8_inputs(spec, dctx)
-        # MoEQuantParams default has QuantType.NONE; vllm-ascend's
-        # FusedMC2CommImpl sees w1_scale != None and dispatches the
-        # quant path. comm_quant_mode=2 mirrors production W8A8.
-        from vllm_ascend.quantization.quant_config import QuantType
-        try:
-            quant_params = MoEQuantParams(
-                quant_type=QuantType.W8A8, comm_quant_mode=2,
-            )
-        except Exception:
-            quant_params = MoEQuantParams()
+        # FusedMC2CommImpl.fused_experts dispatches to dispatch_ffn_combine
+        # purely based on `w1_scale is not None` (line 267 of
+        # moe_comm_method.py). MoEQuantParams() with defaults works
+        # for the W8A8 path; we don't need to set quant_type
+        # explicitly. Earlier attempts to import QuantType failed
+        # because it lives in different module locations across
+        # vllm-ascend versions.
+        quant_params = MoEQuantParams()
     elif spec.quant_type == "bf16":
         # FusedMC2CommImpl asserts w1_scale/w2_scale != None, i.e. it
         # only supports W8A8. BF16 in production goes through a
