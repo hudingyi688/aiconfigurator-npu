@@ -318,9 +318,20 @@ def create_dispatch_combine_func(
         except Exception:
             quant_params = MoEQuantParams()
     elif spec.quant_type == "bf16":
-        dtype = torch.bfloat16
-        w1_list, w2_list, s1_list, s2_list = _make_bf16_inputs(spec, dctx)
-        quant_params = MoEQuantParams()
+        # FusedMC2CommImpl asserts w1_scale/w2_scale != None, i.e. it
+        # only supports W8A8. BF16 in production goes through a
+        # different path: TokenDispatcherWithMC2.token_dispatch ->
+        # per-expert GEMM -> token_combine (three separate ops, see
+        # profiler MoeDistributeDispatchV2 + GroupedMatmul +
+        # MoeDistributeCombineV2). That requires a custom collector
+        # we have not written yet; skip with a clear error so the
+        # sweep driver records "no bf16 data" rather than misreporting.
+        raise NotImplementedError(
+            "bf16 dispatch+combine bench requires the unfused "
+            "TokenDispatcherWithMC2 path (token_dispatch + expert "
+            "GEMM + token_combine). Not implemented yet — only "
+            "W8A8 (FusedMC2CommImpl) is supported in this collector."
+        )
     else:
         raise ValueError(f"unsupported quant_type: {spec.quant_type}")
 
