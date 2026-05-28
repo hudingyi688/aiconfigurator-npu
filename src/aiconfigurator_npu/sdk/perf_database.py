@@ -4736,7 +4736,7 @@ class PerfDatabase:
             sol_time = 0.0
             p2p_bw = self._get_p2p_bandwidth(num_gpus)
 
-            if operation == "all_gather" or operation == "alltoall" or operation == "reduce_scatter":
+            if operation in ("all_gather", "alltoall", "all_to_all", "reduce_scatter"):
                 sol_time = dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000
             elif operation == "all_reduce":
                 sol_time = 2 * dtype.value.memory * message_size * (num_gpus - 1) / num_gpus / p2p_bw * 1000

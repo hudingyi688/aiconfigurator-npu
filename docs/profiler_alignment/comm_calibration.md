@@ -28,17 +28,29 @@ Instead we keep the analytical model and apply a per-`(op_kind, ep_size)`
 multiplicative factor on top:
 
 ```
-modeled_latency  = alpha_beta(volume, ep_size, topology)
+factor[op_kind, ep_size] = profiler_median_latency[op_kind, ep_size]
+                         / sol_alpha_beta_latency[op_kind, ep_size]
+modeled_latency  = sol_alpha_beta(volume, ep_size, topology)
 reported_latency = modeled_latency * factor[op_kind, ep_size]
 ```
 
-The factor is the ratio of profiler-median latency at that EP size to
-the profiler-median at a baseline EP size for the same op. Because the
-ratio is normalized by the model itself at the baseline point, the
-factor stays meaningful when message sizes change — it captures the
-topology delta (intra-node HCCS vs cross-node RoCE) that the
-analytical model misses, not the message-size scaling that the model
-already gets right.
+Each EP is **anchored to its own SOL** — we do **not** divide through
+ep=1. The earlier version divided through ep=1, which is a degenerate
+dispatch path (256 experts on one rank, no real alltoallv traffic) and
+produced misleading factors: ep=8 looked 5× faster than the model and
+ep=16 looked 2× slower. With per-EP self-anchoring, factors directly
+read as "how much slower than alpha-beta this op runs at this EP" —
+e.g. 6.67 at ep=16 W8A8 dispatch+combine reflects that crossing the
+node boundary on RoCE costs ~6.7× the intra-node SOL prediction.
+
+## SOL all_to_all fix
+
+`PerfDatabase.query_nccl(... operation="all_to_all", database_mode=SOL)`
+previously returned 0 because the SOL switch only matched the legacy
+`"alltoall"` spelling. Production callers (`MoEDispatch.query()` for
+vllm-ascend) pass `"all_to_all"`, so the entire fused-MoE comm SOL
+silently zeroed out before this fix. The matcher now accepts both
+spellings.
 
 ## Where the data lives
 
@@ -60,16 +72,15 @@ Op kinds currently calibrated:
 | `reduce_scatter`              | DP-1 attention reduce-scatter               |
 | `all_to_all`                  | (reserved; not yet wired through MoEDispatch)|
 
-EP coverage: 1, 8, 10, 16. Unmeasured EP sizes fall back to the
+EP coverage: 8, 10, 16. Unmeasured EP sizes fall back to the
 factor of the nearest measured EP (ties broken toward the larger EP),
 not to 1.0 — silent 1.0 fallback was letting unmeasured EP points look
 artificially fast in Pareto search and outranking calibrated points.
 
 ## When to refresh
 
-Re-run the profiler aggregation (`tools/build_comm_calibration.py` —
-TODO; the current JSON was hand-written from the
-`/tmp/glm5_profiler/glm-profiler/` runs of 2026-05-28) when:
+Re-run `tools/build_comm_calibration.py <profiler_root> <output_json>`
+when:
 
 - HCCL / CANN / vllm-ascend / driver versions change,
 - EP topology changes (more nodes, different intra-node interconnect),

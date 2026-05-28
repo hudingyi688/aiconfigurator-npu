@@ -1,35 +1,24 @@
 {
-  "doc": "Per (op, ep) correction factor: profiler median latency / baseline ep latency. Apply as scalar multiplier on top of aiconfigurator analytical comm model. Reflects production topology (intra-node HCCS vs cross-node RoCE) but is invariant to specific message sizes — only the alpha+beta constants are rescaled.",
-  "baseline_ep_per_op": {
-    "all_gather": 1,
-    "all_reduce": 1,
-    "all_to_all": 1,
-    "moe_combine_bf16": 1,
-    "moe_dispatch_bf16": 1,
-    "moe_dispatch_combine_w8a8": 1,
-    "reduce_scatter": 1
-  },
+  "doc": "Per (op_kind, ep_size) correction factor: profiler median latency / aiconfigurator SOL alpha-beta latency at GLM-5 reference shape (H=6144, M=128, K=8). Each ep is anchored to its OWN SOL \u2014 the previous version divided through ep=1, which gave misleadingly small factors at intra-node ep and inflated factors at cross-node ep. Apply as scalar multiplier on top of aiconfigurator's analytical comm model.",
   "factors": {
-    "all_gather@ep1": 1.0,
-    "all_gather@ep8": 0.1899,
-    "all_gather@ep10": 0.1901,
-    "all_gather@ep16": 1.5897,
-    "all_reduce@ep1": 1.0,
-    "all_reduce@ep8": 0.9252,
-    "all_reduce@ep10": 1.5689,
-    "all_to_all@ep1": 1.0,
-    "all_to_all@ep16": 2.5818,
-    "moe_combine_bf16@ep1": 1.0,
-    "moe_combine_bf16@ep8": 1.1742,
-    "moe_combine_bf16@ep10": 0.8544,
-    "moe_dispatch_bf16@ep1": 1.0,
-    "moe_dispatch_bf16@ep8": 1.9702,
-    "moe_dispatch_bf16@ep10": 3.4618,
-    "moe_dispatch_combine_w8a8@ep1": 1.0,
-    "moe_dispatch_combine_w8a8@ep8": 0.1957,
-    "moe_dispatch_combine_w8a8@ep10": 0.1987,
-    "moe_dispatch_combine_w8a8@ep16": 2.081,
-    "reduce_scatter@ep1": 1.0,
-    "reduce_scatter@ep16": 0.9969
+    "all_gather@ep10": 0.1805,
+    "all_gather@ep16": 1.4859,
+    "all_gather@ep8": 0.4146,
+    "all_reduce@ep10": 0.1409,
+    "all_reduce@ep8": 0.1914,
+    "all_to_all@ep16": 3.0586,
+    "moe_combine_bf16@ep10": 0.1574,
+    "moe_combine_bf16@ep8": 0.4985,
+    "moe_dispatch_bf16@ep10": 0.4562,
+    "moe_dispatch_bf16@ep8": 0.5983,
+    "moe_dispatch_combine_w8a8@ep10": 0.6612,
+    "moe_dispatch_combine_w8a8@ep16": 6.6739,
+    "moe_dispatch_combine_w8a8@ep8": 1.501,
+    "reduce_scatter@ep16": 6.6835
+  },
+  "reference_shape": {
+    "H": 6144,
+    "K": 8,
+    "M": 128
   }
 }
