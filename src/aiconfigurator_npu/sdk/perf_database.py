@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import functools
 import importlib.resources as pkg_resources
+import json
 import logging
 import math
 import os
@@ -2204,6 +2205,26 @@ class PerfDatabase:
         if backend == "trtllm":
             self._wideep_moe_compute_data = _load_op_data(PerfDataFilename.wideep_moe_compute)
             self._trtllm_alltoall_data = _load_op_data(PerfDataFilename.trtllm_alltoall)
+
+        # Optional comm-latency correction (vllm-ascend only).
+        # Profiler-derived multiplicative factors per (op_kind, ep_size)
+        # rescale the analytical alpha-beta comm model to match production
+        # topology (intra-node HCCS vs cross-node RoCE). File is optional;
+        # missing keys fall back to 1.0 (i.e. unmodified analytical value).
+        self._comm_calibration: dict[str, float] = {}
+        cal_path = os.path.join(data_dir, "comm_calibration.json")
+        if os.path.isfile(cal_path):
+            try:
+                with open(cal_path) as fh:
+                    cal_doc = json.load(fh)
+                self._comm_calibration = dict(cal_doc.get("factors", {}))
+                logger.info(
+                    "loaded comm calibration: %d entries from %s",
+                    len(self._comm_calibration),
+                    cal_path,
+                )
+            except (OSError, ValueError) as e:
+                logger.warning("failed to load comm calibration %s: %s", cal_path, e)
 
         # pre-correction
         self._correct_data()
@@ -4527,6 +4548,23 @@ class PerfDatabase:
                     f"{kvcache_quant_mode=}, {fmha_quant_mode=}"
                 ),
             )
+
+    def query_comm_calibration(self, op_kind: str, ep_size: int) -> float:
+        """
+        Profiler-derived correction factor for comm latency.
+
+        Multiplicative scalar applied on top of the analytical alpha-beta
+        comm model to reflect production topology (HCCS intra-node vs
+        RoCE cross-node) for vllm-ascend. Returns 1.0 when no entry
+        is registered for (op_kind, ep_size), so callers can apply it
+        unconditionally without changing behavior on backends/sizes
+        that don't have calibration data.
+
+        op_kind values: "moe_dispatch_combine_w8a8", "moe_dispatch_bf16",
+                        "moe_combine_bf16", "all_reduce", "all_gather",
+                        "reduce_scatter", "all_to_all".
+        """
+        return float(self._comm_calibration.get(f"{op_kind}@ep{ep_size}", 1.0))
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)
