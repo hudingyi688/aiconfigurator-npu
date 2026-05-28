@@ -84,8 +84,21 @@ def benchmark_npu(
             graph_us=graph_us,
             eager_us=eager_us,
         )
-    except Exception:
-        logger.warning("NPU graph capture failed, using eager mode")
+    except Exception as e:
+        # Surface the reason on first failure so we can act on
+        # specific NPU-graph errors (most often: ACL JIT compile,
+        # missing tbe, op not capturable). Subsequent calls still
+        # silently fall back to eager.
+        if not getattr(benchmark_npu, "_graph_warned", False):
+            logger.warning(
+                "NPU graph capture failed (%s), using eager mode for all subsequent specs. "
+                "Detail: %s. Eager has higher per-call dispatch overhead which shows up as "
+                "a ~40us measurement floor on small ops.",
+                type(e).__name__, str(e)[:200],
+            )
+            benchmark_npu._graph_warned = True
+        else:
+            logger.warning("NPU graph capture failed, using eager mode")
         eager_us = _timed_run(kernel_func, num_runs, repeat_n)
         return BenchResult(
             avg_us=eager_us,

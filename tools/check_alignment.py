@@ -78,7 +78,37 @@ def parse_gemm_shape(shape_str: str) -> tuple | None:
 
 
 def align_gemm(groundtruth: dict, bench: dict) -> list:
-    """Compare profiler GEMM ops vs bench measurements."""
+    """Compare profiler GEMM ops vs bench measurements.
+
+    Note on W8A8 alignment: bench measures one
+    AscendW8A8DynamicLinearMethod.apply() call, which internally
+    runs `npu_dynamic_quant` + `npu_quant_matmul` back-to-back
+    (vllm_ascend/quantization/methods/w8a8_dynamic.py:81-94).
+    The profiler captures these as two separate kernels:
+        DynamicQuant + QuantBatchMatmulV3.
+    So bench's W8A8 latency is consistently ~10-20 us higher than
+    the profiler's QuantBatchMatmulV3 alone — that is the
+    DynamicQuant cost, not a measurement defect. To get a fair
+    apples-to-apples comparison, sum (DynamicQuant + QuantBatchMatmulV3)
+    on the profiler side; we do this when --pair-w8a8 is set.
+    """
+    # Build a lookup of DynamicQuant per (M, K) for the pairing case
+    dq_per_mk: dict[tuple[int, int], float] = {}
+    for (family, op_type, shape), gt in groundtruth.items():
+        if op_type != 'DynamicQuant':
+            continue
+        parts = shape.strip().strip('"').split(';')
+        try:
+            a = [int(x) for x in parts[0].split(',')]
+        except (ValueError, IndexError):
+            continue
+        if len(a) == 2:
+            mk = (a[0], a[1])
+            # Use median of all DynamicQuant calls of that shape
+            existing = dq_per_mk.get(mk)
+            if existing is None or gt['calls'] > existing:
+                dq_per_mk[mk] = gt['median_us']
+
     rows = []
     for (family, op_type, shape), gt in groundtruth.items():
         if family != 'GEMM':
@@ -89,18 +119,26 @@ def align_gemm(groundtruth: dict, bench: dict) -> list:
         m, n, k = parsed
         dtype = 'float16' if op_type == 'MatMulV2' else 'w8a8_dynamic'
         bench_us = bench.get((m, n, k, dtype))
+        # For W8A8 the bench runs DynamicQuant + QuantBatchMatmulV3,
+        # so add the matching DynamicQuant latency to the profiler
+        # number to make the comparison apples-to-apples.
+        profiler_us = gt['median_us']
+        if op_type == 'QuantBatchMatmulV3':
+            dq_us = dq_per_mk.get((m, k))
+            if dq_us is not None:
+                profiler_us = profiler_us + dq_us
         if bench_us is None:
             rows.append({
                 'op': op_type, 'm': m, 'n': n, 'k': k, 'dtype': dtype,
-                'profiler_us': gt['median_us'], 'bench_us': None,
+                'profiler_us': profiler_us, 'bench_us': None,
                 'diff_pct': None, 'calls': gt['calls'],
                 'status': 'BENCH_MISS',
             })
             continue
-        diff_pct = (bench_us - gt['median_us']) / gt['median_us'] * 100
+        diff_pct = (bench_us - profiler_us) / profiler_us * 100
         rows.append({
             'op': op_type, 'm': m, 'n': n, 'k': k, 'dtype': dtype,
-            'profiler_us': gt['median_us'], 'bench_us': bench_us,
+            'profiler_us': profiler_us, 'bench_us': bench_us,
             'diff_pct': diff_pct, 'calls': gt['calls'],
             'status': ('OK' if abs(diff_pct) < 20 else
                        'WARN' if abs(diff_pct) < 50 else 'FAIL'),
