@@ -120,39 +120,35 @@ def setup_distributed(ep_world_size: int) -> DistContext:
         pipeline_model_parallel_size=1,
     )
 
-    # Build EP group covering ranks [floor(rank/ep_size)*ep_size, ...].
-    # For sweep simplicity we keep ranks contiguous.
-    ep_group_id = rank // ep_world_size
-    ep_ranks = list(
-        range(ep_group_id * ep_world_size, (ep_group_id + 1) * ep_world_size)
-    )
-    ep_group = dist.new_group(ranks=ep_ranks)
-
-    # vllm-ascend MC2 group (manual stash — bypass init_ascend_model_parallel
-    # which needs full ascend_config / vllm_config that we don't build).
+    # Build the vllm-ascend MC2 group directly via init_model_parallel_group
+    # — this is the canonical path; it creates one ProcessGroup per row
+    # of `all_ep_ranks` and stashes the rank's group as _MC2.device_group.
+    # We then USE that same group as our ep_group, instead of also calling
+    # dist.new_group() which would create a redundant HCCL comm and
+    # confuse get_hccl_comm_name (HCCL error 4).
     from vllm.distributed import init_model_parallel_group
     from vllm_ascend.distributed import parallel_state as ps
+    all_ep_ranks = [
+        list(range(g * ep_world_size, (g + 1) * ep_world_size))
+        for g in range(world_size // ep_world_size)
+    ]
+    backend_name = dist.get_backend()
     if ps._MC2 is None:
-        backend_name = dist.get_backend(ep_group)
-        # Group spec is rows of ranks; for our flat sweep one row per
-        # ep group is enough.
-        all_ep_ranks = [
-            list(range(g * ep_world_size, (g + 1) * ep_world_size))
-            for g in range(world_size // ep_world_size)
-        ]
         ps._MC2 = init_model_parallel_group(
             all_ep_ranks, local_rank, backend_name, group_name="mc2",
         )
+    ep_group = ps._MC2.device_group
 
     backend = ep_group._get_backend(torch.device("npu"))
-    group_name = backend.get_hccl_comm_name(rank % ep_world_size)
+    ep_local_rank = dist.get_rank(group=ep_group)
+    group_name = backend.get_hccl_comm_name(ep_local_rank)
 
     return DistContext(
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,
         ep_world_size=ep_world_size,
-        ep_rank=rank % ep_world_size,
+        ep_rank=ep_local_rank,
         ep_group=ep_group,
         group_name=group_name,
     )
