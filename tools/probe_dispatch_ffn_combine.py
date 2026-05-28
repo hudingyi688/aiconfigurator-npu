@@ -92,6 +92,26 @@ def main() -> None:
         os.environ.setdefault("LOCAL_RANK", "0")
         if not dist.is_initialized():
             dist.init_process_group(backend="hccl", world_size=1, rank=0)
+        # Initialize vllm's TP/PP groups too — PrepareAndFinalizeWithMC2
+        # calls get_tp_group() in its __init__.
+        from vllm.distributed import (
+            init_distributed_environment, ensure_model_parallel_initialized,
+        )
+        try:
+            init_distributed_environment(
+                world_size=1, rank=0, distributed_init_method="env://",
+                local_rank=0, backend="hccl",
+            )
+        except Exception:
+            # Already inited from torch.dist init_process_group above
+            pass
+        try:
+            ensure_model_parallel_initialized(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+            )
+        except Exception as e:
+            print(f"  ensure_model_parallel_initialized: {type(e).__name__}: {e}")
         ep_group = dist.new_group(ranks=[0])
         _ok(f"dist initialized, ep_group rank={dist.get_rank(group=ep_group)} "
             f"world={dist.get_world_size(group=ep_group)}")
@@ -181,7 +201,11 @@ def main() -> None:
                     scale2=s2_arg,
                     probs=probs,
                     group=group_name,
-                    max_output_size=65536,
+                    max_output_size=M,    # NOT 65536 — that's the per-expert
+                                          # max recv count and op allocates
+                                          # max_output_size × NL × H worth of
+                                          # buffer; pass actual token count
+                                          # to avoid OOM on bench-time ops.
                     out=out,
                     expert_token_nums=expert_token_nums,
                 )
