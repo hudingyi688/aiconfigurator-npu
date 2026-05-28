@@ -60,7 +60,10 @@ Op kinds currently calibrated:
 | `reduce_scatter`              | DP-1 attention reduce-scatter               |
 | `all_to_all`                  | (reserved; not yet wired through MoEDispatch)|
 
-EP coverage: 1, 8, 10, 16. Out-of-range EP returns 1.0 (no correction).
+EP coverage: 1, 8, 10, 16. Unmeasured EP sizes fall back to the
+factor of the nearest measured EP (ties broken toward the larger EP),
+not to 1.0 — silent 1.0 fallback was letting unmeasured EP points look
+artificially fast in Pareto search and outranking calibrated points.
 
 ## When to refresh
 

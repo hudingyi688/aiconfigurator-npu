@@ -4555,16 +4555,41 @@ class PerfDatabase:
 
         Multiplicative scalar applied on top of the analytical alpha-beta
         comm model to reflect production topology (HCCS intra-node vs
-        RoCE cross-node) for vllm-ascend. Returns 1.0 when no entry
-        is registered for (op_kind, ep_size), so callers can apply it
-        unconditionally without changing behavior on backends/sizes
-        that don't have calibration data.
+        RoCE cross-node) for vllm-ascend.
+
+        Lookup order:
+          1. exact `{op_kind}@ep{ep_size}` match — use that factor
+          2. any other ep entry for the same op_kind — use the entry
+             whose ep is closest (by absolute distance) to ep_size,
+             ties broken toward the larger ep. This avoids silent 1.0
+             fallback at unmeasured EP sizes, which otherwise lets
+             those points look artificially fast in Pareto search.
+          3. no entries at all for op_kind — return 1.0
 
         op_kind values: "moe_dispatch_combine_w8a8", "moe_dispatch_bf16",
                         "moe_combine_bf16", "all_reduce", "all_gather",
                         "reduce_scatter", "all_to_all".
         """
-        return float(self._comm_calibration.get(f"{op_kind}@ep{ep_size}", 1.0))
+        exact = self._comm_calibration.get(f"{op_kind}@ep{ep_size}")
+        if exact is not None:
+            return float(exact)
+
+        prefix = f"{op_kind}@ep"
+        candidates: list[tuple[int, float]] = []
+        for key, factor in self._comm_calibration.items():
+            if key.startswith(prefix):
+                try:
+                    ep = int(key[len(prefix):])
+                except ValueError:
+                    continue
+                candidates.append((ep, float(factor)))
+
+        if not candidates:
+            return 1.0
+
+        # Closest ep by |Δep|; on tie prefer the larger ep (worst case).
+        candidates.sort(key=lambda pair: (abs(pair[0] - ep_size), -pair[0]))
+        return candidates[0][1]
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)
