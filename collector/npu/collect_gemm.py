@@ -62,6 +62,38 @@ DEFAULT_NK_LIST = [
     256, 512, 1024, 2048, 4096, 7168, 8192, 12288, 16384,
 ]
 
+# --- Per-model M sweep grids ---
+# Different deployment configs hit different batch-size buckets:
+# DEFAULT_M_LIST is power-of-2 only (good for traditional prefill chunk
+# sizes 1/2/4/.../16384), but production GLM-5 traces show:
+#   - spec decode: M ∈ {3, 6, 9, 12, 15, 18, 21, 24, 27}  (×3 multiples
+#     from nextn=1 + topk=8 + EP routing)
+#   - EP=16 path: M ∈ {114, 608, 1824}  (×19 multiples from
+#     local_experts × chunk; 256 experts / 16 EP + remainders)
+# See docs/profiler_alignment/groundtruth/by_op_family.csv for
+# call-frequency by M.
+#
+# We over-cover to give aiconfigurator's interpolator dense grid
+# anchors (the bench is fast: ~10s per spec, so an extra 20-30 M
+# points adds < 30 min total).
+#
+# A model's effective M_LIST is the union of DEFAULT_M_LIST and any
+# extras registered here.
+MODEL_M_EXTRA: dict[str, list[int]] = {
+    "GlmMoeDsa": [
+        # ×3 multiples — spec decode (nextn=1, topk=8): top MISS group
+        3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 42, 48,
+        # ×3 multiples extending to prefill chunk sizes
+        96, 192, 384, 768, 1536, 3072, 6144, 12288,
+        # ×19 multiples — EP=16 expert-batched (local_experts × chunk)
+        19, 38, 57, 76, 95, 114, 152, 304, 608, 1216, 1824,
+        # other production batches seen in profiler
+        5, 7, 10, 11, 14, 20, 28, 40, 56, 80, 100, 200, 400, 800,
+        # MoE per-expert dispatched batch sizes (256 experts / EP)
+        160, 320, 640, 1280,
+    ],
+}
+
 # --- Per-model GEMM (N, K) shape lists ---
 # Use --model <name> to sweep exactly the (N, K) pairs that
 # aiconfigurator's Model class will query for that architecture under
@@ -392,6 +424,15 @@ def main() -> None:
         if args.n_list or args.k_list:
             raise SystemExit(
                 "--model is mutually exclusive with --n-list / --k-list"
+            )
+        # Union default M grid with the model's profiler-driven extras,
+        # unless the user passed an explicit --m-list.
+        if not args.m_list and args.model in MODEL_M_EXTRA:
+            m_list = sorted(set(DEFAULT_M_LIST) | set(MODEL_M_EXTRA[args.model]))
+            logger.info(
+                "Model %s: using extended M_LIST (%d points = %d default + %d extras)",
+                args.model, len(m_list),
+                len(DEFAULT_M_LIST), len(MODEL_M_EXTRA[args.model]),
             )
         nk_pairs = MODEL_GEMM_SHAPES[args.model]
         specs = _build_model_spec_list(m_list, nk_pairs, args.quant_types)
