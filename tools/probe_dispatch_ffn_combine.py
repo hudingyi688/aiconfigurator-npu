@@ -90,28 +90,34 @@ def main() -> None:
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("LOCAL_RANK", "0")
-        if not dist.is_initialized():
-            dist.init_process_group(backend="hccl", world_size=1, rank=0)
-        # Initialize vllm's TP/PP groups too — PrepareAndFinalizeWithMC2
-        # calls get_tp_group() in its __init__.
+
+        # Order matters: vllm's init_distributed_environment expects to
+        # be the one calling init_process_group. If torch.dist is
+        # already inited, vllm refuses to set its _WORLD group, so the
+        # later ensure_model_parallel_initialized() silently fails.
         from vllm.distributed import (
             init_distributed_environment, ensure_model_parallel_initialized,
         )
-        try:
+        if not dist.is_initialized():
             init_distributed_environment(
                 world_size=1, rank=0, distributed_init_method="env://",
                 local_rank=0, backend="hccl",
             )
-        except Exception:
-            # Already inited from torch.dist init_process_group above
-            pass
+            print(f"  [info] vllm init_distributed_environment ran")
+        else:
+            print(f"  [info] dist already initialized, vllm cannot register _WORLD")
+
         try:
             ensure_model_parallel_initialized(
                 tensor_model_parallel_size=1,
                 pipeline_model_parallel_size=1,
             )
+            from vllm.distributed.parallel_state import _TP
+            print(f"  [info] _TP world_size = {_TP.world_size if _TP else 'None'}")
         except Exception as e:
-            print(f"  ensure_model_parallel_initialized: {type(e).__name__}: {e}")
+            print(f"  [info] ensure_model_parallel_initialized: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
         ep_group = dist.new_group(ranks=[0])
         _ok(f"dist initialized, ep_group rank={dist.get_rank(group=ep_group)} "
             f"world={dist.get_world_size(group=ep_group)}")
@@ -132,94 +138,50 @@ def main() -> None:
         return
 
     # 4. Construct minimal inputs and call dispatch_ffn_combine directly
-    _h("[4] direct call to torch.ops._C_ascend.dispatch_ffn_combine (W8A8)")
-    try:
-        # GLM-5-shaped tiny case for first call
-        H = 6144                # hidden
-        I = 2048                # moe_intermediate
-        NE = 16                 # num_experts (small for probe)
-        TOPK = 4
-        NL = NE                 # num_local_experts (ep_size=1 -> all on this rank)
-        M = 8                   # num_tokens
+    #
+    # NOTE: This bare-op path is currently disabled. With world=1
+    # the op has surprising buffer-allocation behavior (allocates
+    # max_output_size × num_local_experts × hidden buffers; on a
+    # degenerate 1-rank ep group the dispatch step degenerates and
+    # blows past 100+ GiB even with M=8). Path [5] (vllm-ascend
+    # FusedMC2CommImpl wrapper) is the right contract; we focus
+    # there. Bare-op exploration left in source for future debugging.
+    _h("[4] direct call to torch.ops._C_ascend.dispatch_ffn_combine — SKIPPED on world=1")
+    print("  (op behaves abnormally with degenerate ep group; see comment.)")
+    print("  (path [5] is the production contract; that's what the collector uses.)")
 
-        dev, bf16, i8, i32, i64, f32 = (
-            "npu:0", torch.bfloat16, torch.int8, torch.int32,
-            torch.int64, torch.float32,
-        )
+    # GLM-5-shaped tiny case for first call — still needed by [5]
+    H = 6144                # hidden
+    I = 2048                # moe_intermediate
+    NE = 16                 # num_experts (small for probe)
+    TOPK = 4
+    NL = NE                 # num_local_experts (ep_size=1 -> all on this rank)
+    M = 8                   # num_tokens
 
-        x = torch.randn(M, H, dtype=bf16, device=dev)
-        # Per profiler: w1 = (NL, H, 2*I) when fused gate_up; w2 = (NL, I, H)
-        w1 = torch.randint(-128, 127, (NL, H, 2 * I), dtype=i8, device=dev)
-        w2 = torch.randint(-128, 127, (NL, I, H), dtype=i8, device=dev)
+    dev, bf16, i8, i32, i64, f32 = (
+        "npu:0", torch.bfloat16, torch.int8, torch.int32,
+        torch.int64, torch.float32,
+    )
 
-        # ACL says scale must be INT64 — npu_trans_quant_param packs
-        # weight_scale (fp32) into int64 (Ascend deq_scale convention).
-        # The trans op only accepts 1D scale (n,) — call it per-expert.
-        def _trans(per_expert_fp32: torch.Tensor) -> torch.Tensor:
-            """per_expert_fp32: (NL, n) -> int64 (NL, n)."""
-            outs = []
-            for i in range(per_expert_fp32.shape[0]):
-                out = torch_npu.npu_trans_quant_param(
-                    per_expert_fp32[i].contiguous(), None,
-                )
-                outs.append(out.unsqueeze(0))
-            return torch.cat(outs, dim=0).to(torch.int64)
+    x = torch.randn(M, H, dtype=bf16, device=dev)
+    w1 = torch.randint(-128, 127, (NL, H, 2 * I), dtype=i8, device=dev)
+    w2 = torch.randint(-128, 127, (NL, I, H), dtype=i8, device=dev)
 
-        w1_scale_fp32 = (torch.rand(NL, 2 * I, dtype=f32, device=dev) * 0.1 + 0.01)
-        w2_scale_fp32 = (torch.rand(NL, H,     dtype=f32, device=dev) * 0.1 + 0.01)
-        s1 = _trans(w1_scale_fp32)
-        s2 = _trans(w2_scale_fp32)
-        print(f"  scale1: dtype={s1.dtype} shape={tuple(s1.shape)}")
-        print(f"  scale2: dtype={s2.dtype} shape={tuple(s2.shape)}")
+    def _trans(per_expert_fp32):
+        outs = []
+        for i in range(per_expert_fp32.shape[0]):
+            outs.append(torch_npu.npu_trans_quant_param(
+                per_expert_fp32[i].contiguous(), None,
+            ).unsqueeze(0))
+        return torch.cat(outs, dim=0).to(torch.int64)
 
-        topk_ids = torch.randint(0, NE, (M, TOPK), dtype=i32, device=dev)
-        probs = torch.rand(M, TOPK, dtype=f32, device=dev)
+    w1_scale_fp32 = torch.rand(NL, 2 * I, dtype=f32, device=dev) * 0.1 + 0.01
+    w2_scale_fp32 = torch.rand(NL, H,     dtype=f32, device=dev) * 0.1 + 0.01
+    s1 = _trans(w1_scale_fp32)
+    s2 = _trans(w2_scale_fp32)
 
-        out = torch.empty_like(x)
-        expert_token_nums = torch.zeros(NL, dtype=i32, device=dev)
-
-        # The op signature says weight1/2/scale1/2 are Tensor[].
-        # Try with stacked tensors wrapped into a single-element list:
-        for variant in ("stacked-as-list", "list-of-experts"):
-            print(f"\n  -- trying weight layout: {variant} --")
-            if variant == "stacked-as-list":
-                w1_arg, w2_arg = [w1], [w2]
-                s1_arg, s2_arg = [s1], [s2]
-            else:
-                w1_arg = list(w1.unbind(0))
-                w2_arg = list(w2.unbind(0))
-                s1_arg = list(s1.unbind(0))
-                s2_arg = list(s2.unbind(0))
-
-            try:
-                torch.ops._C_ascend.dispatch_ffn_combine(
-                    x=x,
-                    weight1=w1_arg,
-                    weight2=w2_arg,
-                    expert_idx=topk_ids,
-                    scale1=s1_arg,
-                    scale2=s2_arg,
-                    probs=probs,
-                    group=group_name,
-                    max_output_size=M,    # NOT 65536 — that's the per-expert
-                                          # max recv count and op allocates
-                                          # max_output_size × NL × H worth of
-                                          # buffer; pass actual token count
-                                          # to avoid OOM on bench-time ops.
-                    out=out,
-                    expert_token_nums=expert_token_nums,
-                )
-                torch.npu.synchronize()
-                _ok(f"variant {variant!r}: out shape={tuple(out.shape)} "
-                    f"expert_tokens={expert_token_nums[:NL].tolist()}")
-                # Successful — record this layout
-                print(f"\n  >>> WINNER: {variant!r}")
-                break
-            except Exception as e:
-                _fail(f"variant {variant!r}", e)
-    except Exception as e:
-        _fail("setup tensors", e)
-        traceback.print_exc()
+    topk_ids = torch.randint(0, NE, (M, TOPK), dtype=i32, device=dev)
+    probs = torch.rand(M, TOPK, dtype=f32, device=dev)
 
     # 5. Try going through FusedMC2CommImpl.fused_experts() (one layer up)
     _h("[5] FusedMC2CommImpl.fused_experts() path (vllm-ascend interface layer)")
