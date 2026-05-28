@@ -712,12 +712,13 @@ class MoEDispatch(Operation):
             )
 
             comm_latency = 0
+            phase = "prefill" if self._is_context else "decode"
 
             # Add allreduce latency when TP > 1
             if self._attention_tp_size > 1:
                 ar_latency = database.query_custom_allreduce(common.CommQuantMode.half, self.num_gpus, volume)
                 if database.backend == common.BackendName.vllm_ascend.value:
-                    ar_latency *= database.query_comm_calibration("all_reduce", self._moe_ep_size)
+                    ar_latency *= database.query_comm_calibration("all_reduce", self._moe_ep_size, phase)
                 comm_latency += ar_latency
 
             if self._attention_dp_size > 1:
@@ -729,7 +730,7 @@ class MoEDispatch(Operation):
                     volume * self._attention_dp_size,
                 )
                 if database.backend == common.BackendName.vllm_ascend.value:
-                    dp_latency *= database.query_comm_calibration(ag_op, self._moe_ep_size)
+                    dp_latency *= database.query_comm_calibration(ag_op, self._moe_ep_size, phase)
                 comm_latency += dp_latency
 
             # vllm-ascend production path: dispatch + per-expert FFN + combine
@@ -740,7 +741,7 @@ class MoEDispatch(Operation):
             # the full HCCL alltoallv volume (volume * topk per rank). Model
             # it as the no-quant alltoall using moe_ep_size, then apply the
             # profiler-derived calibration. Calibration covers the BF16
-            # combine path symmetrically (factor of ~1.0 at small EP).
+            # combine path symmetrically.
             if (
                 database.backend == common.BackendName.vllm_ascend.value
                 and self._moe_ep_size > 1
@@ -758,14 +759,12 @@ class MoEDispatch(Operation):
                     a2a_volume,
                     database_mode=common.DatabaseMode.SOL,
                 )
-                # W8A8 (fused) vs BF16 (split dispatch/combine) — pick the
-                # right calibration key based on the moe quant mode.
                 quant_mode = self._quant_mode
                 if quant_mode is not None and quant_mode == common.MoEQuantMode.w8a8_dynamic:
                     cal_key = "moe_dispatch_combine_w8a8"
                 else:
                     cal_key = "moe_dispatch_bf16" if self._pre_dispatch else "moe_combine_bf16"
-                a2a_latency *= database.query_comm_calibration(cal_key, self._moe_ep_size)
+                a2a_latency *= database.query_comm_calibration(cal_key, self._moe_ep_size, phase)
                 comm_latency += a2a_latency
         elif database.backend == common.BackendName.sglang.value:
             if self._moe_backend == "deepep_moe":

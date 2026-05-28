@@ -43,14 +43,22 @@ read as "how much slower than alpha-beta this op runs at this EP" —
 e.g. 6.67 at ep=16 W8A8 dispatch+combine reflects that crossing the
 node boundary on RoCE costs ~6.7× the intra-node SOL prediction.
 
-## SOL all_to_all fix
+## Phase split (prefill vs decode)
 
-`PerfDatabase.query_nccl(... operation="all_to_all", database_mode=SOL)`
-previously returned 0 because the SOL switch only matched the legacy
-`"alltoall"` spelling. Production callers (`MoEDispatch.query()` for
-vllm-ascend) pass `"all_to_all"`, so the entire fused-MoE comm SOL
-silently zeroed out before this fix. The matcher now accepts both
-spellings.
+The alpha-beta SOL model accuracy depends heavily on message size:
+prefill messages (M ~ thousands of tokens) are 30-100x larger than
+decode messages (M ~ tens of tokens) and the HCCL kernels approach
+peak bandwidth in that regime. Mixing prefill profiler data with a
+decode SOL reference (or vice versa) produces nonsense factors —
+this was the bug in the v2 calibration where W8A8 dispatch+combine
+ep=16 came out at 6.67× because it compared a *prefill* profiler
+median to a *decode* SOL reference.
+
+Calibration entries are now keyed `{op}@ep{N}@{phase}`. Reference
+shape: H=6144, K=8; M=128 for decode, M=4000 for prefill.
+`query_comm_calibration(op_kind, ep_size, phase)` looks up
+phase-specific factor first, falls back to other-phase same-ep, then
+nearest-EP same-phase, then nearest-EP other-phase, finally 1.0.
 
 ## Where the data lives
 

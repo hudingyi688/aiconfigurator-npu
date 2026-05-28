@@ -55,13 +55,17 @@ def classify(name: str) -> str | None:
 
 
 _RUN_RE = re.compile(r"dp(\d+)_pp(\d+)_tp(\d+)_dcp(\d+)_ep(\d+)_rank")
+_PHASE_RE = re.compile(r"_(prefill|decode)-")
 
 
-def parse_ep(run_dir_name: str) -> int | None:
+def parse_ep_phase(run_dir_name: str) -> tuple[int, str] | None:
     m = _RUN_RE.match(run_dir_name)
     if not m:
         return None
-    return int(m.group(5))
+    p = _PHASE_RE.search(run_dir_name)
+    if not p:
+        return None
+    return int(m.group(5)), p.group(1)
 
 
 # ---- profiler aggregation ------------------------------------------
@@ -81,37 +85,43 @@ def median_durations_per_kind(kernel_csv: Path) -> dict[str, float]:
     return {k: median(v) for k, v in durations.items() if v}
 
 
-def aggregate_runs(profiler_root: Path) -> dict[tuple[str, int], float]:
-    """Median-of-medians per (op_kind, ep_size). Skips ep=0 baseline."""
-    per_run: dict[tuple[str, int], list[float]] = defaultdict(list)
+def aggregate_runs(profiler_root: Path) -> dict[tuple[str, int, str], float]:
+    """Median-of-medians per (op_kind, ep_size, phase). Skips ep=0."""
+    per_run: dict[tuple[str, int, str], list[float]] = defaultdict(list)
     for run_dir in sorted(profiler_root.iterdir()):
         if not run_dir.is_dir():
             continue
-        ep = parse_ep(run_dir.name)
-        if ep is None or ep == 0:
+        parsed = parse_ep_phase(run_dir.name)
+        if parsed is None:
+            continue
+        ep, phase = parsed
+        if ep == 0:
             continue
         kernel_csv = run_dir / "ASCEND_PROFILER_OUTPUT" / "kernel_details.csv"
         if not kernel_csv.is_file():
             continue
         meds = median_durations_per_kind(kernel_csv)
         for op_kind, lat_us in meds.items():
-            per_run[(op_kind, ep)].append(lat_us)
+            per_run[(op_kind, ep, phase)].append(lat_us)
     return {key: median(v) for key, v in per_run.items()}
 
 
 # ---- SOL reference latency from aiconfigurator ---------------------
-def sol_latency_us(database, op_kind: str, ep_size: int) -> float:
+def sol_latency_us(database, op_kind: str, ep_size: int, phase: str) -> float:
     """SOL alpha-beta latency in microseconds for the reference shape.
 
-    Reference: GLM-5 H=6144, M=128 (per-rank tokens), topk=8.
-    For dispatch+combine ops the volume is volume*topk (full alltoallv
-    payload per rank). For the bare collectives we use volume.
+    Reference shapes are phase-specific:
+      - decode:  M=128 (per-rank tokens, ~1 token × concurrency)
+      - prefill: M=4000 (typical isl)
+
+    For dispatch+combine ops the per-rank payload is M*H*topk (full
+    alltoallv volume); for the bare collectives we use M*H.
     """
     from aiconfigurator_npu.sdk import common
 
     H = 6144
-    M = 128
     K = 8
+    M = 4000 if phase == "prefill" else 128
     volume = M * H
 
     op_to_collective = {
@@ -170,37 +180,48 @@ def main() -> None:
     db = build_database()
 
     factors: dict[str, float] = {}
-    debug_rows: list[tuple[str, int, float, float, float]] = []
-    for (op_kind, ep), prof_us in sorted(profiler_med.items()):
+    debug_rows: list[tuple[str, int, str, float, float, float]] = []
+    for (op_kind, ep, phase), prof_us in sorted(profiler_med.items()):
         try:
-            sol_us = sol_latency_us(db, op_kind, ep)
+            sol_us = sol_latency_us(db, op_kind, ep, phase)
         except Exception as e:
-            print(f"  skip {op_kind}@ep{ep}: SOL lookup failed ({e})", file=sys.stderr)
+            print(f"  skip {op_kind}@ep{ep}@{phase}: SOL lookup failed ({e})",
+                  file=sys.stderr)
             continue
         if sol_us <= 0:
-            print(f"  skip {op_kind}@ep{ep}: SOL=0", file=sys.stderr)
+            print(f"  skip {op_kind}@ep{ep}@{phase}: SOL=0", file=sys.stderr)
             continue
         factor = prof_us / sol_us
-        factors[f"{op_kind}@ep{ep}"] = round(factor, 4)
-        debug_rows.append((op_kind, ep, prof_us, sol_us, factor))
+        factors[f"{op_kind}@ep{ep}@{phase}"] = round(factor, 4)
+        debug_rows.append((op_kind, ep, phase, prof_us, sol_us, factor))
 
     # Print a small audit table to stderr
-    print(f"{'op_kind':30s} {'ep':>3s} {'prof_us':>10s} {'sol_us':>10s} {'factor':>8s}",
-          file=sys.stderr)
-    for op_kind, ep, prof_us, sol_us, factor in debug_rows:
-        print(f"{op_kind:30s} {ep:3d} {prof_us:10.3f} {sol_us:10.3f} {factor:8.4f}",
-              file=sys.stderr)
+    print(
+        f"{'op_kind':30s} {'ep':>3s} {'phase':>8s} "
+        f"{'prof_us':>10s} {'sol_us':>10s} {'factor':>8s}",
+        file=sys.stderr,
+    )
+    for op_kind, ep, phase, prof_us, sol_us, factor in debug_rows:
+        print(
+            f"{op_kind:30s} {ep:3d} {phase:>8s} "
+            f"{prof_us:10.3f} {sol_us:10.3f} {factor:8.4f}",
+            file=sys.stderr,
+        )
 
     doc = (
-        "Per (op_kind, ep_size) correction factor: profiler median latency / "
-        "aiconfigurator SOL alpha-beta latency at GLM-5 reference shape (H=6144, "
-        "M=128, K=8). Each ep is anchored to its OWN SOL — the previous version "
-        "divided through ep=1, which gave misleadingly small factors at intra-node "
-        "ep and inflated factors at cross-node ep. Apply as scalar multiplier on "
-        "top of aiconfigurator's analytical comm model."
+        "Per (op_kind, ep_size, phase) correction factor: profiler median "
+        "latency / aiconfigurator SOL alpha-beta latency at GLM-5 reference "
+        "shape (H=6144, K=8, M=128 for decode, M=4000 for prefill). Each "
+        "(ep, phase) is anchored to its OWN SOL — we don't divide through "
+        "ep=1 (degenerate dispatch path) and we don't mix prefill vs decode "
+        "(different M, different alpha/beta regimes). Apply as scalar "
+        "multiplier on top of aiconfigurator's analytical comm model."
     )
-    payload = {"doc": doc, "reference_shape": {"H": 6144, "M": 128, "K": 8},
-               "factors": factors}
+    payload = {
+        "doc": doc,
+        "reference_shape": {"H": 6144, "K": 8, "M_decode": 128, "M_prefill": 4000},
+        "factors": factors,
+    }
     output_json.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)

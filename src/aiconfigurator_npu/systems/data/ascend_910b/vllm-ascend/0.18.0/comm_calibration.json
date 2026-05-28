@@ -1,24 +1,25 @@
 {
-  "doc": "Per (op_kind, ep_size) correction factor: profiler median latency / aiconfigurator SOL alpha-beta latency at GLM-5 reference shape (H=6144, M=128, K=8). Each ep is anchored to its OWN SOL \u2014 the previous version divided through ep=1, which gave misleadingly small factors at intra-node ep and inflated factors at cross-node ep. Apply as scalar multiplier on top of aiconfigurator's analytical comm model.",
+  "doc": "Per (op_kind, ep_size, phase) correction factor: profiler median latency / aiconfigurator SOL alpha-beta latency at GLM-5 reference shape (H=6144, K=8, M=128 for decode, M=4000 for prefill). Each (ep, phase) is anchored to its OWN SOL \u2014 we don't divide through ep=1 (degenerate dispatch path) and we don't mix prefill vs decode (different M, different alpha/beta regimes). Apply as scalar multiplier on top of aiconfigurator's analytical comm model.",
   "factors": {
-    "all_gather@ep10": 0.1805,
-    "all_gather@ep16": 1.4859,
-    "all_gather@ep8": 0.4146,
-    "all_reduce@ep10": 0.1409,
-    "all_reduce@ep8": 0.1914,
-    "all_to_all@ep16": 3.0586,
-    "moe_combine_bf16@ep10": 0.1574,
-    "moe_combine_bf16@ep8": 0.4985,
-    "moe_dispatch_bf16@ep10": 0.4562,
-    "moe_dispatch_bf16@ep8": 0.5983,
-    "moe_dispatch_combine_w8a8@ep10": 0.6612,
-    "moe_dispatch_combine_w8a8@ep16": 6.6739,
-    "moe_dispatch_combine_w8a8@ep8": 1.501,
-    "reduce_scatter@ep16": 6.6835
+    "all_gather@ep10@decode": 0.1805,
+    "all_gather@ep16@prefill": 0.0475,
+    "all_gather@ep8@decode": 0.4146,
+    "all_reduce@ep10@decode": 0.1409,
+    "all_reduce@ep8@decode": 0.1914,
+    "all_to_all@ep16@prefill": 0.0979,
+    "moe_combine_bf16@ep10@decode": 0.1574,
+    "moe_combine_bf16@ep8@decode": 0.4985,
+    "moe_dispatch_bf16@ep10@decode": 0.4562,
+    "moe_dispatch_bf16@ep8@decode": 0.5983,
+    "moe_dispatch_combine_w8a8@ep10@decode": 0.6612,
+    "moe_dispatch_combine_w8a8@ep16@prefill": 0.2136,
+    "moe_dispatch_combine_w8a8@ep8@decode": 1.501,
+    "reduce_scatter@ep16@prefill": 0.2139
   },
   "reference_shape": {
     "H": 6144,
     "K": 8,
-    "M": 128
+    "M_decode": 128,
+    "M_prefill": 4000
   }
 }

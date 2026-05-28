@@ -4549,47 +4549,60 @@ class PerfDatabase:
                 ),
             )
 
-    def query_comm_calibration(self, op_kind: str, ep_size: int) -> float:
+    def query_comm_calibration(
+        self, op_kind: str, ep_size: int, phase: str = "decode"
+    ) -> float:
         """
         Profiler-derived correction factor for comm latency.
 
         Multiplicative scalar applied on top of the analytical alpha-beta
         comm model to reflect production topology (HCCS intra-node vs
-        RoCE cross-node) for vllm-ascend.
+        RoCE cross-node) for vllm-ascend. Phase ("prefill" vs "decode")
+        matters because the alpha-beta model is more or less accurate at
+        different message sizes — prefill messages are 30-100x larger
+        than decode and approach peak bandwidth, so the factors are very
+        different.
 
         Lookup order:
-          1. exact `{op_kind}@ep{ep_size}` match — use that factor
-          2. any other ep entry for the same op_kind — use the entry
-             whose ep is closest (by absolute distance) to ep_size,
-             ties broken toward the larger ep. This avoids silent 1.0
-             fallback at unmeasured EP sizes, which otherwise lets
-             those points look artificially fast in Pareto search.
-          3. no entries at all for op_kind — return 1.0
+          1. exact `{op_kind}@ep{ep_size}@{phase}` match
+          2. exact `{op_kind}@ep{ep_size}@{other_phase}` (better than wrong-EP)
+          3. nearest-EP factor for the same phase
+          4. nearest-EP factor for the other phase
+          5. 1.0 fallback when no entries at all for op_kind
 
         op_kind values: "moe_dispatch_combine_w8a8", "moe_dispatch_bf16",
                         "moe_combine_bf16", "all_reduce", "all_gather",
                         "reduce_scatter", "all_to_all".
+        phase values:  "prefill", "decode".
         """
-        exact = self._comm_calibration.get(f"{op_kind}@ep{ep_size}")
+        other_phase = "prefill" if phase == "decode" else "decode"
+
+        exact = self._comm_calibration.get(f"{op_kind}@ep{ep_size}@{phase}")
         if exact is not None:
             return float(exact)
+        cross = self._comm_calibration.get(f"{op_kind}@ep{ep_size}@{other_phase}")
+        if cross is not None:
+            return float(cross)
 
-        prefix = f"{op_kind}@ep"
-        candidates: list[tuple[int, float]] = []
+        same_phase: list[tuple[int, float]] = []
+        cross_phase: list[tuple[int, float]] = []
         for key, factor in self._comm_calibration.items():
-            if key.startswith(prefix):
-                try:
-                    ep = int(key[len(prefix):])
-                except ValueError:
-                    continue
-                candidates.append((ep, float(factor)))
+            if not key.startswith(f"{op_kind}@ep"):
+                continue
+            try:
+                rest = key[len(f"{op_kind}@ep"):]
+                ep_str, key_phase = rest.split("@", 1)
+                ep = int(ep_str)
+            except ValueError:
+                continue
+            target = same_phase if key_phase == phase else cross_phase
+            target.append((ep, float(factor)))
 
-        if not candidates:
-            return 1.0
-
-        # Closest ep by |Δep|; on tie prefer the larger ep (worst case).
-        candidates.sort(key=lambda pair: (abs(pair[0] - ep_size), -pair[0]))
-        return candidates[0][1]
+        for pool in (same_phase, cross_phase):
+            if pool:
+                pool.sort(key=lambda pair: (abs(pair[0] - ep_size), -pair[0]))
+                return pool[0][1]
+        return 1.0
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)
