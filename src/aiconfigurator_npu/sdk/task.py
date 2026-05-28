@@ -234,17 +234,22 @@ def build_disagg_parallel_lists(
             # Wide range needed for large MoE like GLM-5 (671B): EP must
             # reach 16+ for the model to fit in HBM.
             wide_list = [1, 2, 4, 8, 16, 32, 64]
-            tp_list = [1, 2, 4, 8]
+            # GLM-5 production prefill uses tp=16 (one A3 host = 16 cards).
+            # The earlier tp_list=[1,2,4,8] cap silently excluded this from
+            # the disagg search; prefill tp must reach 16 to cover the
+            # canonical PD-disaggregated deployment shape.
+            prefill_tp_list = [1, 2, 4, 8, 16]
+            decode_tp_list = [1, 2, 4, 8]
 
             prefill_worker_config["num_gpu_per_worker"] = wide_list
-            prefill_worker_config["tp_list"] = tp_list
+            prefill_worker_config["tp_list"] = prefill_tp_list
             prefill_worker_config["pp_list"] = wide_list if should_enable_pp else [1]
             prefill_worker_config["dp_list"] = wide_list
             prefill_worker_config["moe_tp_list"] = [1]
             prefill_worker_config["moe_ep_list"] = wide_list
 
             decode_worker_config["num_gpu_per_worker"] = wide_list
-            decode_worker_config["tp_list"] = tp_list
+            decode_worker_config["tp_list"] = decode_tp_list
             decode_worker_config["pp_list"] = wide_list if should_enable_pp else [1]
             decode_worker_config["dp_list"] = wide_list
             decode_worker_config["moe_tp_list"] = [1]
