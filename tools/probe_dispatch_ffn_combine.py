@@ -122,16 +122,31 @@ def main() -> None:
         NL = NE                 # num_local_experts (ep_size=1 -> all on this rank)
         M = 8                   # num_tokens
 
-        dev, bf16, i8, i32, f32 = "npu:0", torch.bfloat16, torch.int8, torch.int32, torch.float32
+        dev, bf16, i8, i32, i64, f32 = (
+            "npu:0", torch.bfloat16, torch.int8, torch.int32,
+            torch.int64, torch.float32,
+        )
 
         x = torch.randn(M, H, dtype=bf16, device=dev)
         # Per profiler: w1 = (NL, H, 2*I) when fused gate_up; w2 = (NL, I, H)
-        # scale1, scale2: per-channel per-expert
-        # Try the stacked-tensor layout first; fall back to list-of-tensors if rejected.
         w1 = torch.randint(-128, 127, (NL, H, 2 * I), dtype=i8, device=dev)
         w2 = torch.randint(-128, 127, (NL, I, H), dtype=i8, device=dev)
-        s1 = torch.rand(NL, 2 * I, dtype=bf16, device=dev) * 0.1 + 0.01
-        s2 = torch.rand(NL, H, dtype=bf16, device=dev) * 0.1 + 0.01
+        # ACL says scale must be INT64 — npu_trans_quant_param packs
+        # weight_scale (fp32) into int64 (Ascend deq_scale convention).
+        # Use torch_npu.npu_trans_quant_param to build it correctly.
+        w1_scale_fp32 = (torch.rand(NL, 2 * I, dtype=f32, device=dev) * 0.1 + 0.01)
+        w2_scale_fp32 = (torch.rand(NL, H,     dtype=f32, device=dev) * 0.1 + 0.01)
+        try:
+            s1 = torch_npu.npu_trans_quant_param(w1_scale_fp32, None)
+            s2 = torch_npu.npu_trans_quant_param(w2_scale_fp32, None)
+            print(f"  scale1 dtype after trans_quant_param: {s1.dtype} shape={tuple(s1.shape)}")
+        except Exception as e:
+            print(f"  npu_trans_quant_param failed: {e}; falling back to int64 view")
+            # Fallback: bitcast fp32 to int32, pad to int64
+            s1 = torch.zeros(NL, 2 * I, dtype=i64, device=dev)
+            s2 = torch.zeros(NL, H,     dtype=i64, device=dev)
+            s1.view(torch.float32).copy_(w1_scale_fp32.unsqueeze(-1).expand(-1, -1, 2).reshape(NL, -1)[:, ::2])
+            s2.view(torch.float32).copy_(w2_scale_fp32.unsqueeze(-1).expand(-1, -1, 2).reshape(NL, -1)[:, ::2])
 
         topk_ids = torch.randint(0, NE, (M, TOPK), dtype=i32, device=dev)
         probs = torch.rand(M, TOPK, dtype=f32, device=dev)
@@ -188,11 +203,21 @@ def main() -> None:
         from vllm_ascend.ops.fused_moe.moe_stage_params import (
             MoERoutingParams, MoEQuantParams,
         )
-        # MoEConfig requires FusedMoEParallelConfig — try minimal
         from vllm.model_executor.layers.fused_moe.config import (
             FusedMoEConfig, FusedMoEParallelConfig,
             MoEActivation, RoutingMethodType,
         )
+
+        # Bypass init_ascend_model_parallel (which needs full vllm config)
+        # by directly stashing the existing single-rank ep_group as _MC2.
+        from vllm.distributed import init_model_parallel_group, get_world_group
+        from vllm_ascend.distributed import parallel_state as ps
+        if ps._MC2 is None:
+            backend_name = torch.distributed.get_backend(ep_group)
+            ps._MC2 = init_model_parallel_group(
+                [[0]], 0, backend_name, group_name="mc2",
+            )
+            _ok(f"manually set parallel_state._MC2")
 
         parallel_cfg = FusedMoEParallelConfig(
             tp_size=1, pcp_size=1, dp_size=1, ep_size=1,
@@ -215,9 +240,6 @@ def main() -> None:
         )
         _ok(f"FusedMoEConfig built: {moe_cfg.num_experts=} {moe_cfg.hidden_dim=}")
 
-        # FusedMC2CommImpl() touches get_mc2_group() which needs
-        # vllm-ascend's distributed setup; this is the part we expect
-        # to need a vllm_config. Probe the failure mode:
         try:
             comm = FusedMC2CommImpl(moe_cfg)
             _ok(f"FusedMC2CommImpl built")
