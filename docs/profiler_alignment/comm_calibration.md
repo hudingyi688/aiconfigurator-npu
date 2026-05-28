@@ -193,6 +193,21 @@ optimum and why predictions diverge further on long-context inputs.
    mode for the attention component, so attention latency in the
    prediction is itself SOL+empirical, not silicon. Calibration has
    no signal there to work with.
+8. **SOL alpha-beta has no alpha term for small messages**.
+   The query_nccl SOL formula is purely beta-driven
+   (`memory * msg * (n-1)/n / bw`), with no per-call kernel-launch
+   constant. For dispatch+combine in decode the actual per-rank input
+   is M=1 (verified from kernel_details.csv), giving SOL ~1-3 us
+   while profiler reads 100-300 us — a 50-200× ratio that calibration
+   *can* express but only by inflating factors to a regime where any
+   nearest-EP fallback error is amplified to the same magnitude.
+   The current v3 calibration sidesteps this by anchoring SOL at
+   M=4000 (prefill) / M=128 (decode) — message sizes large enough
+   that beta dominates and factors stay in the 0.1-7 range. This is
+   technically inconsistent with the actual profiler shapes but
+   keeps the search numerically well-behaved. A correct fix is at
+   the SOL model layer (add an alpha term to query_nccl SOL), not
+   at the calibration layer.
 
 For accuracy improvements beyond ~25%, build a scheduling-aware
 runtime model (overlap, chunked prefill, paged-attention KV,
