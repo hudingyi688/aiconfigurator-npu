@@ -91,13 +91,32 @@ def main() -> None:
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("LOCAL_RANK", "0")
 
-        # Order matters: vllm's init_distributed_environment expects to
-        # be the one calling init_process_group. If torch.dist is
-        # already inited, vllm refuses to set its _WORLD group, so the
-        # later ensure_model_parallel_initialized() silently fails.
+        # vllm.distributed.initialize_model_parallel calls
+        # get_current_vllm_config() — must be wrapped in
+        # set_current_vllm_config(VllmConfig). Hold this context for
+        # the rest of main() so subsequent ops keep finding the config.
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.config.parallel import ParallelConfig
         from vllm.distributed import (
             init_distributed_environment, ensure_model_parallel_initialized,
         )
+        # Need a non-empty parallel_config — initialize_model_parallel
+        # also reads tensor_parallel_size etc. from the active config.
+        _vc = VllmConfig()
+        try:
+            _vc.parallel_config = ParallelConfig(
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+            )
+        except Exception as e:
+            print(f"  [info] ParallelConfig: {type(e).__name__}: {e}")
+
+        global _VLLM_CFG_GUARD
+        _VLLM_CFG_GUARD = set_current_vllm_config(_vc)
+        _VLLM_CFG_GUARD.__enter__()
+
         if not dist.is_initialized():
             init_distributed_environment(
                 world_size=1, rank=0, distributed_init_method="env://",
