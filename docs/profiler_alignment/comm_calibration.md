@@ -110,10 +110,46 @@ ttft=8000, tpot=200:
 Calibration takes the prediction error from 4× too pessimistic to
 ~1.3× too pessimistic, **and** flips the recommended config from
 tp8 dp4 (sub-optimal) to tp2 dp16 (matches the regime production
-actually runs in).
+actually runs in). The ~25% residual is **systematic and not
+addressable by calibration**; see Blind spots below.
 
-The ~25% residual is **systematic and not addressable by calibration**;
-see Blind spots below.
+## Long-context behavior
+
+Same setup, isl swept across the production buckets:
+
+| isl (model) | top-1 config       | bs | TPOT (model) | TPOT (prod) | TTFT (model) | TTFT (prod) | tokens/s/gpu (model) | tokens/s/gpu (prod) |
+|-------------|--------------------|----|--------------|-------------|--------------|-------------|----------------------|---------------------|
+| 5000        | tp4 dp8 ep32       | 16 | 65.8 ms      | 36.8 ms     | 4677 ms      | 1695 ms     | 56.4                 | 73.4                |
+| 5000 #2     | tp2 dp16 ep32      | 7  | 55.0 ms      | —           | 6963 ms      | —           | 54.4                 | —                   |
+| 15000       | tp8 dp4 ep32       | 2  | 24.8 ms      | 32.6 ms     | 7681 ms      | 2691 ms     | 8.7                  | ~42                 |
+| 30000       | OOM in model       | —  | —            | 31.8 ms     | —            | 3756 ms     | —                    | (sim)               |
+| 60000       | OOM in model       | —  | —            | 30.2 ms     | —            | 6128 ms     | —                    | (sim)               |
+
+Reading this:
+
+- **TTFT consistently 2.5-3× too pessimistic** (model 4677/7681 vs
+  prod 1695/2691). This is Blind spot #2 — production runs chunked
+  prefill, the model treats prefill as one contiguous pass.
+- **TPOT inverts at ~10k isl**. At 5k the model is pessimistic
+  (66 vs 37 ms); at 15k it's *optimistic* (25 vs 33 ms). Different
+  failure modes: at 5k, calibrated comm + analytical attention sum
+  serially with no overlap (Blind spot #1); at 15k, the model can
+  only fit bs=2 on 32 cards while production runs at concurrency=102
+  via paged KV — TPOT for bs=2 is just genuinely lower than for a
+  saturated batch (Blind spot #6, KV scheduling).
+- **OOM at 30k+ isl**. The model accounts for "weights + KV at full
+  isl + activations" against HBM. It doesn't model paged-attention
+  / KV swap-out / prefix cache. Production runs 60k isl on 32 cards
+  routinely; the model rejects it. Long-context Pareto search on
+  this stack is **not trustworthy past the OOM threshold**.
+
+**Conclusion on calibration scope**: only the short-context (≤4-5k)
+branch of this benchmark stresses the comm-calibration approach. The
+~25% throughput residual at 4k is the ceiling of what this method
+can deliver. Long-context divergence is dominated by KV scheduling
+and chunked prefill, neither of which a per-op multiplicative factor
+can capture. Future improvements there require a scheduler-aware
+runtime model.
 
 ## Blind spots
 
@@ -128,11 +164,11 @@ optimum and why predictions diverge further on long-context inputs.
    per-op latency property.
 2. **Chunked prefill**. Production prefill is chunked and interleaved
    with decode. TTFT in the model assumes a single contiguous prefill
-   pass, so model TTFT grows linearly with isl while real TTFT grows
-   sub-linearly (the 4k/60k production runs differ by ~3.6× TTFT for
-   ~15× isl).
+   pass, so model TTFT runs ~3× higher than production (4k/1.5k:
+   model 4677 vs prod 1695; 15k: model 7681 vs prod 2691). The
+   factor approach has no hook to reach this.
 3. **TPOT-vs-isl inversion**. Real TPOT decreases slightly as isl
-   grows (37 ms → 30 ms from 5k to 60k input) because the scheduler
+   grows (37 ms at 5k → 30 ms at 60k) because the scheduler
    amortizes fixed overheads across more tokens. The analytical
    model has TPOT growing with KV cache length (attention SOL ~ s).
    Calibration cannot reverse this trend.
@@ -145,15 +181,23 @@ optimum and why predictions diverge further on long-context inputs.
    ep=2/4 fall back to ep=8, ep=24/32 fall back to ep=16. Topology
    crossings inside those ranges (e.g. ep=8 fully intra-node vs
    ep=16 cross-node) bias the fallback in either direction.
-6. **DSA module data is single-point**. `dsa_generation_module_perf.txt`
+6. **No KV scheduling model**. The OOM check is "weights + KV at
+   full isl + activations" vs HBM. Production paged attention,
+   prefix-cache reuse, and KV swap let real deployments fit isl
+   well past the model's threshold (60k on 32 cards is routine in
+   prod; the model rejects 30k). Past that threshold predictions
+   are not just inaccurate, they are missing — there's no result
+   row to compare against. Calibration cannot shift this boundary.
+7. **DSA module data is single-point**. `dsa_generation_module_perf.txt`
    only covers num_heads=64 (TP=1). Search at TP>1 forces HYBRID
    mode for the attention component, so attention latency in the
    prediction is itself SOL+empirical, not silicon. Calibration has
    no signal there to work with.
 
 For accuracy improvements beyond ~25%, build a scheduling-aware
-runtime model (overlap, chunked prefill, KV scheduling). That is out
-of scope for the perf-database approach.
+runtime model (overlap, chunked prefill, paged-attention KV,
+prefix-cache reuse). That is out of scope for the perf-database
+approach.
 
 ## When to refresh
 
