@@ -218,38 +218,30 @@ def _make_w8a8_weights(spec: DispatchSpec, dctx: DistContext):
       - INT8 weights, npu_format_cast(_, 29) -> FRACTAL_NZ
       - INT64 deq_scale via npu_trans_quant_param
       - Per-expert tensors as Python list (not stacked)
+
+    Allocates each expert's tensor independently rather than slicing
+    a stacked (NL, H, 2I) tensor: stacked-tensor slices share storage
+    with the parent, and npu_format_cast on a slice ends up trying to
+    allocate output the size of the parent storage (NL × per-expert),
+    which OOMs at GLM-5 scale.
     """
     import torch_npu
     dev = f"npu:{dctx.local_rank}"
     NL = spec.num_local_experts
     H, I = spec.hidden, spec.inter
 
-    # Note: weight1 shape is (k, n=2*I) per-expert, weight2 is (k2=I, n2=H).
-    # Match nightly test layout: w1=(NL, k, n) with k=H, n=2*I.
-    w1_stacked = torch.randint(-16, 16, (NL, H, 2 * I), dtype=torch.int8, device=dev)
-    w2_stacked = torch.randint(-16, 16, (NL, I, H),     dtype=torch.int8, device=dev)
-    w1_scale_fp32 = torch.rand(NL, 2 * I, dtype=torch.float32, device=dev) * 0.1 + 0.01
-    w2_scale_fp32 = torch.rand(NL, H,     dtype=torch.float32, device=dev) * 0.1 + 0.01
-
-    def _trans(per_expert_fp32):
-        outs = []
-        for i in range(per_expert_fp32.shape[0]):
-            outs.append(
-                torch_npu.npu_trans_quant_param(
-                    per_expert_fp32[i].contiguous(), None,
-                ).unsqueeze(0)
-            )
-        return torch.cat(outs, dim=0).to(torch.int64)
-
-    s1_stacked = _trans(w1_scale_fp32)
-    s2_stacked = _trans(w2_scale_fp32)
-
     w1_list, w2_list, s1_list, s2_list = [], [], [], []
-    for i in range(NL):
-        w1_list.append(torch_npu.npu_format_cast(w1_stacked[i].contiguous(), 29))
-        w2_list.append(torch_npu.npu_format_cast(w2_stacked[i].contiguous(), 29))
-        s1_list.append(s1_stacked[i].contiguous())
-        s2_list.append(s2_stacked[i].contiguous())
+    for _ in range(NL):
+        w1 = torch.randint(-16, 16, (H, 2 * I), dtype=torch.int8, device=dev)
+        w2 = torch.randint(-16, 16, (I, H),     dtype=torch.int8, device=dev)
+        w1_scale = torch.rand(2 * I, dtype=torch.float32, device=dev) * 0.1 + 0.01
+        w2_scale = torch.rand(H,     dtype=torch.float32, device=dev) * 0.1 + 0.01
+        s1 = torch_npu.npu_trans_quant_param(w1_scale.contiguous(), None).to(torch.int64)
+        s2 = torch_npu.npu_trans_quant_param(w2_scale.contiguous(), None).to(torch.int64)
+        w1_list.append(torch_npu.npu_format_cast(w1, 29))
+        w2_list.append(torch_npu.npu_format_cast(w2, 29))
+        s1_list.append(s1)
+        s2_list.append(s2)
 
     return w1_list, w2_list, s1_list, s2_list
 
@@ -260,23 +252,25 @@ def _make_bf16_weights(spec: DispatchSpec, dctx: DistContext):
     Mirrors vllm-ascend nightly test_dispatch_ffn_combine_bf16.py:
       - BF16 weights cast to FRACTAL_NZ
       - scale1/scale2 are int64 zeros (kernel still expects them, dtype-agnostic)
+
+    Per-expert allocation (not stacked) for the same storage-aliasing
+    reason as the W8A8 path.
     """
     import torch_npu
     dev = f"npu:{dctx.local_rank}"
     NL = spec.num_local_experts
     H, I = spec.hidden, spec.inter
 
-    w1_stacked = torch.randn(NL, H, 2 * I, dtype=torch.bfloat16, device=dev)
-    w2_stacked = torch.randn(NL, I, H,     dtype=torch.bfloat16, device=dev)
-    s1_stacked = torch.zeros(NL, 2 * I, dtype=torch.int64, device=dev)
-    s2_stacked = torch.zeros(NL, H,     dtype=torch.int64, device=dev)
-
     w1_list, w2_list, s1_list, s2_list = [], [], [], []
-    for i in range(NL):
-        w1_list.append(torch_npu.npu_format_cast(w1_stacked[i].contiguous(), 29))
-        w2_list.append(torch_npu.npu_format_cast(w2_stacked[i].contiguous(), 29))
-        s1_list.append(s1_stacked[i].contiguous())
-        s2_list.append(s2_stacked[i].contiguous())
+    for _ in range(NL):
+        w1 = torch.randn(H, 2 * I, dtype=torch.bfloat16, device=dev)
+        w2 = torch.randn(I, H,     dtype=torch.bfloat16, device=dev)
+        s1 = torch.zeros(2 * I, dtype=torch.int64, device=dev)
+        s2 = torch.zeros(H,     dtype=torch.int64, device=dev)
+        w1_list.append(torch_npu.npu_format_cast(w1, 29))
+        w2_list.append(torch_npu.npu_format_cast(w2, 29))
+        s1_list.append(s1)
+        s2_list.append(s2)
 
     return w1_list, w2_list, s1_list, s2_list
 
