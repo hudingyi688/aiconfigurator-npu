@@ -85,6 +85,23 @@ def _write_row(writer, spec: DispatchSpec, latency_us: float) -> None:
     ])
 
 
+# Device-level error signatures that leave the NPU unrecoverable for the
+# rest of the process: once seen, every subsequent op (including
+# empty_cache / synchronize) re-raises, so the sweep must stop, not retry.
+_FATAL_DEVICE_ERROR_MARKERS = (
+    "507057",                 # HCCL/runtime suspect-remote error code
+    "SUSPECT REMOTE ERROR",
+    "PTA call acl api failed",
+    "npuSynchronizeDevice",
+)
+
+
+def _is_fatal_device_error(exc: BaseException) -> bool:
+    """True if exc looks like an unrecoverable NPU device/HCCL error."""
+    text = str(exc)
+    return any(marker in text for marker in _FATAL_DEVICE_ERROR_MARKERS)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -138,9 +155,11 @@ def main() -> None:
     n_ok = 0
     n_fail = 0
     t_start = time.monotonic()
+    fatal = False
     try:
         for i, spec in enumerate(specs):
             tag = f"[{i+1}/{len(specs)}] M={spec.num_tokens} {spec.quant_type}"
+            meta = None
             try:
                 forward_fn, meta = create_dispatch_combine_func(spec, dctx)
                 result = benchmark_npu(
@@ -159,20 +178,36 @@ def main() -> None:
             except Exception as e:
                 logger.exception("%s FAILED: %s", tag, e)
                 n_fail += 1
+                # A device-level error (HCCL 507057 / SUSPECT REMOTE ERROR /
+                # PTA acl api failure) leaves the NPU in an unrecoverable
+                # state — every subsequent op, including empty_cache(), will
+                # re-raise. Stop the sweep cleanly so the rows already
+                # flushed to CSV survive, instead of crashing the process.
+                if _is_fatal_device_error(e):
+                    logger.error("%s is a device-level error; aborting this "
+                                 "ep sweep after %d ok / %d fail (CSV preserved).",
+                                 tag, n_ok, n_fail)
+                    fatal = True
+                    break
             finally:
-                # Free per-spec tensors before the next one
-                try:
+                # Free per-spec tensors before the next one. Skip on a fatal
+                # device error: empty_cache() would itself re-raise 507057.
+                if meta is not None:
                     del meta
-                except Exception:
-                    pass
-                torch.npu.empty_cache()
+                if not fatal:
+                    try:
+                        torch.npu.empty_cache()
+                    except Exception:
+                        pass
     finally:
         if fh is not None:
             fh.close()
-        stack.close()
+        if not fatal:
+            stack.close()
 
     elapsed = time.monotonic() - t_start
-    logger.info("done: %d ok, %d fail, %.1fs", n_ok, n_fail, elapsed)
+    logger.info("done: %d ok, %d fail, %.1fs%s", n_ok, n_fail, elapsed,
+                " (ABORTED on device error)" if fatal else "")
 
 
 if __name__ == "__main__":

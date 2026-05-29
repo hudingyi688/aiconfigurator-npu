@@ -276,22 +276,37 @@ def _make_bf16_weights(spec: DispatchSpec, dctx: DistContext):
 
 
 def _resolve_max_output_size(spec: DispatchSpec) -> int:
-    """Match production cudagraph_capture_sizes-like upper bound.
+    """Per-local-expert token capacity that bounds scratch memory.
 
     The dispatch_ffn_combine kernel allocates per-rank scratch sized to
-    max_output_size × num_local_experts × hidden. vllm-ascend's
-    FusedMC2CommImpl wrapper hardcodes max_output_size=65536 (line 292
-    of moe_comm_method.py); that fallback ALWAYS OOMs on the synthetic
-    bench because we don't have a scheduler bounding output per call.
+    ``max_output_size × num_local_experts × hidden × dtype_bytes``.
+    ``max_output_size`` is the *per-local-expert* token capacity, NOT a
+    global token count. The earlier ``max(M*2, 512)`` ignored that and
+    ignored num_local_experts: at small EP (NL=128) with large M and
+    bf16 weights it sized scratch to e.g. 8192×128×6144×2 ≈ 12 GiB,
+    which drove the device into a 507057 SUSPECT REMOTE ERROR rather
+    than a clean OOM (M=3072 bf16 on ep2).
 
-    The vllm-ascend nightly tests pin max_output_size=512 instead. We
-    match that lower bound when num_tokens is small, and grow with
-    num_tokens to leave the kernel some headroom on larger M sweeps —
-    this matches what production sees: cudagraph_capture_sizes max in
-    the GLM-5 deployment is 102 (decode) and max-num-batched-tokens
-    is 4096 (prefill).
+    Under balanced top-K routing each rank receives ``M × ep × K``
+    token-slots spread over ``NE`` logical experts, so each *local*
+    expert sees on average ``M × ep × K / NE = M × K / NL`` slots.
+    We size to that mean × a load-imbalance headroom factor, clamped
+    to the nightly tests' floor (512). This keeps total scratch
+    (``cap × NL``) proportional to ``M × K`` — bounded and independent
+    of how the experts are sharded across EP.
+
+    vllm-ascend's FusedMC2CommImpl wrapper instead hardcodes
+    max_output_size=65536 (line 292 of moe_comm_method.py); that
+    worst-case fallback ALWAYS OOMs the synthetic bench.
     """
-    return max(spec.num_tokens * 2, 512)
+    # Mean token-slots per local expert under balanced routing.
+    mean_per_expert = (spec.num_tokens * spec.topk + spec.num_local_experts - 1) \
+        // spec.num_local_experts
+    # Headroom for routing imbalance (experts are not perfectly balanced).
+    HEADROOM_FACTOR = 4
+    cap = mean_per_expert * HEADROOM_FACTOR
+    # Nightly tests' floor; also covers the tiny-M regime.
+    return max(cap, 512)
 
 
 def create_dispatch_combine_func(
