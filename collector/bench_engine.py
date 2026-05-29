@@ -67,11 +67,20 @@ def benchmark_npu(
     torch.npu.synchronize()
 
     try:
-        stream = torch.npu.current_stream()
+        # NPU graphs must be captured on a NON-default stream. Using
+        # current_stream() (the default stream) raises
+        # "NPU graphs must be captured on a non-default stream".
+        # Use a dedicated side stream: have it wait for warmup to finish,
+        # capture on it, then have the default stream wait for the capture
+        # so a subsequent graph.replay() on the default stream is ordered
+        # correctly.
+        capture_stream = torch.npu.Stream()
+        capture_stream.wait_stream(torch.npu.current_stream())
         graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph, stream=stream):
+        with torch.npu.graph(graph, stream=capture_stream):
             for _ in range(repeat_n):
                 kernel_func()
+        torch.npu.current_stream().wait_stream(capture_stream)
 
         graph_us = _timed_run(kernel_func, num_runs, repeat_n, graph=graph)
         eager_us = _timed_run(kernel_func, num_runs, repeat_n)
