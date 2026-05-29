@@ -102,6 +102,37 @@ def _is_fatal_device_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _FATAL_DEVICE_ERROR_MARKERS)
 
 
+def _ensure_hccl_buffsize(num_tokens_list, hidden: int, topk: int) -> None:
+    """Set HCCL_BUFFSIZE (MB) large enough for the largest M in the sweep.
+
+    dispatch_ffn_combine validates HCCL_BUFFSIZE against a hard formula
+    (it prints it on failure):
+
+        required_bytes = (m * k * topK * sizeof(int8)) * 3 + 3MB
+
+    where k == hidden. The HCCL default is 200MB, which is too small from
+    M=1536 (226MB) upward — the op then fails host-side tiling with
+    EZ9999 "HCCL_BUFFSIZE is too SMALL" before any kernel runs. We size
+    for the max M in the sweep, add a safety margin, and round up to MB.
+
+    Must run BEFORE HCCL init (setup_all -> init_process_group); HCCL
+    reads HCCL_BUFFSIZE once at communicator creation. If the user has
+    already exported a larger value we leave it untouched.
+    """
+    max_m = max(num_tokens_list)
+    required_bytes = (max_m * hidden * topk * 1) * 3 + 3 * 1024 * 1024
+    # 25% margin, rounded up to whole MB.
+    required_mb = ((int(required_bytes * 1.25) + (1 << 20) - 1) >> 20)
+    current = os.environ.get("HCCL_BUFFSIZE")
+    if current is not None and current.isdigit() and int(current) >= required_mb:
+        logger.info("HCCL_BUFFSIZE=%s MB (user-set, >= required %d MB) — keeping",
+                    current, required_mb)
+        return
+    os.environ["HCCL_BUFFSIZE"] = str(required_mb)
+    logger.info("HCCL_BUFFSIZE set to %d MB for max M=%d (k=%d topk=%d)",
+                required_mb, max_m, hidden, topk)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -119,6 +150,10 @@ def main() -> None:
                 "tokens=%s quants=%s",
                 args.ep_size, args.hidden, args.inter, args.num_experts,
                 args.topk, args.num_tokens_list, args.quant_types)
+
+    # Must run before setup_all() -> HCCL init: HCCL_BUFFSIZE is read once
+    # at communicator creation.
+    _ensure_hccl_buffsize(args.num_tokens_list, args.hidden, args.topk)
 
     dctx, stack = setup_all(args.ep_size)
     logger.info("dist OK: world=%d ep=%d ep_rank=%d group=%s",
