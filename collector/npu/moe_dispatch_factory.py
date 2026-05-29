@@ -276,35 +276,34 @@ def _make_bf16_weights(spec: DispatchSpec, dctx: DistContext):
 
 
 def _resolve_max_output_size(spec: DispatchSpec) -> int:
-    """Per-local-expert token capacity that bounds scratch memory.
+    """Per-local-expert token capacity, sized to balanced-routing peak.
 
-    The dispatch_ffn_combine kernel allocates per-rank scratch sized to
-    ``max_output_size × num_local_experts × hidden × dtype_bytes``.
-    ``max_output_size`` is the *per-local-expert* token capacity, NOT a
-    global token count. The earlier ``max(M*2, 512)`` ignored that and
-    ignored num_local_experts: at small EP (NL=128) with large M and
-    bf16 weights it sized scratch to e.g. 8192×128×6144×2 ≈ 12 GiB,
-    which drove the device into a 507057 SUSPECT REMOTE ERROR rather
-    than a clean OOM (M=3072 bf16 on ep2).
+    The dispatch_ffn_combine kernel allocates per-rank scratch of
+    ``max_output_size × num_local_experts × hidden × dtype_bytes`` AND
+    writes each local expert's dispatched tokens into a buffer of
+    ``max_output_size`` rows. So the value is a two-sided constraint:
 
-    Under balanced top-K routing each rank receives ``M × ep × K``
-    token-slots spread over ``NE`` logical experts, so each *local*
-    expert sees on average ``M × ep × K / NE = M × K / NL`` slots.
-    We size to that mean × a load-imbalance headroom factor, clamped
-    to the nightly tests' floor (512). This keeps total scratch
-    (``cap × NL``) proportional to ``M × K`` — bounded and independent
-    of how the experts are sharded across EP.
+      - too LARGE  -> scratch OOM / device error 507057 (the original
+        ``max(M*2, 512)`` sized 9-12 GiB at small EP / large M)
+      - too SMALL  -> the kernel writes past the per-expert buffer, an
+        MTE out-of-range error (EI0012 / 507035) — what ``mean×4`` hit
+        once random routing produced an above-mean expert.
 
-    vllm-ascend's FusedMC2CommImpl wrapper instead hardcodes
-    max_output_size=65536 (line 292 of moe_comm_method.py); that
-    worst-case fallback ALWAYS OOMs the synthetic bench.
+    With the balanced (round-robin) routing the collector now builds,
+    each local expert receives exactly ``ceil(M × ep × K / NE)`` =
+    ``ceil(M × K / NL)`` tokens (every rank dispatches M×K slots; an
+    all-to-all spreads them uniformly over NE logical experts; NL of
+    those live on this rank). We size to that exact peak plus a small
+    additive margin for the kernel's internal alignment/padding, floored
+    at the nightly tests' 512. Total scratch stays ∝ M×K and is
+    independent of EP sharding.
     """
-    # Mean token-slots per local expert under balanced routing.
-    mean_per_expert = (spec.num_tokens * spec.topk + spec.num_local_experts - 1) \
-        // spec.num_local_experts
-    # Headroom for routing imbalance (experts are not perfectly balanced).
-    HEADROOM_FACTOR = 4
-    cap = mean_per_expert * HEADROOM_FACTOR
+    NL = spec.num_local_experts
+    # Exact per-local-expert token count under round-robin routing.
+    peak_per_expert = (spec.num_tokens * spec.topk + NL - 1) // NL
+    # Small additive margin for kernel-internal alignment/padding.
+    ALIGN_MARGIN = 64
+    cap = peak_per_expert + ALIGN_MARGIN
     # Nightly tests' floor; also covers the tiny-M regime.
     return max(cap, 512)
 
@@ -347,7 +346,16 @@ def create_dispatch_combine_func(
         raise ValueError(f"unsupported quant_type: {spec.quant_type}")
 
     x = torch.randn(M, H, dtype=out_dtype, device=dev)
-    expert_idx = torch.randint(0, NE, (M, K), dtype=torch.int32, device=dev)
+    # Balanced (round-robin) routing rather than random. GLM-5's router
+    # is trained with an aux balance loss, so production traffic is
+    # near-uniform across experts. Random routing (randint over NE) instead
+    # produces unbounded per-expert peaks: at large M one local expert can
+    # receive several times the mean, overflowing the kernel's per-expert
+    # buffer (max_output_size) and causing an MTE out-of-range write
+    # (EI0012 / 507035). Round-robin makes the peak == ceil(mean), which
+    # lets us size max_output_size precisely below.
+    flat = torch.arange(M * K, dtype=torch.int32, device=dev) % NE
+    expert_idx = flat.reshape(M, K)
     probs = torch.rand(M, K, dtype=torch.float32, device=dev)
 
     out = torch.empty_like(x)

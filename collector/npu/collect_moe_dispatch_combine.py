@@ -142,14 +142,20 @@ def main() -> None:
     else:
         fh, writer = None, None
 
+    # Order specs by ascending difficulty: M outer (small -> large),
+    # quant inner. A device-level error tends to hit only at large M, so
+    # this guarantees every small/medium-M point for BOTH quant types is
+    # collected and flushed before any crash — instead of the old
+    # quant-outer order, where a single large-M bf16 failure buried the
+    # entire w8a8 sweep (the one production actually uses).
     specs = [
         DispatchSpec(
             num_tokens=m, hidden=args.hidden, inter=args.inter,
             num_experts=args.num_experts, topk=args.topk,
             ep_world_size=args.ep_size, quant_type=q,
         )
-        for q in args.quant_types
         for m in args.num_tokens_list
+        for q in args.quant_types
     ]
 
     n_ok = 0
