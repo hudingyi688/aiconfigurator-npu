@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=str, default="./data/moe_dispatch_combine")
     p.add_argument("--warmup-iters", type=int, default=10)
     p.add_argument("--num-runs", type=int, default=50)
+    p.add_argument("--append", action="store_true",
+                   help="Append to an existing per-ep CSV instead of "
+                        "overwriting it. Default is to truncate and rewrite, "
+                        "so each run produces a single-version, dup-free file. "
+                        "Only use --append to resume a deliberately split run.")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
@@ -163,8 +168,14 @@ def main() -> None:
     if dctx.rank == 0:
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = _csv_path(out_dir, args.ep_size)
-        write_header = not csv_path.exists()
-        fh = csv_path.open("a", newline="", encoding="utf-8")
+        # Default: truncate + rewrite ("w") so a run yields a single-version,
+        # duplicate-free file. The old unconditional append ("a") silently
+        # stacked every prior smoke test / failed retry onto the same file,
+        # mixing measurements from different code versions for the same
+        # (M, dtype) key. --append opts back into appending to resume a run.
+        mode = "a" if args.append else "w"
+        write_header = mode == "w" or not csv_path.exists()
+        fh = csv_path.open(mode, newline="", encoding="utf-8")
         writer = csv.writer(fh)
         if write_header:
             writer.writerow([
@@ -174,6 +185,7 @@ def main() -> None:
                 "num_local_experts", "dtype", "latency_us",
             ])
             fh.flush()
+        logger.info("writing %s (mode=%s)", csv_path, mode)
     else:
         fh, writer = None, None
 
