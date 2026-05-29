@@ -6,9 +6,17 @@ Encapsulates everything the probe walked through:
   - vllm config + ParallelConfig (so initialize_model_parallel runs)
   - vllm TP/PP groups (ensure_model_parallel_initialized)
   - vllm-ascend MC2 group (_MC2) — built directly from the ep ranks
-  - FusedMoEConfig + FusedMoEParallelConfig
-  - FusedMC2CommImpl construction (vllm-ascend's MoE comm interface)
-  - MoEFusedExpertsInput tensor allocation (W8A8 list-of-tensors layout)
+  - W8A8 / BF16 weight tensors in FRACTAL_NZ format (npu_format_cast 29)
+  - Direct torch.ops._C_ascend.dispatch_ffn_combine call, mirroring the
+    canonical path validated by vllm-ascend's nightly tests.
+
+We deliberately bypass FusedMC2CommImpl: its hardcoded
+max_output_size=65536 (line 292 of moe_comm_method.py) allocates a
+worst-case scratch buffer that OOMs on synthetic single-/double-/16-
+card runs. The bare C op accepts max_output_size as a parameter; we
+size it to ~max(num_tokens × 2, 512), matching the nightly test
+range and approximating what production cudagraph_capture_sizes
+gives the kernel.
 
 The collector stays thin: it sets a (num_tokens, ep_size, dtype) spec,
 asks the factory for a forward callable + a context to keep alive, and
@@ -17,7 +25,6 @@ hands the callable to bench_engine.benchmark_npu().
 from __future__ import annotations
 
 import glob
-import math
 import os
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -204,53 +211,26 @@ class DispatchSpec:
         return self.num_experts // self.ep_world_size
 
 
-def build_moe_config(spec: DispatchSpec, dctx: DistContext, dtype: torch.dtype):
-    """Build FusedMoEConfig matching the spec."""
-    from vllm.model_executor.layers.fused_moe.config import (
-        FusedMoEConfig, FusedMoEParallelConfig,
-        MoEActivation, RoutingMethodType,
-    )
-    parallel_cfg = FusedMoEParallelConfig(
-        tp_size=1, pcp_size=1, dp_size=1,
-        ep_size=spec.ep_world_size,
-        tp_rank=0, pcp_rank=0, dp_rank=0,
-        ep_rank=dctx.ep_rank,
-        sp_size=1, use_ep=True,
-        all2all_backend="naive", enable_eplb=False,
-    )
-    return FusedMoEConfig(
-        num_experts=spec.num_experts,
-        experts_per_token=spec.topk,
-        hidden_dim=spec.hidden,
-        intermediate_size_per_partition=spec.inter,
-        num_local_experts=spec.num_local_experts,
-        num_logical_experts=spec.num_experts,
-        activation=MoEActivation.SILU,
-        device=torch.device(f"npu:{dctx.local_rank}"),
-        routing_method=RoutingMethodType.Renormalize,
-        moe_parallel_config=parallel_cfg,
-        in_dtype=dtype,
-    )
+def _make_w8a8_weights(spec: DispatchSpec, dctx: DistContext):
+    """Build W8A8 weights as FRACTAL_NZ list[Tensor] (one per local expert).
 
-
-def _make_w8a8_inputs(spec: DispatchSpec, dctx: DistContext):
-    """Build W8A8 weights/scales as list[Tensor] (one per local expert)."""
+    Mirrors vllm-ascend nightly test_dispatch_ffn_combine.py:
+      - INT8 weights, npu_format_cast(_, 29) -> FRACTAL_NZ
+      - INT64 deq_scale via npu_trans_quant_param
+      - Per-expert tensors as Python list (not stacked)
+    """
     import torch_npu
     dev = f"npu:{dctx.local_rank}"
     NL = spec.num_local_experts
     H, I = spec.hidden, spec.inter
 
-    w1_stacked = torch.randint(
-        -128, 127, (NL, H, 2 * I), dtype=torch.int8, device=dev,
-    )
-    w2_stacked = torch.randint(
-        -128, 127, (NL, I, H), dtype=torch.int8, device=dev,
-    )
+    # Note: weight1 shape is (k, n=2*I) per-expert, weight2 is (k2=I, n2=H).
+    # Match nightly test layout: w1=(NL, k, n) with k=H, n=2*I.
+    w1_stacked = torch.randint(-16, 16, (NL, H, 2 * I), dtype=torch.int8, device=dev)
+    w2_stacked = torch.randint(-16, 16, (NL, I, H),     dtype=torch.int8, device=dev)
     w1_scale_fp32 = torch.rand(NL, 2 * I, dtype=torch.float32, device=dev) * 0.1 + 0.01
     w2_scale_fp32 = torch.rand(NL, H,     dtype=torch.float32, device=dev) * 0.1 + 0.01
 
-    # npu_trans_quant_param packs fp32 scale -> int64 deq_scale; only
-    # accepts 1D scale, call per-expert.
     def _trans(per_expert_fp32):
         outs = []
         for i in range(per_expert_fp32.shape[0]):
@@ -264,73 +244,82 @@ def _make_w8a8_inputs(spec: DispatchSpec, dctx: DistContext):
     s1_stacked = _trans(w1_scale_fp32)
     s2_stacked = _trans(w2_scale_fp32)
 
-    return (
-        list(w1_stacked.unbind(0)),
-        list(w2_stacked.unbind(0)),
-        list(s1_stacked.unbind(0)),
-        list(s2_stacked.unbind(0)),
-    )
+    w1_list, w2_list, s1_list, s2_list = [], [], [], []
+    for i in range(NL):
+        w1_list.append(torch_npu.npu_format_cast(w1_stacked[i].contiguous(), 29))
+        w2_list.append(torch_npu.npu_format_cast(w2_stacked[i].contiguous(), 29))
+        s1_list.append(s1_stacked[i].contiguous())
+        s2_list.append(s2_stacked[i].contiguous())
+
+    return w1_list, w2_list, s1_list, s2_list
 
 
-def _make_bf16_inputs(spec: DispatchSpec, dctx: DistContext):
-    """Build BF16 weights as list[Tensor] (no scales)."""
+def _make_bf16_weights(spec: DispatchSpec, dctx: DistContext):
+    """Build BF16 weights as FRACTAL_NZ list[Tensor], plus int64 zero scales.
+
+    Mirrors vllm-ascend nightly test_dispatch_ffn_combine_bf16.py:
+      - BF16 weights cast to FRACTAL_NZ
+      - scale1/scale2 are int64 zeros (kernel still expects them, dtype-agnostic)
+    """
+    import torch_npu
     dev = f"npu:{dctx.local_rank}"
     NL = spec.num_local_experts
     H, I = spec.hidden, spec.inter
 
     w1_stacked = torch.randn(NL, H, 2 * I, dtype=torch.bfloat16, device=dev)
     w2_stacked = torch.randn(NL, I, H,     dtype=torch.bfloat16, device=dev)
-    return list(w1_stacked.unbind(0)), list(w2_stacked.unbind(0)), None, None
+    s1_stacked = torch.zeros(NL, 2 * I, dtype=torch.int64, device=dev)
+    s2_stacked = torch.zeros(NL, H,     dtype=torch.int64, device=dev)
+
+    w1_list, w2_list, s1_list, s2_list = [], [], [], []
+    for i in range(NL):
+        w1_list.append(torch_npu.npu_format_cast(w1_stacked[i].contiguous(), 29))
+        w2_list.append(torch_npu.npu_format_cast(w2_stacked[i].contiguous(), 29))
+        s1_list.append(s1_stacked[i].contiguous())
+        s2_list.append(s2_stacked[i].contiguous())
+
+    return w1_list, w2_list, s1_list, s2_list
+
+
+def _resolve_max_output_size(spec: DispatchSpec) -> int:
+    """Match production cudagraph_capture_sizes-like upper bound.
+
+    The dispatch_ffn_combine kernel allocates per-rank scratch sized to
+    max_output_size × num_local_experts × hidden. vllm-ascend's
+    FusedMC2CommImpl wrapper hardcodes max_output_size=65536 (line 292
+    of moe_comm_method.py); that fallback ALWAYS OOMs on the synthetic
+    bench because we don't have a scheduler bounding output per call.
+
+    The vllm-ascend nightly tests pin max_output_size=512 instead. We
+    match that lower bound when num_tokens is small, and grow with
+    num_tokens to leave the kernel some headroom on larger M sweeps —
+    this matches what production sees: cudagraph_capture_sizes max in
+    the GLM-5 deployment is 102 (decode) and max-num-batched-tokens
+    is 4096 (prefill).
+    """
+    return max(spec.num_tokens * 2, 512)
 
 
 def create_dispatch_combine_func(
     spec: DispatchSpec, dctx: DistContext,
 ) -> tuple[Callable[[], None], dict]:
-    """Build a forward callable that runs one comm.fused_experts() pass.
+    """Build a forward callable that runs one dispatch_ffn_combine pass.
+
+    Bypasses vllm-ascend's FusedMC2CommImpl wrapper and calls
+    torch.ops._C_ascend.dispatch_ffn_combine directly, mirroring the
+    canonical path validated by the vllm-ascend nightly tests
+    (test_dispatch_ffn_combine.py for W8A8, test_dispatch_ffn_combine_bf16.py
+    for BF16). The wrapper's hardcoded max_output_size=65536 is what
+    OOMs synthetic bench; the bare op accepts any value.
 
     Returns:
-      forward_fn: zero-arg callable, runs one dispatch+ffn+combine
-      meta: dict with the exit_stack to close after benchmarking
+      forward_fn: zero-arg callable, runs one fused dispatch+ffn+combine
+      meta: dict with handles to keep alive during benchmarking
     """
-    from vllm_ascend.ops.fused_moe.moe_comm_method import FusedMC2CommImpl
-    from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
-        MoEFusedExpertsInput, MoEWeights,
-    )
-    from vllm_ascend.ops.fused_moe.moe_stage_params import (
-        MoERoutingParams, MoEQuantParams,
-    )
-
-    if spec.quant_type == "w8a8_dynamic":
-        dtype = torch.bfloat16
-        w1_list, w2_list, s1_list, s2_list = _make_w8a8_inputs(spec, dctx)
-        # FusedMC2CommImpl.fused_experts dispatches to dispatch_ffn_combine
-        # purely based on `w1_scale is not None` (line 267 of
-        # moe_comm_method.py). MoEQuantParams() with defaults works
-        # for the W8A8 path; we don't need to set quant_type
-        # explicitly. Earlier attempts to import QuantType failed
-        # because it lives in different module locations across
-        # vllm-ascend versions.
-        quant_params = MoEQuantParams()
-    elif spec.quant_type == "bf16":
-        # FusedMC2CommImpl asserts w1_scale/w2_scale != None, i.e. it
-        # only supports W8A8. BF16 in production goes through a
-        # different path: TokenDispatcherWithMC2.token_dispatch ->
-        # per-expert GEMM -> token_combine (three separate ops, see
-        # profiler MoeDistributeDispatchV2 + GroupedMatmul +
-        # MoeDistributeCombineV2). That requires a custom collector
-        # we have not written yet; skip with a clear error so the
-        # sweep driver records "no bf16 data" rather than misreporting.
-        raise NotImplementedError(
-            "bf16 dispatch+combine bench requires the unfused "
-            "TokenDispatcherWithMC2 path (token_dispatch + expert "
-            "GEMM + token_combine). Not implemented yet — only "
-            "W8A8 (FusedMC2CommImpl) is supported in this collector."
-        )
-    else:
-        raise ValueError(f"unsupported quant_type: {spec.quant_type}")
-
-    moe_cfg = build_moe_config(spec, dctx, dtype)
-    comm = FusedMC2CommImpl(moe_cfg)
+    # Make sure vllm-ascend's custom C ops are registered
+    # (torch.ops._C_ascend.dispatch_ffn_combine).
+    from vllm_ascend.utils import enable_custom_op
+    enable_custom_op()
 
     M = spec.num_tokens
     H = spec.hidden
@@ -339,34 +328,49 @@ def create_dispatch_combine_func(
     K = spec.topk
     dev = f"npu:{dctx.local_rank}"
 
-    x = torch.randn(M, H, dtype=dtype, device=dev)
-    topk_ids = torch.randint(0, NE, (M, K), dtype=torch.int32, device=dev)
-    probs = torch.rand(M, K, dtype=torch.float32, device=dev)
-    expert_map = torch.arange(NL, dtype=torch.int32, device=dev)
+    if spec.quant_type == "w8a8_dynamic":
+        out_dtype = torch.bfloat16
+        w1_list, w2_list, s1_list, s2_list = _make_w8a8_weights(spec, dctx)
+    elif spec.quant_type == "bf16":
+        out_dtype = torch.bfloat16
+        w1_list, w2_list, s1_list, s2_list = _make_bf16_weights(spec, dctx)
+    else:
+        raise ValueError(f"unsupported quant_type: {spec.quant_type}")
 
-    weights = MoEWeights(
-        w1=w1_list, w2=w2_list,
-        w1_scale=s1_list, w2_scale=s2_list,
-    )
-    routing = MoERoutingParams(
-        expert_map=expert_map,
-        global_redundant_expert_num=0,
-        mc2_mask=None,
-        apply_router_weight_on_input=False,
-    )
-    input_ = MoEFusedExpertsInput(
-        hidden_states=x, topk_weights=probs, topk_ids=topk_ids,
-        weights=weights, routing=routing, quant=quant_params,
-    )
+    x = torch.randn(M, H, dtype=out_dtype, device=dev)
+    expert_idx = torch.randint(0, NE, (M, K), dtype=torch.int32, device=dev)
+    probs = torch.rand(M, K, dtype=torch.float32, device=dev)
+
+    out = torch.empty_like(x)
+    expert_token_nums = torch.zeros((1, NL), dtype=torch.int32, device=dev)
+
+    max_output_size = _resolve_max_output_size(spec)
 
     def forward_fn() -> None:
-        comm.fused_experts(input_)
+        torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore[attr-defined]
+            x=x,
+            weight1=w1_list,
+            weight2=w2_list,
+            expert_idx=expert_idx,
+            scale1=s1_list,
+            scale2=s2_list,
+            probs=probs,
+            group=dctx.group_name,
+            max_output_size=max_output_size,
+            out=out,
+            expert_token_nums=expert_token_nums,
+        )
 
     # Dry run to surface init failures here, not in the timing loop.
     forward_fn()
     torch.npu.synchronize()
 
-    return forward_fn, {"comm": comm, "input": input_}
+    return forward_fn, {
+        "x": x, "out": out, "expert_idx": expert_idx, "probs": probs,
+        "w1": w1_list, "w2": w2_list, "s1": s1_list, "s2": s2_list,
+        "expert_token_nums": expert_token_nums,
+        "max_output_size": max_output_size,
+    }
 
 
 # ============================================================
