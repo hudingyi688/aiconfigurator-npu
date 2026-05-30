@@ -561,6 +561,8 @@ class PerfDataFilename(Enum):
     generation_mla = "generation_mla_perf.txt"
     mla_bmm = "mla_bmm_perf.txt"
     moe = "moe_perf.txt"
+    # vllm-ascend fused dispatch + per-expert FFN + combine (FusedMC2 kernel)
+    moe_dispatch_combine = "moe_dispatch_combine_perf.txt"
     custom_allreduce = "custom_allreduce_perf.txt"
     wideep_context_mla = "wideep_context_mla_perf.txt"
     wideep_generation_mla = "wideep_generation_mla_perf.txt"

@@ -501,6 +501,22 @@ class MoE(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query MoE latency with energy data."""
+        # vllm-ascend MoE-EP path: pre-dispatch + per-expert FFN + combine are
+        # fused into one on-device kernel (FusedMC2) whose measured latency is
+        # emitted by the paired MoEDispatch (post-dispatch) op via
+        # query_moe_dispatch_combine. The expert FFN compute is already inside
+        # that fused number, so we must NOT also charge it here — return 0 on
+        # this gated path to avoid double-counting. The gate intentionally does
+        # NOT test attention_dp_size: vllm-ascend selects FusedMC2 purely on
+        # ep_world_size (<=32) regardless of DP attention, so dp>1 (the
+        # mainstream DP-attn + EP-MoE form) takes this path too. Same gate
+        # predicate as MoEDispatch's fused-silicon block.
+        if (
+            database.backend == common.BackendName.vllm_ascend.value
+            and self._moe_ep_size > 1
+        ):
+            return PerformanceResult(0.0, energy=0.0)
+
         # attention dp size will scale up the total input tokens.
         x = kwargs.get("x") * self._attention_dp_size
         overwrite_quant_mode = kwargs.get("quant_mode")
@@ -721,7 +737,43 @@ class MoEDispatch(Operation):
                     ar_latency *= database.query_comm_calibration("all_reduce", self._moe_ep_size, phase)
                 comm_latency += ar_latency
 
-            if self._attention_dp_size > 1:
+            # MoE comm path is mutually exclusive: vllm-ascend with moe_ep>1
+            # runs the fused FusedMC2 kernel (dispatch_ffn_combine), which does
+            # NOT perform the cross-DP all_gather/reduce_scatter that the
+            # AllGather comm path does — that DP traffic is subsumed into the
+            # fused kernel. So we pick ONE: the fused silicon table OR the
+            # analytical dp_latency, never both, else we double-count the DP comm.
+            is_fused_mc2 = (
+                database.backend == common.BackendName.vllm_ascend.value
+                and self._moe_ep_size > 1
+            )
+
+            if is_fused_mc2:
+                # vllm-ascend production path: pre-dispatch alltoallv, per-expert
+                # FFN and combine are fused into a single on-device kernel
+                # (FusedMC2CommImpl.fused_experts -> dispatch_ffn_combine). A
+                # silicon table measures that whole fused kernel, so we feed its
+                # latency in here ONCE — on the combine (post-dispatch) op — and
+                # emit 0 for the pre-dispatch op. The expert FFN compute already
+                # lives inside the fused number, so the paired MoE op zeroes its
+                # query_moe result on the same gate (see MoE.query). num_tokens
+                # is kwargs["x"] = per-rank tokens, matching the collector's
+                # per-rank M; FusedMC2 does no cross-DP all_gather so this holds
+                # for dp>1 too. The attention-side ar_latency above is a separate
+                # kernel and is intentionally preserved.
+                if not self._pre_dispatch:
+                    quant_mode = self._quant_mode
+                    if quant_mode is not None and quant_mode == common.MoEQuantMode.w8a8_dynamic:
+                        dtype_tag = "w8a8_dynamic"
+                    else:
+                        dtype_tag = "bf16"
+                    fused_latency = float(
+                        database.query_moe_dispatch_combine(int(num_tokens), dtype_tag, self._moe_ep_size)
+                    )
+                    comm_latency += fused_latency
+            elif self._attention_dp_size > 1:
+                # AllGather comm path: cross-DP all_gather (pre-dispatch) /
+                # reduce_scatter (post-dispatch) of the attention output.
                 ag_op = "all_gather" if self._pre_dispatch else "reduce_scatter"
                 dp_latency = database.query_nccl(
                     common.CommQuantMode.half,
@@ -733,39 +785,6 @@ class MoEDispatch(Operation):
                     dp_latency *= database.query_comm_calibration(ag_op, self._moe_ep_size, phase)
                 comm_latency += dp_latency
 
-            # vllm-ascend production path: dispatch + per-expert FFN + combine
-            # are fused into a single op (FusedMC2CommImpl.fused_experts ->
-            # torch.ops._C_ascend.dispatch_ffn_combine for W8A8 path).
-            # The analytical comm above only models attention-side traffic;
-            # the dispatch+combine kernel adds a flat per-call cost driven by
-            # the full HCCL alltoallv volume (volume * topk per rank). Model
-            # it as the no-quant alltoall using moe_ep_size, then apply the
-            # profiler-derived calibration. Calibration covers the BF16
-            # combine path symmetrically.
-            if (
-                database.backend == common.BackendName.vllm_ascend.value
-                and self._moe_ep_size > 1
-                and self._attention_dp_size <= 1
-            ):
-                a2a_volume = volume * self._topk
-                # SOL mode: alpha-beta analytical baseline. The vllm-ascend
-                # silicon nccl table doesn't carry all_to_all entries, and
-                # the calibration factor below is what brings this in line
-                # with measured production latency anyway.
-                a2a_latency = database.query_nccl(
-                    common.CommQuantMode.half,
-                    self.num_gpus,
-                    "all_to_all",
-                    a2a_volume,
-                    database_mode=common.DatabaseMode.SOL,
-                )
-                quant_mode = self._quant_mode
-                if quant_mode is not None and quant_mode == common.MoEQuantMode.w8a8_dynamic:
-                    cal_key = "moe_dispatch_combine_w8a8"
-                else:
-                    cal_key = "moe_dispatch_bf16" if self._pre_dispatch else "moe_combine_bf16"
-                a2a_latency *= database.query_comm_calibration(cal_key, self._moe_ep_size, phase)
-                comm_latency += a2a_latency
         elif database.backend == common.BackendName.sglang.value:
             if self._moe_backend == "deepep_moe":
                 logger.debug("MoEDispatch: In SGLang DeepEP execution path")

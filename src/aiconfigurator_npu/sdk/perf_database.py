@@ -781,6 +781,55 @@ def load_moe_data(moe_file):
     return moe_default_data, moe_low_latency_data
 
 
+def load_moe_dispatch_combine_data(moe_dispatch_combine_file):
+    """
+    Load the vllm-ascend fused dispatch+FFN+combine (FusedMC2) perf data.
+
+    The on-device kernel fuses pre-dispatch alltoallv, per-expert FFN and
+    combine into a single op, so the measured ``latency_us`` already includes
+    the expert GEMM compute. Latency is converted us -> ms to match the rest
+    of the pipeline (nccl/moe tables are stored in ms).
+
+    Returns:
+        dict: Nested dict ``[ep_size][dtype][num_tokens]`` -> ``{"latency", "power", "energy"}``
+              with latency in ms. ``None`` when the file is absent (optional table).
+    """
+    if not os.path.exists(moe_dispatch_combine_file):
+        logger.debug(f"MoE dispatch+combine data file {moe_dispatch_combine_file} not found.")
+        return None
+
+    moe_dispatch_combine_data = defaultdict(lambda: defaultdict(dict))
+
+    with open(moe_dispatch_combine_file, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    has_power = len(rows) > 0 and "power" in rows[0]
+    if not has_power:
+        logger.debug(f"Legacy database format detected in {moe_dispatch_combine_file} - power will default to 0.0")
+
+    for row in rows:
+        ep_size = int(row["ep_size"])
+        dtype = row["dtype"]
+        num_tokens = int(row["num_tokens"])
+        latency = float(row["latency_us"]) / 1000.0  # us -> ms
+        power = float(row.get("power", 0.0))
+        energy = power * latency  # watt-milliseconds
+
+        if num_tokens in moe_dispatch_combine_data[ep_size][dtype]:
+            logger.debug(
+                f"value conflict in moe_dispatch_combine data: ep{ep_size} {dtype} {num_tokens}"
+            )
+        moe_dispatch_combine_data[ep_size][dtype][num_tokens] = {
+            "latency": latency,
+            "power": power,
+            "energy": energy,
+        }
+
+    return moe_dispatch_combine_data
+
+
+
 def load_context_attention_data(context_attention_file):
     """
     Load the context attention data with power support (backward compatible).
@@ -2129,6 +2178,7 @@ class PerfDatabase:
                 PerfDataFilename.context_attention: load_context_attention_data,
                 PerfDataFilename.generation_attention: load_generation_attention_data,
                 PerfDataFilename.moe: load_moe_data,
+                PerfDataFilename.moe_dispatch_combine: load_moe_dispatch_combine_data,
                 PerfDataFilename.custom_allreduce: load_custom_allreduce_data,
                 PerfDataFilename.nccl: load_nccl_data,
                 PerfDataFilename.context_mla: load_context_mla_data,
@@ -2171,6 +2221,8 @@ class PerfDatabase:
         self._context_attention_data = _load_op_data(PerfDataFilename.context_attention)
         self._generation_attention_data = _load_op_data(PerfDataFilename.generation_attention)
         self._moe_data, self._moe_low_latency_data = _load_op_data(PerfDataFilename.moe)
+        # vllm-ascend fused dispatch+FFN+combine silicon table (optional)
+        self._moe_dispatch_combine_data = _load_op_data(PerfDataFilename.moe_dispatch_combine)
 
         # Comm ops
         self._custom_allreduce_data = _load_op_data(PerfDataFilename.custom_allreduce)
@@ -4603,6 +4655,63 @@ class PerfDatabase:
                 pool.sort(key=lambda pair: (abs(pair[0] - ep_size), -pair[0]))
                 return pool[0][1]
         return 1.0
+
+    @functools.lru_cache(maxsize=32768)
+    def query_moe_dispatch_combine(
+        self,
+        num_tokens: int,
+        dtype: str,
+        ep_size: int,
+    ) -> PerformanceResult:
+        """
+        Query the vllm-ascend fused dispatch+FFN+combine (FusedMC2) latency.
+
+        The silicon table measures the whole fused kernel — pre-dispatch
+        alltoallv, per-expert FFN and combine — as a single number, so the
+        returned latency already accounts for the expert GEMM compute that
+        ``query_moe`` would otherwise model. Callers must therefore replace
+        the MoE FFN + both MoEDispatch comm slots with this single value, not
+        add it on top (see operations.MoEDispatch / MoE).
+
+        Latency is interpolated linearly over ``num_tokens`` within the
+        measured grid for the matching ``(ep_size, dtype)`` and clamped
+        (held flat) outside the measured range.
+
+        Args:
+            num_tokens: number of tokens routed through the MoE layer
+            dtype: quant dtype tag as stored in the table ("bf16", "w8a8_dynamic")
+            ep_size: MoE expert-parallel size (2, 4, 8 in the measured grid)
+
+        Returns:
+            PerformanceResult: latency in ms (acts as float); energy in W·ms.
+
+        Raises:
+            ValueError: when the table is not loaded or has no entries for
+                        the requested ``(ep_size, dtype)``.
+        """
+        self._moe_dispatch_combine_data.raise_if_not_loaded()
+
+        ep_table = self._moe_dispatch_combine_data.get(ep_size)
+        token_table = ep_table.get(dtype) if ep_table is not None else None
+        if not token_table:
+            raise ValueError(
+                f"no moe_dispatch_combine data for ep_size={ep_size}, dtype={dtype!r}; "
+                f"available ep_sizes={sorted(self._moe_dispatch_combine_data.keys())}"
+            )
+
+        token_points = sorted(token_table.keys())
+        # Clamp into the measured range (hold flat at the boundaries): the
+        # fused-kernel curve is non-monotonic and flattens at both ends, so
+        # linear extrapolation outside the grid is unsafe (it would run the
+        # boundary slope off to absurd values). Clamping the query point keeps
+        # interpolation strictly interpolating.
+        clamped = min(max(num_tokens, token_points[0]), token_points[-1])
+        left, right = self._nearest_1d_point_helper(clamped, token_points, inner_only=False)
+        result = self._interp_1d([left, right], [token_table[left], token_table[right]], clamped)
+
+        if isinstance(result, dict):
+            return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
+        return PerformanceResult(result, energy=0.0)
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)
