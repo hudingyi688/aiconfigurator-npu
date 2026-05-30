@@ -122,9 +122,21 @@ GLM-5 是 671B 级 MoE，注意力为 **DSA（DeepSeek Sparse Attention，含 Li
 
 <!-- SECTION3 -->
 
-## 3. 与 Profiler 的算子 + Shape 对齐
+## 3. 与 Profiler 的算子 + Shape 对齐（详细）
 
-数据源：11 个 GLM-5 生产 profiler run（`glm5-profiler.tar.gz`，prefill/decode × dp/ep 配置），聚合为 `docs/profiler_alignment/groundtruth/`（3203 个 (run, op_type, shape) 条目，882413 次 op 调用）。
+数据源：11 个 GLM-5 生产 profiler run（`glm5-profiler.tar.gz`，prefill/decode × dp/ep 配置），聚合为 `docs/profiler_alignment/groundtruth/`：
+- `detail.csv`：3203 个 (run, phase, isl, tp/dp/ep, op_type, shape) 条目，882413 次 op 调用
+- `by_op_family.csv`：1722 个 (family, sub_op, shape) 条目，已按 family 归类
+- 对齐工具：`tools/check_alignment.py`（profiler 中位 vs bench 实测，纯 CSV 解析）
+
+### 3.0 度量口径说明（重要）
+
+profiler 的 `avg_us` 在小 isl 下被 **10-20 秒级 rank 同步等待气泡**严重污染（KV transfer 族 max 达 2×10⁷ us）。因此本节区分两个口径：
+
+- **avg×count（含气泡）**：等于墙钟时间份额，是 `coverage_analysis_20260528.md` 的口径。KV transfer 占 prefill **87.4%**。
+- **median×count（去气泡）**：真实 device 计算份额。KV transfer 占 prefill **34.3%**。
+
+两个数字都正确，口径不同。下文覆盖率表**两者并列给出**。算子级偏差对齐统一用 **median**（稳定、抗离群）。
 
 ### 3.1 Profiler 按总时长 Top 算子（含调用次数）
 
@@ -141,44 +153,120 @@ GLM-5 是 671B 级 MoE，注意力为 **DSA（DeepSeek Sparse Attention，含 Li
 | MatMulV2 | 72 | 62430 | 1236 | 19.8 | silicon (gemm BF16) |
 | hcom_allReduce_ | 1 | 74786 | 1028 | 13.8 | silicon (custom_allreduce) |
 
-### 3.2 GEMM 精度对齐（`glm5_profiler_alignment_20260527.md`）
+### 3.2 GEMM 算子级偏差对齐（`tools/check_alignment.py` 全量结果）
 
-| Shape (M,N,K) | profiler 中位 | bench | 偏差 | 含义 |
-|---|---:|---:|---:|---|
-| (256,256,6144) | 19.6us | 46.7us | +138% | router 小 op，dispatch overhead 主导 |
-| (256,6144,6144) | 123.8us | 110.3us | -10.9% | dense gate_up TP=4 |
-| (256,6144,12288) | 272.8us | 220.4us | -19.2% | dense ffn2 TP=1 |
-| (256,6144,2048) W8A8 | 38us | 46us | +23% | shared_ffn2，可用 |
+对所有有 bench 对应的 (op_type, shape) 逐条比对 profiler 中位 vs bench：
 
-结论：中大 GEMM 偏差 <20%，可用；router 类小 op（<50us）因 bench 的 6×100 op-loop 系统性高估 ~30us dispatch overhead，但绝对值小、占比 <1%，对寻优影响可忽略。
+**整体分布（real-signal，kernel ≥ 30us，共 71 条）**
+
+| 指标 | 值 |
+|---|---|
+| 平均偏差 | -11.2% |
+| 中位偏差 | -14.0% |
+| 平均 \|偏差\| | 27.7% |
+| 最大 \|偏差\| | 224.4% |
+
+偏差分桶：`[0,10)% → 17 条`，`[10,20)% → 24 条`，`[20,50)% → 20 条`，`[50,100)% → 9 条`，`[100,∞)% → 1 条`。
+另有 14 条 small-op（<30us，~1% 时间占比）+ 56 条 bench MISS（该 shape 未采）。
+
+**W8A8 (QuantBatchMatmulV3) 对齐良好样本（调用次数高、偏差小）**
+
+| M | N | K | dtype | profiler调用 | profiler中位(us) | bench(us) | 偏差 |
+|--:|--:|--:|---|--:|--:|--:|--:|
+| 9 | 1024 | 6144 | w8a8 | 3619 | 36.86 | 41.71 | +13.2% OK |
+| 6 | 1024 | 6144 | w8a8 | 3542 | 35.49 | 42.50 | +19.8% OK |
+| 256 | 6144 | 2048 | w8a8 | 2772 | 52.11 | 46.41 | -10.9% OK |
+| 256 | 4096 | 2048 | w8a8 | 2080 | 47.89 | 46.75 | -2.4% OK |
+| 256 | 16384 | 2048 | w8a8 | 2080 | 87.18 | 70.32 | -19.3% OK |
+| 114 | 6144 | 2048 | w8a8 | 154 | 40.76 | 39.66 | -2.7% OK |
+
+**BF16 (MatMulV2) 对齐良好样本**
+
+| M | N | K | profiler调用 | profiler中位(us) | bench(us) | 偏差 |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 38720 | 6144 | 218 | 393.09 | 363.96 | -7.4% OK |
+| 3 | 6144 | 12288 | 218 | 143.41 | 123.30 | -14.0% OK |
+| 3 | 6144 | 6144 | 218 | 64.35 | 62.77 | -2.5% OK |
+| 3 | 38720 | 6144 | 203 | 397.93 | 363.88 | -8.6% OK |
+
+**偏差较大样本（已分析根因，不影响寻优）**
+
+| op | M | N | K | profiler中位 | bench | 偏差 | 根因 |
+|---|--:|--:|--:|--:|--:|--:|---|
+| QuantBatchMatmulV3 | 18 | 1024 | 6144 | 131.72 | 39.61 | -69.9% FAIL | expert-batched 误归类（见 3.3） |
+| MatMulV2 | 21 | 6144 | 6144 | 84.29 | 66.07 | -21.6% WARN | TP 切分边界 |
+| MatMulV2 | 12 | 6144 | 12288 | 154.14 | 120.93 | -21.5% WARN | dense ffn2 |
+| (256,256,6144) | — | — | — | 19.6 | 46.7 | +138% | router 小 op，bench loop 高估 ~30us |
+
+结论：real-signal GEMM 中位偏差 -14%、61/71 条在 ±50% 内。偏差主要来自 TP 切分边界和小 op 的 bench dispatch overhead，绝对值占比小，对 Pareto 排名无实质影响。
 
 ### 3.3 一个关键的 shape 归类陷阱（已澄清）
 
-profiler 里有 539 个 `aclnnQuantMatmulWeightNz` shape 形如 `(256,4096,6144)`，profiler 中位 **2055us** 而 bench 单 op 仅 62us（-97%）。根因：这些被 NPU runtime 归到 `QuantBatchMatmulV3` op type 下的，**实际是 MoE 内部的 expert-batched W8A8 group GEMM**（一次调用做 N 个 expert），延迟是单 op 的几十倍。
-这条数据**不参与寻优**——MoE 路径查 `moe_perf.txt`，不查 `gemm_perf.txt`。澄清这点避免了把它误当 GEMM 偏差。
+profiler 里有 539 个 `aclnnQuantMatmulWeightNz` shape 形如 `(256,4096,6144)`，profiler 中位 **2055us** 而 bench 单 op 仅 62us（-97%）。根因：被 NPU runtime 归到 `QuantBatchMatmulV3` op type 下的这批，**实际是 MoE 内部 expert-batched W8A8 group GEMM**（一次调用做 N 个 expert），延迟是单 op 的几十倍。
+这条数据**不参与寻优**——MoE 路径查 `moe_perf.txt`，不查 `gemm_perf.txt`。check_alignment 里那条 -69.9% FAIL 同源，已知非缺陷。
 
-### 3.4 调用次数揭示的结构规律
+### 3.4 DSA 注意力与通信对齐
 
-- **DispatchFFNCombine** 19950 次、**broadcast 系列** 各 2964 次：后者的 count 精确等于 `78层 × chunk数`，证明 KV transfer 逐层触发（这是第 4 节 KVTransfer 建模的依据）。
-- **hcom_allReduce_** 74786 次但 avg 仅 13.8us：TP 通信频繁但单次极小，silicon 表覆盖良好。
-- **SparseFlashAttention / LightningIndexer** 各 ~20400 次：DSA 注意力两个核心 sub-kernel，调用次数一致，印证 module 级采集的合理性。
+| profiler kernel | 调用次数 | 中位(us) | aic-npu 对应 | 状态 |
+|---|--:|--:|---|---|
+| SparseFlashAttention | 20399 | 153.0 | `ContextDSAModule` 内 | module 级采集，语义对齐 |
+| LightningIndexer | 20400 | 62.8 | DSA module 内 indexer | 调用次数与 SFA 一致 |
+| mla_preprocess_0_mix_aic | 17784 | 69.2 | 并入 module forward | 不单独采 |
+| hcom_allReduce_ | 74786 | 13.8 | `custom_allreduce_perf.txt` | silicon，单次极小 |
+| hcom_allGather_ | 41407 | 35.7 | `query_nccl(all_gather)` | silicon |
+| hcom_alltoall_ | 4324 | 382.3 | calibration (a2a SOL) | 校准近似 |
 
-### 3.5 对齐状态汇总
+DSA module 在 bench 和 profiler 两侧都是 module 级（投影+attention+输出），语义对齐，无需逐 sub-kernel 验证；唯一缺口是 TP>1（num_heads≠64）的 silicon 数据（见 2.3）。
+
+### 3.5 总覆盖率（两口径）
+
+按 profiler device-time 份额分类（每个 op_type 归到 aic-npu 来源），两口径并列：
+
+**Prefill 阶段**
+
+| 来源 | median×count（去气泡） | avg×count（含气泡=墙钟份额） |
+|---|---:|---:|
+| silicon | 33.5% | — |
+| calibration | 26.1% | — |
+| SOL/elementwise | 1.8% | — |
+| **KV transfer**（本轮新建模） | **34.3%** | **87.2%** |
+| unmodeled_misc | 4.2% | — |
+| **可建模合计（silicon+calib+SOL+KVTransfer）** | **95.7%** | — |
+
+> prefill 两口径差异完全来自 KV transfer 的同步气泡：avg 口径下 KV transfer 吞掉 87% 墙钟（rank 间等待计入传输 kernel），median 口径下其真实 device 计算占 34%。覆盖度文档（`coverage_analysis_20260528.md`）用的是 avg/墙钟口径，故记为 87%。两者一致、不矛盾。**本轮 KVTransfer 建模后，prefill 在两口径下都已从「未覆盖」转为「已建模」。**
+
+**Decode 阶段**
+
+| 来源 | median×count |
+|---|---:|
+| silicon | 48.0% |
+| calibration | 25.9% |
+| SOL/elementwise | 12.7% |
+| unmodeled_misc | 13.4% |
+| **可建模合计** | **86.6%** |
+
+> decode 的 unmodeled_misc（13.4%）主要是 PadV3/MemSet/ScatterNdUpdate 等内存搬运小 kernel 和 sampling，分散且单个占比低；TP>1 DSA 由 HYBRID 的 SOL+经验补。decode 绝对延迟实测在 ±25% 内（`coverage_analysis_20260528.md`）。
+
+### 3.6 对齐状态汇总
 
 | 算子族 | 对齐状态 | 寻优精度影响 |
 |---|---|---|
-| BF16 GEMM 中大 op | ✅ 偏差 <20% | 低 |
-| BF16 GEMM router 小 op | ⚠️ +138% | 极低（<50us，占比<1%） |
-| W8A8 GEMM 单 op | ✅ 偏差 23-43% | 可接受 |
+| BF16 GEMM 中大 op | ✅ 中位偏差 -14% | 低 |
+| BF16/W8A8 GEMM 小 op (router) | ⚠️ +138% | 极低（<50us，占比<1%） |
+| W8A8 GEMM 单 op | ✅ 多数 ±20% | 可接受 |
 | W8A8 expert-batched | 走 moe_perf.txt | 不经 GEMM 表 |
-| DSA module | bench/profiler 均 module 级 | 语义对齐，TP>1 数据缺 |
-| KV transfer | profiler 反推建模（第4节） | prefill 关键 |
+| MoE FusedMC2 dispatch | ✅ silicon (ep{2,4,8}) | 生产 ep16 靠夹取 |
+| DSA module | ✅ 语义对齐 | TP>1 数据缺，靠 HYBRID |
+| 通信 allreduce/allgather | ✅ silicon | 低 |
+| a2a | ⚠️ calibration | 中 |
+| KV transfer | ✅ 本轮建模 | prefill 关键 |
 
 <!-- SECTION4 -->
 
 ## 4. 配置寻优方式与结果
 
 ### 4.1 寻优流程
+
 
 入口 `task.py:build_disagg_parallel_lists` 定义搜索空间 → `InferenceSession` 静态估算每个候选 → `picking.py` 聚合并挑选 Pareto 最优。
 
@@ -226,12 +314,15 @@ disagg top-1:  prefill tp=16 dp=2 ep=32   ← 与生产一致
 
 ### 4.4 当前可信 / 不可信边界（`coverage_analysis_20260528.md`）
 
-算子覆盖度（按 profiler 时间占比）：
+算子覆盖度（按 profiler **墙钟时间份额** = avg×count 口径，与 `coverage_analysis_20260528.md` 一致）：
 
 | 阶段 | silicon | calibration | 未覆盖 |
 |---|---|---|---|
 | prefill | 6.6% | 4.0% | **87.2%**（KV transfer，本轮已新增建模） |
 | decode | 47.4% | 46.9% | 5.7%（TP>1 DSA + misc） |
+
+> 注：此表是**墙钟口径**（含同步气泡），与 §3.5 的 device 计算口径（median×count）数字不同但不矛盾——见 §3.0 口径说明。本轮 KVTransfer 建模后，prefill 那 87.2% 已从「未覆盖」转为「已建模」。
+
 
 **可信**：
 - 配置形态（tp/dp/ep、agg vs disagg）——pin 后复现生产。
