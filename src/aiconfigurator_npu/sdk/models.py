@@ -1711,6 +1711,18 @@ class DeepSeekV32Model(BaseModel):
             ]
         )
 
+        # PD-disaggregated prefill worker: charge mooncake KV-transfer cost once
+        # per request (the table already aggregates all layers/chunks, so
+        # scale_factor=1, not num_layers). No-op unless is_disagg_prefill.
+        self.context_ops.append(
+            ops.KVTransfer(
+                "context_kv_transfer",
+                1,
+                moe_ep_size,
+                self.config.is_disagg_prefill,
+            )
+        )
+
         self.generation_ops.extend(
             [
                 ops.Embedding("generation_embedding", 1 * self._mtp_scale_factor, self._vocab_size, h, 0.3),

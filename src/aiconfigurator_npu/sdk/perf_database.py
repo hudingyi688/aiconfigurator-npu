@@ -829,6 +829,58 @@ def load_moe_dispatch_combine_data(moe_dispatch_combine_file):
     return moe_dispatch_combine_data
 
 
+def load_kv_transfer_data(kv_transfer_file):
+    """
+    Load the vllm-ascend PD-disaggregated KV-transfer cost table.
+
+    Columns: ``ep_size, isl, device_total_ms``. Each row is the per-request
+    total KV-transfer DEVICE time (ms) for an ``(ep_size, isl)`` point,
+    measured on the mooncake kv_producer (prefill) worker of a GLM-5-w8a8
+    PD-disaggregated deployment (chunked prefill max_num_batched_tokens=4096,
+    prefix-caching on, prefill tp=16).
+
+    ``device_total_ms`` is the sum over the four KV-transfer kernel families of
+    ``count x median_us`` (us -> ms):
+
+      - ``broadcastAicpuKernel`` + ``hcom_broadcast_``  (per-layer KV push:
+        AICPU coordination + HCCL transfer; count == num_layers x num_chunks)
+      - ``reduce_scatterAicpuKernel`` + ``hcom_reduceScatter_``  (KV pool sync)
+
+    The MEDIAN is used, not the mean: the mean is contaminated by 10-20 s
+    rank-sync stall artifacts (max values reach ~2e7 us), worst at small isl.
+
+    This is the DEVICE-accumulated upper bound. The fraction actually exposed on
+    the critical-path TTFT (KV transfer not hidden behind compute via async
+    mooncake push) is applied as an ``overlap_factor`` at query time
+    (see ``query_kv_transfer``), not stored here.
+
+    Source: 11 GLM-5 profiler runs, docs/profiler_alignment/groundtruth/detail.csv.
+    Grid: ep_size in {1 (dp-only, no EP), 16}; isl in {2500, 10000, 20000}.
+    (The dp-only baseline was profiled under a no-EP run and is stored as ep=1,
+    the value a real no-expert-parallel config passes, so query clamps to it.)
+
+    Returns:
+        dict: Nested dict ``[ep_size][isl]`` -> ``device_total_ms`` (float).
+              ``None`` when the file is absent (optional table).
+    """
+    if not os.path.exists(kv_transfer_file):
+        logger.debug(f"KV-transfer data file {kv_transfer_file} not found.")
+        return None
+
+    kv_transfer_data = defaultdict(dict)
+
+    with open(kv_transfer_file, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ep_size = int(row["ep_size"])
+            isl = int(row["isl"])
+            device_total_ms = float(row["device_total_ms"])
+            if isl in kv_transfer_data[ep_size]:
+                logger.debug(f"value conflict in kv_transfer data: ep{ep_size} isl{isl}")
+            kv_transfer_data[ep_size][isl] = device_total_ms
+
+    return kv_transfer_data
+
 
 def load_context_attention_data(context_attention_file):
     """
@@ -2179,6 +2231,7 @@ class PerfDatabase:
                 PerfDataFilename.generation_attention: load_generation_attention_data,
                 PerfDataFilename.moe: load_moe_data,
                 PerfDataFilename.moe_dispatch_combine: load_moe_dispatch_combine_data,
+                PerfDataFilename.kv_transfer: load_kv_transfer_data,
                 PerfDataFilename.custom_allreduce: load_custom_allreduce_data,
                 PerfDataFilename.nccl: load_nccl_data,
                 PerfDataFilename.context_mla: load_context_mla_data,
@@ -2223,6 +2276,8 @@ class PerfDatabase:
         self._moe_data, self._moe_low_latency_data = _load_op_data(PerfDataFilename.moe)
         # vllm-ascend fused dispatch+FFN+combine silicon table (optional)
         self._moe_dispatch_combine_data = _load_op_data(PerfDataFilename.moe_dispatch_combine)
+        # vllm-ascend PD-disaggregated KV-transfer cost table (optional)
+        self._kv_transfer_data = _load_op_data(PerfDataFilename.kv_transfer)
 
         # Comm ops
         self._custom_allreduce_data = _load_op_data(PerfDataFilename.custom_allreduce)
@@ -4675,29 +4730,47 @@ class PerfDatabase:
 
         Latency is interpolated linearly over ``num_tokens`` within the
         measured grid for the matching ``(ep_size, dtype)`` and clamped
-        (held flat) outside the measured range.
+        (held flat) outside the measured range. ``ep_size`` is likewise
+        snapped to the nearest measured ep (hold flat outside the grid): the
+        fused-kernel ep grid {2,4,8} is sparse, so an unmeasured ep such as 16
+        uses the nearest measured row rather than raising — this keeps a
+        production prefill worker (ep16) from crashing the disagg search.
 
         Args:
             num_tokens: number of tokens routed through the MoE layer
             dtype: quant dtype tag as stored in the table ("bf16", "w8a8_dynamic")
-            ep_size: MoE expert-parallel size (2, 4, 8 in the measured grid)
+            ep_size: MoE expert-parallel size; snapped to nearest measured ep
+                     (grid is 2, 4, 8) when not present.
 
         Returns:
             PerformanceResult: latency in ms (acts as float); energy in W·ms.
 
         Raises:
-            ValueError: when the table is not loaded or has no entries for
-                        the requested ``(ep_size, dtype)``.
+            ValueError: when the table is not loaded or has no entries at all
+                        for the requested ``dtype``.
         """
         self._moe_dispatch_combine_data.raise_if_not_loaded()
 
-        ep_table = self._moe_dispatch_combine_data.get(ep_size)
-        token_table = ep_table.get(dtype) if ep_table is not None else None
-        if not token_table:
+        # ep grid {2,4,8} is sparse; snap an unmeasured ep (e.g. production
+        # ep16) to the nearest measured ep, holding flat outside the range
+        # rather than extrapolating or raising. Only eps that actually carry
+        # this dtype are candidates.
+        ep_points = sorted(
+            ep for ep, tbl in self._moe_dispatch_combine_data.items() if tbl.get(dtype)
+        )
+        if not ep_points:
             raise ValueError(
-                f"no moe_dispatch_combine data for ep_size={ep_size}, dtype={dtype!r}; "
+                f"no moe_dispatch_combine data for dtype={dtype!r}; "
                 f"available ep_sizes={sorted(self._moe_dispatch_combine_data.keys())}"
             )
+        ep_clamped = min(max(ep_size, ep_points[0]), ep_points[-1])
+        nearest_ep = min(ep_points, key=lambda e: abs(e - ep_clamped))
+        if nearest_ep != ep_size:
+            logger.debug(
+                f"moe_dispatch_combine: ep_size={ep_size} not measured, "
+                f"using nearest ep={nearest_ep} (grid={ep_points})"
+            )
+        token_table = self._moe_dispatch_combine_data[nearest_ep][dtype]
 
         token_points = sorted(token_table.keys())
         # Clamp into the measured range (hold flat at the boundaries): the
@@ -4712,6 +4785,84 @@ class PerfDatabase:
         if isinstance(result, dict):
             return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
         return PerformanceResult(result, energy=0.0)
+
+    # Fraction of the DEVICE-accumulated KV-transfer time that lands on the
+    # critical-path TTFT. CALIBRATED from profiler wall-clock traces, NOT a
+    # guess: for each prefill run we took the time-axis UNION of all KV-transfer
+    # kernel intervals (kernel_details.csv Start+Duration) — the real wall-clock
+    # span KV transfer occupies — and divided by this table's median-based
+    # device total. On the 4 clean runs (isl 10k/20k x ep 1/16; isl=2500 is
+    # excluded, its device sum is corrupted by 10-20s rank-sync stall artifacts)
+    # the ratio is mean 1.09 / median 1.05, i.e. ~1.0: the KV-transfer kernels
+    # run essentially serially (they do NOT overlap each other or hide behind
+    # compute), so the device total already IS the wall-clock cost. This is also
+    # why KV transfer is ~87% of prefill wall-clock in the coverage analysis.
+    # 1.0 = charge the full measured cost; tune down only if a future run shows
+    # genuine compute/transfer overlap. Replaces the legacy hand-tuned
+    # _AUTOSCALE_TTFT_CORRECTION_FACTOR=1.8 magic in picking.py.
+    _KV_TRANSFER_OVERLAP_FACTOR = 1.0
+
+    @functools.lru_cache(maxsize=4096)
+    def query_kv_transfer(
+        self,
+        isl: int,
+        ep_size: int,
+        overlap_factor: float | None = None,
+    ) -> PerformanceResult:
+        """
+        Query the vllm-ascend PD-disaggregated KV-transfer critical-path cost.
+
+        The stored table holds per-request total KV-transfer DEVICE time (ms)
+        on a ``(ep_size, isl)`` grid measured on the mooncake kv_producer
+        worker. This method bilinearly clamps+interpolates that grid, then
+        multiplies by ``overlap_factor`` to return the portion exposed on the
+        critical-path TTFT (KV transfer not hidden behind compute).
+
+        Both ``isl`` and ``ep_size`` are clamped into the measured range
+        (hold flat at the boundaries) before interpolation — the grid is small
+        (3 isl x 2 ep) and extrapolating its boundary slope is unsafe.
+
+        Args:
+            isl: input sequence length (per request)
+            ep_size: MoE expert-parallel size on the prefill worker
+            overlap_factor: critical-path-exposed fraction; defaults to
+                            ``_KV_TRANSFER_OVERLAP_FACTOR`` when None.
+
+        Returns:
+            PerformanceResult: critical-path KV-transfer latency in ms; energy 0.
+
+        Raises:
+            ValueError: when the table is not loaded or is empty.
+        """
+        self._kv_transfer_data.raise_if_not_loaded()
+
+        factor = self._KV_TRANSFER_OVERLAP_FACTOR if overlap_factor is None else overlap_factor
+
+        ep_points = sorted(self._kv_transfer_data.keys())
+        if not ep_points:
+            raise ValueError("kv_transfer data is loaded but empty")
+
+        # Clamp ep into the measured range, then interpolate isl within each
+        # bracketing ep row, then interpolate across ep. Nested 1-D keeps the
+        # clamp-then-interpolate guarantee on both axes.
+        ep_clamped = min(max(ep_size, ep_points[0]), ep_points[-1])
+        ep_lo, ep_hi = self._nearest_1d_point_helper(ep_clamped, ep_points, inner_only=False)
+
+        def _isl_interp(ep_key: int) -> float:
+            isl_table = self._kv_transfer_data[ep_key]
+            isl_points = sorted(isl_table.keys())
+            isl_clamped = min(max(isl, isl_points[0]), isl_points[-1])
+            left, right = self._nearest_1d_point_helper(isl_clamped, isl_points, inner_only=False)
+            return float(self._interp_1d([left, right], [isl_table[left], isl_table[right]], isl_clamped))
+
+        device_lo = _isl_interp(ep_lo)
+        if ep_hi == ep_lo:
+            device_total_ms = device_lo
+        else:
+            device_hi = _isl_interp(ep_hi)
+            device_total_ms = float(self._interp_1d([ep_lo, ep_hi], [device_lo, device_hi], ep_clamped))
+
+        return PerformanceResult(device_total_ms * factor, energy=0.0)
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)

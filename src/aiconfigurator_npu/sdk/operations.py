@@ -898,6 +898,59 @@ class MoEDispatch(Operation):
         return comm_latency * self._scale_factor
 
 
+class KVTransfer(Operation):
+    """
+    PD-disaggregated KV-transfer cost on the mooncake kv_producer (prefill) side.
+
+    In a PD-disaggregated deployment the prefill worker streams paged-attention
+    KV blocks to decode workers via the mooncake connector. This traffic is
+    ~87% of prefill device time on GLM-5 yet is not an operator the per-kernel
+    collectors can bench, so it is modeled here from a profiler-derived
+    ``(ep_size, isl)`` table (see PerfDatabase.query_kv_transfer).
+
+    The op contributes the per-request critical-path KV-transfer latency ONCE
+    (the table already aggregates all layers and chunks), and only on the
+    disagg prefill path: it is gated on ``backend == vllm_ascend`` and
+    ``is_disagg_prefill``. In agg mode (or decode) it returns 0, since there is
+    no cross-worker KV transfer to charge.
+
+    This replaces the legacy hand-tuned _AUTOSCALE_TTFT_CORRECTION_FACTOR=1.8
+    magic with a data-driven prefill-side cost.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        moe_ep_size: int,
+        is_disagg_prefill: bool,
+        **kwargs,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._moe_ep_size = moe_ep_size
+        self._is_disagg_prefill = is_disagg_prefill
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        """Query per-request critical-path KV-transfer latency (prefill side)."""
+        # Gate: only the vllm-ascend disagg prefill worker pays KV transfer.
+        if not (
+            database.backend == common.BackendName.vllm_ascend.value
+            and self._is_disagg_prefill
+        ):
+            return PerformanceResult(0.0, energy=0.0)
+
+        # isl arrives as the per-request sequence length (s). The table is
+        # keyed on the EP size of the prefill worker; ep<=1 clamps to the
+        # measured ep=0 (dp-only, no EP) row inside query_kv_transfer.
+        isl = int(kwargs.get("s"))
+        result = database.query_kv_transfer(isl, self._moe_ep_size)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
 class ContextAttention(Operation):
     """
     Context attention operation.

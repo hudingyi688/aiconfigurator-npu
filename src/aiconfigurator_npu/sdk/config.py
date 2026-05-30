@@ -35,6 +35,10 @@ class ModelConfig:
     enable_wideep: bool = False
     enable_eplb: bool = False  # Expert Parallel Load Balancing
     wideep_num_slots: int = None  # EPLB num_slots, defaults to num_experts if None
+    # PD-disaggregated prefill worker: charges mooncake KV-transfer cost on the
+    # producer side. Set True only for the prefill model in a disagg run; agg
+    # and decode leave it False so KVTransfer contributes nothing.
+    is_disagg_prefill: bool = False
 
 
 @dataclass

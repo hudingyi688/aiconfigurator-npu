@@ -275,6 +275,10 @@ class DisaggInferenceSession:
         Returns:
             InferenceSummary: the summary of the inference result
         """
+        # Mark the prefill config as the disagg producer side (copy, don't
+        # mutate the caller's config) so KVTransfer charges mooncake KV cost.
+        prefill_model_config = copy.deepcopy(prefill_model_config)
+        prefill_model_config.is_disagg_prefill = True
         prefill_model = models.get_model(model_path, prefill_model_config, self._prefill_backend.name.value)
         decode_model = models.get_model(model_path, decode_model_config, self._decode_backend.name.value)
         prefill_sess = InferenceSession(
@@ -726,6 +730,10 @@ class DisaggInferenceSession:
         disagg_summary.set_summary_df(disagg_summary_df)
 
         # find prefill and decode workers
+        # Mark prefill as the disagg producer (copy, don't mutate caller config)
+        # so KVTransfer charges mooncake KV cost on every prefill candidate.
+        prefill_model_config = copy.deepcopy(prefill_model_config)
+        prefill_model_config.is_disagg_prefill = True
         prefill_summary_df = self.get_worker_candidates(
             model_path=model_path,
             model_config=prefill_model_config,

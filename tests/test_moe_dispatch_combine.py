@@ -138,9 +138,21 @@ def test_query_unknown_dtype_raises(db):
         db.query_moe_dispatch_combine(256, "fp8", 2)
 
 
-def test_query_unknown_ep_size_raises(db):
-    with pytest.raises(ValueError):
-        db.query_moe_dispatch_combine(256, "bf16", 16)
+def test_query_unmeasured_ep_snaps_to_nearest(db):
+    # ep16 is not in the grid {2,4,8}; it must snap to the nearest measured ep
+    # (8, held flat) rather than raising — a production ep16 prefill worker
+    # must not crash the disagg search.
+    got = float(db.query_moe_dispatch_combine(256, "bf16", 16))
+    at_ep8 = float(db.query_moe_dispatch_combine(256, "bf16", 8))
+    assert got == pytest.approx(at_ep8)
+
+
+def test_query_ep_below_grid_snaps_to_smallest(db):
+    # ep1 (below the smallest measured ep=2) holds flat at ep2
+    got = float(db.query_moe_dispatch_combine(256, "bf16", 1))
+    at_ep2 = float(db.query_moe_dispatch_combine(256, "bf16", 2))
+    assert got == pytest.approx(at_ep2)
+
 
 
 def test_query_latency_is_positive_across_grid(db):
