@@ -186,6 +186,14 @@ class DsaModuleSpec:
                               # collect a non-sparse MLA baseline on
                               # GLM-5-style configs while the SFA kernel
                               # path is unstable on synthetic inputs.
+    num_heads_override: int | None = None  # Override attention head count to
+                              # emulate the per-rank head split under TP>1
+                              # (num_heads = num_attention_heads // tp). The
+                              # DSA module is a single-rank op whose latency is
+                              # driven by its head count, so overriding num_heads
+                              # collects the TP=2/4/8/16 working set (heads
+                              # 32/16/8/4) without launching real distributed
+                              # ranks. None = use the model's full head count.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -351,6 +359,7 @@ def _build_attention_module(
     is_context: bool,
     device: str,
     force_mla: bool = False,
+    num_heads_override: int | None = None,
 ):
     """Build a DeepseekV2MLAAttention module with real vllm-ascend wiring.
 
@@ -465,6 +474,20 @@ def _build_attention_module(
 
     hf_config = vllm_config.model_config.hf_config
     num_heads = hf_config.num_attention_heads
+    if num_heads_override is not None:
+        # Emulate the per-rank head count under TP>1. The full model has
+        # num_attention_heads; a TP=t rank owns num_attention_heads // t.
+        # We also write it back onto hf_config so any downstream code that
+        # re-reads the config (and the meta dict) sees the per-rank value.
+        if num_heads_override <= 0 or hf_config.num_attention_heads % num_heads_override != 0:
+            print(
+                f"[WARN] num_heads_override={num_heads_override} does not evenly divide "
+                f"num_attention_heads={hf_config.num_attention_heads}; using it anyway "
+                f"(latency still valid for that head count).",
+                flush=True,
+            )
+        num_heads = num_heads_override
+        hf_config.num_attention_heads = num_heads_override
 
     # Optional: strip DSA / sparse fields from hf_config so the platform
     # selector dispatches to AscendMLABackend instead of AscendSFABackend.
@@ -858,6 +881,7 @@ def create_dsa_module_func(
         is_context=is_context,
         device=device,
         force_mla=spec.force_mla,
+        num_heads_override=spec.num_heads_override,
     )
 
     # 2. Post-load hooks (FP8 packing, W_UK_T materialisation, etc).

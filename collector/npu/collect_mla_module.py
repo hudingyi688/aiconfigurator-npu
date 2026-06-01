@@ -353,6 +353,7 @@ def run_dsa_module(
     warmup_iters: int = 10,
     bench_iters: int = 50,
     force_mla: bool = False,
+    num_heads_override: int | None = None,
 ) -> float | None:
     """Benchmark one (seq_len, batch_size) point for DSA module on NPU."""
     is_context = mode == "context"
@@ -360,7 +361,8 @@ def run_dsa_module(
     phase = "context" if is_context else "generation"
 
     label = "MLA" if force_mla else "DSA"
-    print(f"\n[{label} module] {phase} b={batch_size}, s={seq_len}, model={model_path}")
+    heads_note = f", heads={num_heads_override}" if num_heads_override else ""
+    print(f"\n[{label} module] {phase} b={batch_size}, s={seq_len}, model={model_path}{heads_note}")
 
     spec = DsaModuleSpec(
         op_type=op_type,
@@ -368,6 +370,7 @@ def run_dsa_module(
         seq_len=seq_len,
         model_path=model_path,
         force_mla=force_mla,
+        num_heads_override=num_heads_override,
     )
 
     try:
@@ -465,6 +468,17 @@ def main():
              "the output txt. Useful for resuming a 2-3 day sweep after "
              "a crash without re-running already-collected points.",
     )
+    parser.add_argument(
+        "--num-heads-override",
+        type=int,
+        default=None,
+        help="Override attention head count to emulate the per-rank head split "
+             "under TP>1 (heads = num_attention_heads // tp). GLM-5 has 64 heads, "
+             "so use 32/16/8/4 for TP=2/4/8/16. The DSA module is a single-rank "
+             "op driven by head count, so this collects the TP>1 working set "
+             "without launching distributed ranks. Output rows carry this head "
+             "count; the perf DB matches on num_heads at query time.",
+    )
     args = parser.parse_args()
 
     print("Initializing vLLM + Ascend context...")
@@ -483,6 +497,7 @@ def main():
             warmup_iters=args.warmup_iters,
             bench_iters=args.bench_iters,
             force_mla=args.force_mla,
+            num_heads_override=args.num_heads_override,
         )
         return
 
@@ -513,6 +528,7 @@ def main():
                 warmup_iters=args.warmup_iters,
                 bench_iters=args.bench_iters,
                 force_mla=args.force_mla,
+                num_heads_override=args.num_heads_override,
             )
         except Exception as e:
             print(f"  FAILED b={b}, s={s}: {e}")

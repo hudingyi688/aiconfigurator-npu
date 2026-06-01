@@ -107,7 +107,7 @@ GLM-5 是 671B 级 MoE，注意力为 **DSA（DeepSeek Sparse Attention，含 Li
 
 1. **DSA 模块只有 TP=1（num_heads=64）的硅数据**（最高优先）
    生产 prefill tp=16 → num_heads_per_rank=4、decode tp=4 → 16，硅表只有 64。SILICON 模式下 `query_*_dsa_module` 直接 Qhull 报错崩溃，只能用 HYBRID（SOL+经验回退）。
-   改进：`mla_module_factory.py` 已支持 `--num-heads-override`，需在 NPU 上重采 TP∈{2,4,8,16} → num_heads∈{32,16,8,4}，追加进 `dsa_*_module_perf.txt`，即可解锁纯 SILICON 寻优。
+   改进：本轮已给 `collect_mla_module.py` / `mla_module_factory.py` 新增 `--num-heads-override` 参数（之前并不存在，工厂硬编码 tp=1、num_heads=64）。在 NPU 上单卡重采 num_heads∈{32,16,8,4}（对应 TP=2/4/8/16 的每卡头数），追加进 `dsa_*_module_perf.txt`，即可解锁纯 SILICON 寻优。DSA module 是单卡算子、延迟由头数主导，故 override 头数即可模拟 TP 切分负载，无需真起分布式。
 
 2. **MoE dispatch/combine 融合表只覆盖 ep{2,4,8}**
    生产 prefill 用 ep16、decode 用 ep8/ep10。已做缓解：`query_moe_dispatch_combine` 对未测 ep 夹取到最近已测 ep（hold flat，`perf_database.py`），使 ep10/ep16 不崩。
@@ -386,7 +386,7 @@ disagg top-1:  prefill tp=16 dp=2 ep=32   ← 与生产一致
 只列已识别、有明确收益的项，不含设想。**前两项需多机环境采集，技术路径已在单机/小规模验证可行，只差机时**：
 
 1. **多机补采 MoE dispatch ep10/ep16/ep32**（最高优先）。生产 decode 实际 ep8/**ep10**、prefill ep16，而融合硅表只有 ep{2,4,8}——ep10/ep16 当前靠夹取到 ep8 近似。`collect_moe_dispatch_combine.py` 已支持任意 `--ep-size`，多机 `torchrun` 直接补采即可把 decode 的 45.5% silicon 从「ep 近似」变「ep 精确」。
-2. **多机重采 DSA module TP∈{2,4,8,16}**（次高）。生产 prefill tp=16 / decode tp=4 → num_heads_per_rank ∈ {4,16}，silicon 表只有 num_heads=64，TP>1 靠 HYBRID（SOL+经验）补。`mla_module_factory.py` 已支持 `--num-heads-override`，多机重采 num_heads∈{32,16,8,4} 即可解锁纯 SILICON 寻优、消除 HYBRID 依赖。
+2. **单卡重采 DSA module num_heads∈{32,16,8,4}**（次高）。生产 prefill tp=16 / decode tp=4 → num_heads_per_rank ∈ {4,16}，silicon 表只有 num_heads=64，TP>1 靠 HYBRID（SOL+经验）补。本轮已新增 `--num-heads-override` 参数（DSA module 是单卡算子、延迟由头数主导，override 头数即可模拟 TP 切分，**无需多机**）。NPU 单卡重采即可解锁纯 SILICON 寻优、消除 HYBRID 依赖。
 3. **KV transfer overlap_factor 用真实 bench TTFT 复核**（当前 trace 标定=1.0，bench TTFT 未保存；若后续有 P50 可二次校准）。
 4. **清理 dead calibration 系数**：`comm_calibration.json` 里 `moe_dispatch_bf16` / `moe_combine_bf16` / `moe_dispatch_combine_w8a8` 三个 op_kind 的系数在 operations.py 已无调用点（MoE dispatch 全转 FusedMC2 silicon），属遗留 dead data，可删。
 
