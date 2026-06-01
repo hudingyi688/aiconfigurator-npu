@@ -7,8 +7,9 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 
 ## 结论速览
 
-**校准修正后**（overlap_factor 1.0→**0.86**，按 profiler 时间轴逐 kernel 累加，非单点标量修正）：
-- KV transfer device 累加时间的 **86% 暴露在关键路径**（14% 与 compute 重叠被掩盖），该比值跨 isl 稳定（10k=0.862 / 20k=0.860）。
+**建模方式（去掉 overlap_factor，直接存实测净墙钟）**：
+- KVTransfer 数据表直接存 profiler 实测的**净 KV 墙钟**（kernel 时间轴上 KV 并集减去与 compute 的重叠），query 插值返回，**不再乘任何标量修正系数**。这消除了之前 overlap_factor（0.86）这个纠缠了"median-vs-真实/KV流间重叠/KV-compute重叠"三件事的魔数。
+- 实测净 KV 墙钟（ep16）：isl=10k→1679ms，isl=20k→2571ms（isl=2500 因同步气泡污染，由 10k/20k 斜率线性外推）。
 - 单独存在的问题：prefill compute（主要 TP>1 DSA attention 走 HYBRID 回退）被高估 ~3×（模型 807ms vs profiler 实测 compute 并集 259ms），使模型 prefill TTFT 比真实墙钟偏高 ~27%。这是 TP>1 DSA 数据缺口（报告 §2.3），不归 KVTransfer。
 
 根因仍是 mooncake KV transfer 主导 prefill TTFT，但**幅度比初版小得多**——初版用错误的 overlap=1.0 把档1 TTFT 估成 7743ms；按真实时间轴标定后，单请求 prefill 真实墙钟（profiler 实测）档1=**2754ms**、档2=**3833ms**。
@@ -33,12 +34,12 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 | 组成 | 真实墙钟 | 说明 |
 |---|---|---|
 | compute 并集（DSA+MoE+GEMM 实际） | 259ms | profiler 实测（模型高估为 807+ms） |
-| KV transfer 净暴露 | ~2495ms | device 累加 2896ms × 0.86 |
-| 合计 | ~2754ms | = 真实墙钟 |
+| KV transfer 净墙钟（直接查表实测） | ~1679ms | profiler 时间轴: KV并集−KV∩compute |
+| 合计 | ~2693ms | = 真实墙钟 2754ms (-2%) |
 
-**KV transfer 是绝对支配项**（净暴露 2495ms / 墙钟 2754ms = 91%）。overlap_factor=0.86 的依据：从 kernel 时间轴把 KV kernel 与 compute kernel 分离，净 KV 墙钟 = span − compute 并集，÷device 累加 = 0.86，且 isl=10k/20k 两点一致（0.862/0.860）。这比初版"区间并集/device≈1.0"或单点反推 0.60 都更精确——后者的偏差源于模型 compute 高估，而非 KV。
+**KV transfer 是绝对支配项**（净墙钟 1679ms / 单请求墙钟 2754ms = 61%）。该值直接来自 profiler kernel 时间轴（KV 并集减去与 compute 的重叠），**不经任何 overlap_factor**——数据表存的就是实测净墙钟，避免了标量魔数。模型 prefill TTFT 在 isl=10k 对齐真实墙钟 -2%。
 
-**SLO 可达性**：档2 单请求真实墙钟 3833ms < SLO 5000ms（达标）；档1 真实 2754ms 略超 SLO 2000ms，且即使零并发也因 KV transfer 净暴露单项 2495ms 而超。
+**SLO 可达性**：档2 单请求真实墙钟 3833ms < SLO 5000ms（达标）；档1 真实 2754ms 略超 SLO 2000ms，且即使零并发也因 KV transfer 净墙钟单项 1679ms + compute 而超。
 
 ## TPOT 超标归因
 

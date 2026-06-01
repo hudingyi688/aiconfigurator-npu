@@ -833,34 +833,37 @@ def load_kv_transfer_data(kv_transfer_file):
     """
     Load the vllm-ascend PD-disaggregated KV-transfer cost table.
 
-    Columns: ``ep_size, isl, device_total_ms``. Each row is the per-request
-    total KV-transfer DEVICE time (ms) for an ``(ep_size, isl)`` point,
-    measured on the mooncake kv_producer (prefill) worker of a GLM-5-w8a8
-    PD-disaggregated deployment (chunked prefill max_num_batched_tokens=4096,
-    prefix-caching on, prefill tp=16).
+    Columns: ``ep_size, isl, net_kv_wallclock_ms``. Each row is the per-request
+    KV-transfer net WALL-CLOCK contribution (ms) for an ``(ep_size, isl)``
+    point, measured on the mooncake kv_producer (prefill) worker of a
+    GLM-5-w8a8 PD-disaggregated deployment (chunked prefill
+    max_num_batched_tokens=4096, prefix-caching on).
 
-    ``device_total_ms`` is the sum over the four KV-transfer kernel families of
-    ``count x median_us`` (us -> ms):
+    ``net_kv_wallclock_ms`` is derived directly from the profiler kernel
+    timeline (kernel_details.csv): we take the time-axis UNION of the four
+    KV-transfer kernel families and subtract the part that overlaps compute
+    (AI_CORE / AI_VECTOR_CORE) kernels — i.e. the KV time genuinely exposed on
+    the critical path, NOT hidden behind compute on another stream. This is the
+    value the model adds directly; there is NO separate overlap_factor (the old
+    ``device_total x factor`` form entangled three things — median-vs-real,
+    KV-stream overlap, and KV-compute overlap — into one opaque scalar; storing
+    the measured net wall-clock removes that).
 
-      - ``broadcastAicpuKernel`` + ``hcom_broadcast_``  (per-layer KV push:
-        AICPU coordination + HCCL transfer; count == num_layers x num_chunks)
+    KV-transfer families:
+      - ``broadcastAicpuKernel`` + ``hcom_broadcast_``  (per-layer KV push)
       - ``reduce_scatterAicpuKernel`` + ``hcom_reduceScatter_``  (KV pool sync)
 
-    The MEDIAN is used, not the mean: the mean is contaminated by 10-20 s
-    rank-sync stall artifacts (max values reach ~2e7 us), worst at small isl.
-
-    This is the DEVICE-accumulated upper bound. The fraction actually exposed on
-    the critical-path TTFT (KV transfer not hidden behind compute via async
-    mooncake push) is applied as an ``overlap_factor`` at query time
-    (see ``query_kv_transfer``), not stored here.
-
-    Source: 11 GLM-5 profiler runs, docs/profiler_alignment/groundtruth/detail.csv.
+    Source: 11 GLM-5 profiler runs (glm5-profiler.tar.gz kernel_details.csv).
     Grid: ep_size in {1 (dp-only, no EP), 16}; isl in {2500, 10000, 20000}.
-    (The dp-only baseline was profiled under a no-EP run and is stored as ep=1,
-    the value a real no-expert-parallel config passes, so query clamps to it.)
+    The isl=2500 points are linearly extrapolated from the 10k/20k slope: the
+    raw 2500 profiler windows are corrupted by 10-20 s rank-sync stall bubbles
+    (KV kernel durations themselves inflated), so a direct timeline measurement
+    is unreliable there; the 10k/20k points are clean. The dp-only baseline is
+    stored as ep=1 (the value a real no-EP config passes) so query hits it
+    exactly rather than interpolating up.
 
     Returns:
-        dict: Nested dict ``[ep_size][isl]`` -> ``device_total_ms`` (float).
+        dict: Nested dict ``[ep_size][isl]`` -> ``net_kv_wallclock_ms`` (float).
               ``None`` when the file is absent (optional table).
     """
     if not os.path.exists(kv_transfer_file):
@@ -874,10 +877,10 @@ def load_kv_transfer_data(kv_transfer_file):
         for row in reader:
             ep_size = int(row["ep_size"])
             isl = int(row["isl"])
-            device_total_ms = float(row["device_total_ms"])
+            net_kv_wallclock_ms = float(row["net_kv_wallclock_ms"])
             if isl in kv_transfer_data[ep_size]:
                 logger.debug(f"value conflict in kv_transfer data: ep{ep_size} isl{isl}")
-            kv_transfer_data[ep_size][isl] = device_total_ms
+            kv_transfer_data[ep_size][isl] = net_kv_wallclock_ms
 
     return kv_transfer_data
 
@@ -4786,48 +4789,22 @@ class PerfDatabase:
             return PerformanceResult(result["latency"], energy=result.get("energy", 0.0))
         return PerformanceResult(result, energy=0.0)
 
-    # Fraction of the DEVICE-accumulated KV-transfer time that lands on the
-    # critical-path TTFT. CALIBRATED per-time-axis against profiler, NOT a
-    # single-point scalar fudge.
-    #
-    # Method: from kernel_details.csv we split each prefill run's timeline into
-    # KV-transfer kernels vs compute kernels (AI_CORE/AI_VECTOR_CORE) and
-    # measure, by interval union, how much of the KV time is NOT hidden behind
-    # compute (KV-exclusive + the KV scheduling gaps that belong to the
-    # critical path). Net KV wall-clock = real prefill span − profiler compute
-    # union:
-    #   ep16 isl=10k: span 2754 − compute 259 = 2495 ms  → 2495/2896 = 0.862
-    #   ep16 isl=20k: span 3833 − compute 395 = 3438 ms  → 3438/3999 = 0.860
-    # The ratio is STABLE at ~0.86 across isl (unlike the naive back-out which
-    # gave 0.60/0.23 — that divergence came from using the model's HYBRID
-    # compute estimate, which is itself inflated, not from KV). So 0.86 is the
-    # physically-grounded exposed fraction: ~14% of KV device time overlaps
-    # compute, the rest is on the critical path.
-    #
-    # NOTE — independent issue, do NOT absorb here: the model's prefill compute
-    # (esp. context DSA attention at TP>1, which falls back to HYBRID SOL) is
-    # itself overestimated (~807 ms modeled vs ~259 ms profiler compute union),
-    # so model prefill_ttff = inflated_compute + KV×0.86 runs ~+27% high at
-    # isl=10k. That gap is the TP>1 DSA silicon data gap (see report §2.3), not
-    # a KVTransfer error — fixing it by lowering this factor would hide one
-    # error behind another. Re-fit when isl>20k KV data + TP>1 DSA silicon land.
-    _KV_TRANSFER_OVERLAP_FACTOR = 0.86
-
     @functools.lru_cache(maxsize=4096)
     def query_kv_transfer(
         self,
         isl: int,
         ep_size: int,
-        overlap_factor: float | None = None,
     ) -> PerformanceResult:
         """
         Query the vllm-ascend PD-disaggregated KV-transfer critical-path cost.
 
-        The stored table holds per-request total KV-transfer DEVICE time (ms)
-        on a ``(ep_size, isl)`` grid measured on the mooncake kv_producer
-        worker. This method bilinearly clamps+interpolates that grid, then
-        multiplies by ``overlap_factor`` to return the portion exposed on the
-        critical-path TTFT (KV transfer not hidden behind compute).
+        The stored table holds the per-request KV-transfer net WALL-CLOCK
+        contribution (ms) on a ``(ep_size, isl)`` grid — the value measured
+        directly from the profiler kernel timeline as the KV time exposed on
+        the critical path (KV interval union minus its overlap with compute).
+        This method bilinearly clamps+interpolates that grid and returns the
+        value directly: there is NO overlap_factor (the table already stores
+        the measured net wall-clock, so no opaque scalar correction is needed).
 
         Both ``isl`` and ``ep_size`` are clamped into the measured range
         (hold flat at the boundaries) before interpolation — the grid is small
@@ -4836,8 +4813,6 @@ class PerfDatabase:
         Args:
             isl: input sequence length (per request)
             ep_size: MoE expert-parallel size on the prefill worker
-            overlap_factor: critical-path-exposed fraction; defaults to
-                            ``_KV_TRANSFER_OVERLAP_FACTOR`` when None.
 
         Returns:
             PerformanceResult: critical-path KV-transfer latency in ms; energy 0.
@@ -4846,8 +4821,6 @@ class PerfDatabase:
             ValueError: when the table is not loaded or is empty.
         """
         self._kv_transfer_data.raise_if_not_loaded()
-
-        factor = self._KV_TRANSFER_OVERLAP_FACTOR if overlap_factor is None else overlap_factor
 
         ep_points = sorted(self._kv_transfer_data.keys())
         if not ep_points:
@@ -4866,14 +4839,14 @@ class PerfDatabase:
             left, right = self._nearest_1d_point_helper(isl_clamped, isl_points, inner_only=False)
             return float(self._interp_1d([left, right], [isl_table[left], isl_table[right]], isl_clamped))
 
-        device_lo = _isl_interp(ep_lo)
+        net_lo = _isl_interp(ep_lo)
         if ep_hi == ep_lo:
-            device_total_ms = device_lo
+            net_kv_wallclock_ms = net_lo
         else:
-            device_hi = _isl_interp(ep_hi)
-            device_total_ms = float(self._interp_1d([ep_lo, ep_hi], [device_lo, device_hi], ep_clamped))
+            net_hi = _isl_interp(ep_hi)
+            net_kv_wallclock_ms = float(self._interp_1d([ep_lo, ep_hi], [net_lo, net_hi], ep_clamped))
 
-        return PerformanceResult(device_total_ms * factor, energy=0.0)
+        return PerformanceResult(net_kv_wallclock_ms, energy=0.0)
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)

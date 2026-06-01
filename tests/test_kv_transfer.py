@@ -2,7 +2,7 @@
 
 Covers the loader (load_kv_transfer_data), the query method
 (PerfDatabase.query_kv_transfer) including exact-grid lookup, isl/ep
-interpolation, both-axis hold-flat clamping, and the overlap_factor; plus the
+interpolation, both-axis hold-flat clamping (stored value is the measured net KV wall-clock, no overlap_factor); plus the
 operations-layer KVTransfer gating: the cost is charged ONCE on the vllm-ascend
 disagg prefill path and is zero everywhere else (agg mode, decode, missing
 table).
@@ -29,15 +29,13 @@ SYSTEM = "ascend_910b"
 BACKEND = "vllm-ascend"
 VERSION = "0.18.0"
 
-# Known grid points (device_total_ms in source file).
-EP1_2500 = 994.3
-EP1_10000 = 1056.7
-EP1_20000 = 1273.0
-EP16_2500 = 1404.9
-EP16_10000 = 2896.0
-EP16_20000 = 3999.0
-
-DEFAULT_OVERLAP = PerfDatabase._KV_TRANSFER_OVERLAP_FACTOR
+# Known grid points (net_kv_wallclock_ms in source file).
+EP1_2500 = 867.0
+EP1_10000 = 1260.4
+EP1_20000 = 1785.1
+EP16_2500 = 1011.0
+EP16_10000 = 1679.4
+EP16_20000 = 2571.0
 
 
 def _data_file() -> str:
@@ -84,36 +82,16 @@ def test_loader_values(raw_data):
 
 
 # --------------------------------------------------------------------------- #
-# Query: exact grid points (device x default overlap)
+# Query: exact grid points (returns stored net KV wall-clock directly)
 # --------------------------------------------------------------------------- #
 def test_query_exact_grid_ep1(db):
     got = float(db.query_kv_transfer(2500, 1))
-    assert got == pytest.approx(EP1_2500 * DEFAULT_OVERLAP)
+    assert got == pytest.approx(EP1_2500)
 
 
 def test_query_exact_grid_ep16(db):
     got = float(db.query_kv_transfer(20000, 16))
-    assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP)
-
-
-def test_query_overlap_override_scales_device_total(db):
-    # an explicit overlap_factor scales the device total linearly, independent
-    # of the default (calibrated to 0.60 against profiler wall-clock)
-    got = float(db.query_kv_transfer(20000, 16, overlap_factor=0.5))
-    assert got == pytest.approx(EP16_20000 * 0.5)
-
-
-def test_query_default_overlap_is_calibrated_factor(db):
-    # default overlap calibrated to 0.86 from profiler time-axis: net KV
-    # wall-clock (span − compute union) / device_total is stable ~0.86 across
-    # isl 10k/20k. query == device_total x 0.86.
-    assert DEFAULT_OVERLAP == pytest.approx(0.86)
-    got = float(db.query_kv_transfer(20000, 16))
-    assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP)
-
-
-def test_query_overlap_zero_is_zero(db):
-    assert float(db.query_kv_transfer(10000, 16, overlap_factor=0.0)) == 0.0
+    assert got == pytest.approx(EP16_20000)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,14 +99,14 @@ def test_query_overlap_zero_is_zero(db):
 # --------------------------------------------------------------------------- #
 def test_query_isl_interpolation(db):
     # 15000 is midway between 10000 and 20000 on the ep16 row
-    got = float(db.query_kv_transfer(15000, 16, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(15000, 16))
     expected = (EP16_10000 + EP16_20000) / 2.0
     assert got == pytest.approx(expected, abs=1e-3)
 
 
 def test_query_ep_interpolation(db):
     # ep=8 lies between ep1 and ep16 at fraction (8-1)/(16-1) on isl=10000
-    got = float(db.query_kv_transfer(10000, 8, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(10000, 8))
     frac = (8 - 1) / (16 - 1)
     expected = EP1_10000 + frac * (EP16_10000 - EP1_10000)
     assert got == pytest.approx(expected, abs=1e-2)
@@ -139,23 +117,23 @@ def test_query_ep_interpolation(db):
 # --------------------------------------------------------------------------- #
 def test_query_clamps_isl_below(db):
     # isl below smallest grid (2500) -> held at the 2500 value
-    got = float(db.query_kv_transfer(1, 16, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(1, 16))
     assert got == pytest.approx(EP16_2500)
 
 
 def test_query_clamps_isl_above(db):
-    got = float(db.query_kv_transfer(10**6, 1, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(10**6, 1))
     assert got == pytest.approx(EP1_20000)
 
 
 def test_query_clamps_ep_below(db):
     # ep below smallest grid (1) clamps to the ep=1 (dp-only) row
-    got = float(db.query_kv_transfer(10000, 0, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(10000, 0))
     assert got == pytest.approx(EP1_10000)
 
 
 def test_query_clamps_ep_above(db):
-    got = float(db.query_kv_transfer(10000, 64, overlap_factor=1.0))
+    got = float(db.query_kv_transfer(10000, 64))
     assert got == pytest.approx(EP16_10000)
 
 
@@ -172,7 +150,7 @@ def test_query_monotonic_in_isl_at_ep16(db):
 def test_op_charges_cost_on_disagg_prefill(db):
     op = ops.KVTransfer("kv", 1, 16, is_disagg_prefill=True)
     got = float(op.query(db, s=20000))
-    assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP)
+    assert got == pytest.approx(EP16_20000)
 
 
 def test_op_zero_in_agg_mode(db):
@@ -184,13 +162,13 @@ def test_op_zero_in_agg_mode(db):
 def test_op_scale_factor_applied(db):
     op = ops.KVTransfer("kv", 2.0, 16, is_disagg_prefill=True)
     got = float(op.query(db, s=20000))
-    assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP * 2.0)
+    assert got == pytest.approx(EP16_20000 * 2.0)
 
 
 def test_op_ep1_path(db):
     op = ops.KVTransfer("kv", 1, 1, is_disagg_prefill=True)
     got = float(op.query(db, s=2500))
-    assert got == pytest.approx(EP1_2500 * DEFAULT_OVERLAP)
+    assert got == pytest.approx(EP1_2500)
 
 
 def test_op_missing_isl_raises(db):
