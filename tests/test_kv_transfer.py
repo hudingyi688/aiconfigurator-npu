@@ -98,17 +98,17 @@ def test_query_exact_grid_ep16(db):
 
 def test_query_overlap_override_scales_device_total(db):
     # an explicit overlap_factor scales the device total linearly, independent
-    # of the default (which is 1.0 = charge full measured cost)
+    # of the default (calibrated to 0.60 against profiler wall-clock)
     got = float(db.query_kv_transfer(20000, 16, overlap_factor=0.5))
     assert got == pytest.approx(EP16_20000 * 0.5)
 
 
-def test_query_default_overlap_is_full_device_total(db):
-    # default overlap is calibrated to 1.0: query == device total (KV-transfer
-    # kernels run serially, no compute overlap — see _KV_TRANSFER_OVERLAP_FACTOR)
-    assert DEFAULT_OVERLAP == 1.0
+def test_query_default_overlap_is_calibrated_factor(db):
+    # default overlap is calibrated to 0.60 from profiler step wall-clock
+    # (isl=10k real prefill = 2754ms); query == device_total x 0.60.
+    assert DEFAULT_OVERLAP == pytest.approx(0.60)
     got = float(db.query_kv_transfer(20000, 16))
-    assert got == pytest.approx(EP16_20000)
+    assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP)
 
 
 def test_query_overlap_zero_is_zero(db):

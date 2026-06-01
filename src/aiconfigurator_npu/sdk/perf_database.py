@@ -4787,20 +4787,26 @@ class PerfDatabase:
         return PerformanceResult(result, energy=0.0)
 
     # Fraction of the DEVICE-accumulated KV-transfer time that lands on the
-    # critical-path TTFT. CALIBRATED from profiler wall-clock traces, NOT a
-    # guess: for each prefill run we took the time-axis UNION of all KV-transfer
-    # kernel intervals (kernel_details.csv Start+Duration) — the real wall-clock
-    # span KV transfer occupies — and divided by this table's median-based
-    # device total. On the 4 clean runs (isl 10k/20k x ep 1/16; isl=2500 is
-    # excluded, its device sum is corrupted by 10-20s rank-sync stall artifacts)
-    # the ratio is mean 1.09 / median 1.05, i.e. ~1.0: the KV-transfer kernels
-    # run essentially serially (they do NOT overlap each other or hide behind
-    # compute), so the device total already IS the wall-clock cost. This is also
-    # why KV transfer is ~87% of prefill wall-clock in the coverage analysis.
-    # 1.0 = charge the full measured cost; tune down only if a future run shows
-    # genuine compute/transfer overlap. Replaces the legacy hand-tuned
-    # _AUTOSCALE_TTFT_CORRECTION_FACTOR=1.8 magic in picking.py.
-    _KV_TRANSFER_OVERLAP_FACTOR = 1.0
+    # critical-path TTFT. CALIBRATED against the profiler's true per-step
+    # wall-clock, NOT the KV-kernel union (the earlier 1.0 was wrong — it
+    # measured KV-vs-KV overlap only and missed that KV kernels run on
+    # separate streams that overlap with compute and with each other).
+    #
+    # Ground truth: profiler step_trace_time.csv + kernel_details time-axis
+    # span agree exactly on real single-request prefill wall-clock:
+    #   isl=10k -> 2754 ms, isl=20k -> 3833 ms (ep16).
+    # Note sum-of-kernel-durations (6828 ms at 10k) >> wall-clock (2754 ms),
+    # proving heavy cross-stream overlap. Backing the factor out of
+    #   model_compute + device_total x factor = real_wall_clock :
+    #   isl=10k: (2754-1014)/2896 = 0.60   isl=20k: (3833-2923)/3999 = 0.23.
+    # We anchor on isl=10k (0.60): it is the strictest TTFT tier and its
+    # compute estimate is the most trustworthy (the isl=20k compute term is
+    # itself inflated, which is why its back-out is lower). At isl>=20k this
+    # factor makes the prediction conservative (~+39% at 20k), i.e. safe for
+    # SLO sizing. Re-fit when isl>20k KV-transfer data + a per-isl bench TTFT
+    # are available. Together with the per-op sum this supersedes the legacy
+    # _AUTOSCALE_TTFT_CORRECTION_FACTOR=1.8 magic for the prefill side.
+    _KV_TRANSFER_OVERLAP_FACTOR = 0.60
 
     @functools.lru_cache(maxsize=4096)
     def query_kv_transfer(
