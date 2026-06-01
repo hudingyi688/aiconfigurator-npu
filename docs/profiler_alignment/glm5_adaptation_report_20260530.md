@@ -110,12 +110,11 @@ GLM-5 是 671B 级 MoE，注意力为 **DSA（DeepSeek Sparse Attention，含 Li
    改进：`mla_module_factory.py` 已支持 `--num-heads-override`，需在 NPU 上重采 TP∈{2,4,8,16} → num_heads∈{32,16,8,4}，追加进 `dsa_*_module_perf.txt`，即可解锁纯 SILICON 寻优。
 
 2. **MoE dispatch/combine 融合表只覆盖 ep{2,4,8}**
-   生产 prefill 用 ep16。已做缓解：`query_moe_dispatch_combine` 对未测 ep 夹取到最近已测 ep（hold flat，`perf_database.py`），使 ep16 不再崩溃。
-   改进：在 NPU 上补采 ep16（及 ep32）的 `dispatch_ffn_combine` 数据。
+   生产 prefill 用 ep16、decode 用 ep8/ep10。已做缓解：`query_moe_dispatch_combine` 对未测 ep 夹取到最近已测 ep（hold flat，`perf_database.py`），使 ep10/ep16 不崩。
+   改进：多机补采 ep10/ep16/ep32 的 `dispatch_ffn_combine` 数据（BF16+W8A8），把近似变精确。
 
-3. **MoE dispatch BF16 路径仍走 calibration 而非 silicon**
-   decode 阶段 `MoeDistributeDispatchV2/CombineV2`（BF16）目前用 `comm_calibration.json` 系数近似。
-   改进：新增 `collect_moe_dispatch_bf16.py`，把 BF16 路径也提升为 silicon。
+3. **MoE dispatch/combine BF16 路径 —— 已是 silicon，无缺口**
+   澄清：`moe_dispatch_combine_perf.txt` 已含 bf16（72 行）+ w8a8（72 行），BF16 和 W8A8 同走 `dispatch_ffn_combine` 融合 silicon，`MoEDispatch.query` 已按 dtype 自动分流。`comm_calibration.json` 里残留的 `moe_dispatch_bf16`/`moe_combine_bf16` 系数在 operations.py 已无调用点，是 FusedMC2 改造前的 dead data，可清理。
 
 4. **若干小算子未单独建模**（低优先，合计 <5% 时间占比）
    `mla_preprocess`、`MoeGatingTopK`、`ReshapeAndCache`、RoPE 等可分离小 kernel 目前并入 SOL 估算。按 YAGNI，对寻优影响可忽略，暂不单独采集。
@@ -261,11 +260,27 @@ aiconfigurator 的设计原则是 **「系统延迟 = 各算子延迟之和」**
 | 阶段 | silicon | calibration | KV transfer（本轮新建模） | **已建模合计** | 未覆盖 |
 |---|---:|---:|---:|---:|---:|
 | **prefill** | 6.6% | 4.0% | 87.2% | **97.8%** | 2.2%（misc 内存搬运/采样） |
-| **decode** | 47.4% | 46.9% | — | **94.3%** | 5.7%（TP>1 DSA + misc） |
+| **decode** | **94.9%** | 0.0% | — | **97.2%** | 2.8%（misc + TP>1 DSA 经 HYBRID） |
 
-**本轮关键变化**：KVTransfer 建模把 prefill 那 87.2% 从「未覆盖」转为「已建模」，**prefill 覆盖率从 10.6% → 97.8%**。这是本轮适配对寻优精度最大的贡献——此前 prefill 因 KV transfer 缺失导致 disagg 绝对吞吐系统性低估 ~50%，现已闭合主要缺口。
+> 注：decode 行已按**当前状态**更新。改造前（`coverage_analysis_20260528.md` 快照）decode 是 silicon 47.4% / calibration 46.9%——那 46.9% 的 MOE_DISPATCH_W8A8（`DispatchFFNCombine`，decode 第一大头 45.5%）本轮经 FusedMC2 硅表升级为 **silicon**，故 decode calibration 现已**清零**，silicon 升至 94.9%。
+
+**本轮两项关键变化**：
+1. **prefill**：KVTransfer 建模把 87.2% 从「未覆盖」转为「已建模」，**prefill 覆盖率 10.6% → 97.8%**。此前 prefill 因 KV transfer 缺失导致 disagg 绝对吞吐系统性低估 ~50%，现已闭合主要缺口。
+2. **decode**：FusedMC2 硅表把 MoE dispatch（45.5%）从 calibration 升级为 silicon，**decode silicon 47.4% → 94.9%、calibration 46.9% → 0%**，已建模 94.3% → 97.2%。
+
+**decode 当前构成（墙钟份额，avg×count）**：
+
+| op | 占比 | 来源 |
+|---|---:|---|
+| DispatchFFNCombine（MoE dispatch+FFN+combine） | 45.5% | silicon（本轮 FusedMC2） |
+| QuantBatchMatmulV3（W8A8 GEMM） | 45.0% | silicon |
+| SparseFlashAttention + LightningIndexer（DSA） | 2.3% | silicon（TP=1；TP>1 经 HYBRID） |
+| mla_preprocess / DynamicQuant / AscendQuant 等 | 2.2% | SOL/elementwise |
+| PadV3 / MemSet / sampling / batch_get 等碎片 | 2.8% | unmodeled_misc |
 
 > 度量注记：上述份额用 profiler 的墙钟时间（avg×count），KV transfer 在此口径下含 PD 分离的 rank 同步等待，占 prefill 87.2%。若改用去同步气泡的 device 计算口径（median×count），KV transfer 真实 device 占比约 34%——这只是诊断 KVTransfer 内部成本结构的副指标（见 §4.5 overlap_factor 标定），**不改变覆盖率定义**：覆盖率始终按设计原则的墙钟份额计。
+
+> ⚠️ decode silicon 的一个精度隐患（非覆盖率问题）：生产 decode 实际 ep8/**ep10**，而 MoE dispatch 融合表只有 ep{2,4,8}，**ep10 靠夹取到 ep8 近似**；TP>1 DSA 靠 HYBRID 经验补。两者均可通过多机重采消除，见 §5 后续计划。
 
 ### 3.6 对齐状态汇总
 
@@ -275,10 +290,10 @@ aiconfigurator 的设计原则是 **「系统延迟 = 各算子延迟之和」**
 | BF16/W8A8 GEMM 小 op (router) | ⚠️ +138% | 极低（<50us，占比<1%） |
 | W8A8 GEMM 单 op | ✅ 多数 ±20% | 可接受 |
 | W8A8 expert-batched | 走 moe_perf.txt | 不经 GEMM 表 |
-| MoE FusedMC2 dispatch | ✅ silicon (ep{2,4,8}) | 生产 ep16 靠夹取 |
+| MoE FusedMC2 dispatch（prefill+decode） | ✅ silicon (ep{2,4,8}, bf16+w8a8) | 生产 prefill ep16 / decode ep10 靠夹取 |
 | DSA module | ✅ 语义对齐 | TP>1 数据缺，靠 HYBRID |
-| 通信 allreduce/allgather | ✅ silicon | 低 |
-| a2a | ⚠️ calibration | 中 |
+| 通信 allreduce/allgather | ✅ silicon 基线 + 拓扑校准系数 | 低 |
+| a2a | ⚠️ SOL + 校准（vllm-ascend 主路径已被 FusedMC2 吸收） | 低 |
 | KV transfer | ✅ 本轮建模 | prefill 关键 |
 
 <!-- SECTION4 -->
@@ -339,17 +354,18 @@ disagg top-1:  prefill tp=16 dp=2 ep=32   ← 与生产一致
 | 阶段 | silicon | calibration | KV transfer（本轮建模） | **已建模合计** | 未覆盖 |
 |---|---:|---:|---:|---:|---:|
 | prefill | 6.6% | 4.0% | 87.2% | **97.8%** | 2.2% |
-| decode | 47.4% | 46.9% | — | **94.3%** | 5.7%（TP>1 DSA + misc） |
+| decode | **94.9%** | 0.0% | — | **97.2%** | 2.8% |
 
-> 本轮 KVTransfer 建模前，prefill 那 87.2% 是最大未覆盖项，prefill 覆盖率仅 10.6%；建模后升至 97.8%。
+> 本轮两项升级：① KVTransfer 建模把 prefill 87.2% 从未覆盖转为已建模（10.6%→97.8%）；② FusedMC2 硅表把 decode 的 MoE dispatch（45.5%）从 calibration 升级为 silicon（decode silicon 47.4%→94.9%、calibration 46.9%→0%）。decode 现已基本纯 silicon。
 
 **可信**：
 - 配置形态（tp/dp/ep、agg vs disagg）——pin 后复现生产。
 - 同部署族内的相对排名（A 比 B 快 30% 这类结论可信）。
-- decode 绝对延迟（±25%，覆盖 94.3%）。
+- decode 绝对延迟（±25%，覆盖 97.2%，两大头 MoE dispatch + GEMM 均 silicon）。
 
 **此前不可信、本轮改善**：
 - prefill 绝对吞吐曾系统性低估 ~50%，根因是 KV transfer（占 prefill 墙钟 87.2%）未建模。**本轮已新增 `KVTransfer` 算子**（profiler wall-clock trace 反推、overlap_factor=1.0 标定），让 prefill ttft 自带真实 KV transfer 成本，prefill 覆盖率 10.6%→97.8%。详见 `kv_transfer_perf.txt` 与 `query_kv_transfer`。
+- decode MoE dispatch 此前走 calibration（解析+系数），本轮 FusedMC2 硅表升级为 silicon，calibration 清零。
 
 **仍不可信**：
 - 长上下文（isl>8k）：KV transfer 网格只标定到 20k，且 chunked-prefill 调度未建模。
@@ -367,13 +383,14 @@ disagg top-1:  prefill tp=16 dp=2 ep=32   ← 与生产一致
 
 ## 附：后续优先级（YAGNI 取舍）
 
-只列已识别、有明确收益的项，不含设想：
+只列已识别、有明确收益的项，不含设想。**前两项需多机环境采集，技术路径已在单机/小规模验证可行，只差机时**：
 
-1. **NPU 上重采 DSA module TP∈{2,4,8,16}**（解锁纯 SILICON 寻优，消除 HYBRID 依赖）。
-2. **补采 MoE dispatch ep16/ep32**（生产 prefill 用 ep16，当前靠夹取近似）。
+1. **多机补采 MoE dispatch ep10/ep16/ep32**（最高优先）。生产 decode 实际 ep8/**ep10**、prefill ep16，而融合硅表只有 ep{2,4,8}——ep10/ep16 当前靠夹取到 ep8 近似。`collect_moe_dispatch_combine.py` 已支持任意 `--ep-size`，多机 `torchrun` 直接补采即可把 decode 的 45.5% silicon 从「ep 近似」变「ep 精确」。
+2. **多机重采 DSA module TP∈{2,4,8,16}**（次高）。生产 prefill tp=16 / decode tp=4 → num_heads_per_rank ∈ {4,16}，silicon 表只有 num_heads=64，TP>1 靠 HYBRID（SOL+经验）补。`mla_module_factory.py` 已支持 `--num-heads-override`，多机重采 num_heads∈{32,16,8,4} 即可解锁纯 SILICON 寻优、消除 HYBRID 依赖。
 3. **KV transfer overlap_factor 用真实 bench TTFT 复核**（当前 trace 标定=1.0，bench TTFT 未保存；若后续有 P50 可二次校准）。
+4. **清理 dead calibration 系数**：`comm_calibration.json` 里 `moe_dispatch_bf16` / `moe_combine_bf16` / `moe_dispatch_combine_w8a8` 三个 op_kind 的系数在 operations.py 已无调用点（MoE dispatch 全转 FusedMC2 silicon），属遗留 dead data，可删。
 
-不做（无必要）：小算子（mla_preprocess/RoPE/GatingTopK）单独采集——合计 <5% 占比，并入 SOL 已足够。
+不做（无必要）：小算子（mla_preprocess/RoPE/GatingTopK/PadV3/MemSet）单独采集——decode 合计 <3% 占比，并入 SOL 已足够。
 
 
 
