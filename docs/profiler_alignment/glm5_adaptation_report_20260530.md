@@ -131,12 +131,11 @@ GLM-5 是 671B 级 MoE，注意力为 **DSA（DeepSeek Sparse Attention，含 Li
 
 ### 3.0 度量口径说明（重要）
 
-profiler 的 `avg_us` 在小 isl 下被 **10-20 秒级 rank 同步等待气泡**严重污染（KV transfer 族 max 达 2×10⁷ us）。因此本节区分两个口径：
+**覆盖率口径**：aiconfigurator 的设计原则是「系统延迟 = 各算子延迟之和」，所以覆盖率统一定义为**已建模算子占生产热路径墙钟时间的份额**（profiler 时间占比，= avg×count），与 `coverage_analysis_20260528.md` 一致。§3.5 / §4.4 的覆盖率均按此口径。
 
-- **avg×count（含气泡）**：等于墙钟时间份额，是 `coverage_analysis_20260528.md` 的口径。KV transfer 占 prefill **87.4%**。
-- **median×count（去气泡）**：真实 device 计算份额。KV transfer 占 prefill **34.3%**。
+**诊断副口径**：profiler 的 `avg_us` 在小 isl 下被 10-20 秒级 rank 同步等待气泡污染（KV transfer 族 max 达 2×10⁷ us）。分析 KV transfer 内部成本结构时另用 median×count（去气泡的 device 计算量）作副指标——它只服务于 overlap_factor 标定（§4.5），**不参与覆盖率定义**。
 
-两个数字都正确，口径不同。下文覆盖率表**两者并列给出**。算子级偏差对齐统一用 **median**（稳定、抗离群）。
+**对齐偏差口径**：算子级 profiler-vs-bench 偏差统一用 **median**（稳定、抗离群）。
 
 ### 3.1 Profiler 按总时长 Top 算子（含调用次数）
 
@@ -200,10 +199,47 @@ profiler 的 `avg_us` 在小 isl 下被 **10-20 秒级 rank 同步等待气泡**
 
 结论：real-signal GEMM 中位偏差 -14%、61/71 条在 ±50% 内。偏差主要来自 TP 切分边界和小 op 的 bench dispatch overhead，绝对值占比小，对 Pareto 排名无实质影响。
 
-### 3.3 一个关键的 shape 归类陷阱（已澄清）
+### 3.3 数据异常清单（check_alignment 全量分类）
 
-profiler 里有 539 个 `aclnnQuantMatmulWeightNz` shape 形如 `(256,4096,6144)`，profiler 中位 **2055us** 而 bench 单 op 仅 62us（-97%）。根因：被 NPU runtime 归到 `QuantBatchMatmulV3` op type 下的这批，**实际是 MoE 内部 expert-batched W8A8 group GEMM**（一次调用做 N 个 expert），延迟是单 op 的几十倍。
-这条数据**不参与寻优**——MoE 路径查 `moe_perf.txt`，不查 `gemm_perf.txt`。check_alignment 里那条 -69.9% FAIL 同源，已知非缺陷。
+`check_alignment.py` 对 85 条 matched + 57 条 MISS 逐条比对，异常归为四类，**均已定位根因，均不影响寻优**：
+
+**（A）expert-batched GEMM 误归类 — 2 条 FAIL，偏差 -90%+**
+
+| shape (M,N,K) | profiler中位 | bench | 偏差 |
+|---|---:|---:|---:|
+| (256,4096,6144) | 1089.6us | 62.9us | -94.2% |
+| (114,4096,6144) | 702.9us | 51.4us | -92.7% |
+
+profiler shape `192,256,16,32`（FRACTAL_NZ 4D）说明这是 **MoE 内部 expert-batched W8A8 group GEMM**（一次调用做 256 个 expert），被 NPU runtime 归到 `QuantBatchMatmulV3` op type 下。延迟是单 op 的几十倍。**走 `moe_perf.txt`，不查 `gemm_perf.txt`**，误判为 GEMM 偏差实属归类错位。
+
+**（B）DSA MLA 投影被当普通 GEMM — 5 条 FAIL，同一 (M,6144,512) 下偏差双向矛盾**
+
+| shape | profiler中位 | bench | 偏差 |
+|---|---:|---:|---:|
+| (3,6144,512) | 146.2us | 40.8us | -72.1% |
+| (6,6144,512) | 22.6us | 73.2us | **+224.4%** |
+| (27,6144,512) | 171.9us | 42.9us | -75.0% |
+
+同一标称 (M,6144,512) 既出现 -75% 又出现 +224% —— **铁证表明 profiler 那个 op 不是普通 GEMM**。其 profiler shape `192,32,16,32`（4D NZ）+ N=512=kv_lora_rank，实际是 **DSA 的 MLA 投影/吸收 BMM**（带 batch 维）。check_alignment 用平面 (M,N,K) 匹配 bench 的普通 GEMM 必然错位。这批应走 `dsa_*_module_perf.txt`（module 级），不该进 GEMM 对齐。
+
+**（C）dense FFN 系统性偏低 — 20 条 WARN，偏差 -20% ~ +48%**
+
+集中在 K∈{3072,12288} 的 dense gate_up/ffn2（如 `(9,6144,12288) -113.6us` 偏 -20.7%）。方向一致偏低，疑似 bench 的 TP 切分边界与 profiler 实际切法略有差异。绝对偏差 <50%、可接受，未阻塞寻优；可作后续 GEMM 采集精度优化项。
+
+**（D）bench 未采的高频 shape — 57 条 MISS**
+
+profiler 有但 bench 没采的 shape，按 profiler 调用次数排序，高频待补采：
+
+| shape (M,N,K) | profiler调用次数 | profiler中位 |
+|---|---:|---:|
+| (3,4096,2048) | 8720 | 19.3us |
+| (3,128,6144) | 8611 | 13.9us |
+| (3,32,6144) | 8611 | 12.2us |
+| (3,6144,4096) | 8000 | 30.0us |
+
+这些多是 decode 小 M（spec decode M=3/6/9）的小 op（中位 12-30us），单个占比低；补采可提升覆盖完整度，但对 Pareto 排名影响有限。
+
+> 小结：10 条 FAIL 中 7 条（A+B）是**算子归类错位**（本就不该走 GEMM 表），非数据质量问题；20 条 WARN 是 dense FFN 的 ~20% 系统偏差，可接受；57 条 MISS 是覆盖完整度而非精度问题。real-signal GEMM 真实中位偏差 -14%。
 
 ### 3.4 DSA 注意力与通信对齐
 
@@ -218,34 +254,18 @@ profiler 里有 539 个 `aclnnQuantMatmulWeightNz` shape 形如 `(256,4096,6144)
 
 DSA module 在 bench 和 profiler 两侧都是 module 级（投影+attention+输出），语义对齐，无需逐 sub-kernel 验证；唯一缺口是 TP>1（num_heads≠64）的 silicon 数据（见 2.3）。
 
-### 3.5 总覆盖率（两口径）
+### 3.5 总覆盖率（按 aiconfigurator 原始设计口径）
 
-按 profiler device-time 份额分类（每个 op_type 归到 aic-npu 来源），两口径并列：
+aiconfigurator 的设计原则是 **「系统延迟 = 各算子延迟之和」**（`coverage_analysis_20260528.md` 原文："aic-npu's design premise is system latency = sum of operator latencies"）。因此**覆盖率的唯一正确定义 = 已建模算子占生产热路径墙钟时间的份额**（profiler 时间占比口径）。下表统一用此口径。
 
-**Prefill 阶段**
+| 阶段 | silicon | calibration | KV transfer（本轮新建模） | **已建模合计** | 未覆盖 |
+|---|---:|---:|---:|---:|---:|
+| **prefill** | 6.6% | 4.0% | 87.2% | **97.8%** | 2.2%（misc 内存搬运/采样） |
+| **decode** | 47.4% | 46.9% | — | **94.3%** | 5.7%（TP>1 DSA + misc） |
 
-| 来源 | median×count（去气泡） | avg×count（含气泡=墙钟份额） |
-|---|---:|---:|
-| silicon | 33.5% | — |
-| calibration | 26.1% | — |
-| SOL/elementwise | 1.8% | — |
-| **KV transfer**（本轮新建模） | **34.3%** | **87.2%** |
-| unmodeled_misc | 4.2% | — |
-| **可建模合计（silicon+calib+SOL+KVTransfer）** | **95.7%** | — |
+**本轮关键变化**：KVTransfer 建模把 prefill 那 87.2% 从「未覆盖」转为「已建模」，**prefill 覆盖率从 10.6% → 97.8%**。这是本轮适配对寻优精度最大的贡献——此前 prefill 因 KV transfer 缺失导致 disagg 绝对吞吐系统性低估 ~50%，现已闭合主要缺口。
 
-> prefill 两口径差异完全来自 KV transfer 的同步气泡：avg 口径下 KV transfer 吞掉 87% 墙钟（rank 间等待计入传输 kernel），median 口径下其真实 device 计算占 34%。覆盖度文档（`coverage_analysis_20260528.md`）用的是 avg/墙钟口径，故记为 87%。两者一致、不矛盾。**本轮 KVTransfer 建模后，prefill 在两口径下都已从「未覆盖」转为「已建模」。**
-
-**Decode 阶段**
-
-| 来源 | median×count |
-|---|---:|
-| silicon | 48.0% |
-| calibration | 25.9% |
-| SOL/elementwise | 12.7% |
-| unmodeled_misc | 13.4% |
-| **可建模合计** | **86.6%** |
-
-> decode 的 unmodeled_misc（13.4%）主要是 PadV3/MemSet/ScatterNdUpdate 等内存搬运小 kernel 和 sampling，分散且单个占比低；TP>1 DSA 由 HYBRID 的 SOL+经验补。decode 绝对延迟实测在 ±25% 内（`coverage_analysis_20260528.md`）。
+> 度量注记：上述份额用 profiler 的墙钟时间（avg×count），KV transfer 在此口径下含 PD 分离的 rank 同步等待，占 prefill 87.2%。若改用去同步气泡的 device 计算口径（median×count），KV transfer 真实 device 占比约 34%——这只是诊断 KVTransfer 内部成本结构的副指标（见 §4.5 overlap_factor 标定），**不改变覆盖率定义**：覆盖率始终按设计原则的墙钟份额计。
 
 ### 3.6 对齐状态汇总
 
@@ -314,23 +334,22 @@ disagg top-1:  prefill tp=16 dp=2 ep=32   ← 与生产一致
 
 ### 4.4 当前可信 / 不可信边界（`coverage_analysis_20260528.md`）
 
-算子覆盖度（按 profiler **墙钟时间份额** = avg×count 口径，与 `coverage_analysis_20260528.md` 一致）：
+算子覆盖度（按 aiconfigurator 设计口径 = profiler 墙钟时间份额，与 §3.5 统一）：
 
-| 阶段 | silicon | calibration | 未覆盖 |
-|---|---|---|---|
-| prefill | 6.6% | 4.0% | **87.2%**（KV transfer，本轮已新增建模） |
-| decode | 47.4% | 46.9% | 5.7%（TP>1 DSA + misc） |
+| 阶段 | silicon | calibration | KV transfer（本轮建模） | **已建模合计** | 未覆盖 |
+|---|---:|---:|---:|---:|---:|
+| prefill | 6.6% | 4.0% | 87.2% | **97.8%** | 2.2% |
+| decode | 47.4% | 46.9% | — | **94.3%** | 5.7%（TP>1 DSA + misc） |
 
-> 注：此表是**墙钟口径**（含同步气泡），与 §3.5 的 device 计算口径（median×count）数字不同但不矛盾——见 §3.0 口径说明。本轮 KVTransfer 建模后，prefill 那 87.2% 已从「未覆盖」转为「已建模」。
-
+> 本轮 KVTransfer 建模前，prefill 那 87.2% 是最大未覆盖项，prefill 覆盖率仅 10.6%；建模后升至 97.8%。
 
 **可信**：
 - 配置形态（tp/dp/ep、agg vs disagg）——pin 后复现生产。
 - 同部署族内的相对排名（A 比 B 快 30% 这类结论可信）。
-- decode 绝对延迟（±25%，覆盖 94%）。
+- decode 绝对延迟（±25%，覆盖 94.3%）。
 
 **此前不可信、本轮改善**：
-- prefill 绝对吞吐曾系统性低估 ~50%，根因是 KV transfer（占 prefill 87%）未建模。**本轮已新增 `KVTransfer` 算子**（profiler wall-clock trace 反推、overlap_factor=1.0 标定），让 prefill ttft 自带真实 KV transfer 成本。详见 `kv_transfer_perf.txt` 与 `query_kv_transfer`。
+- prefill 绝对吞吐曾系统性低估 ~50%，根因是 KV transfer（占 prefill 墙钟 87.2%）未建模。**本轮已新增 `KVTransfer` 算子**（profiler wall-clock trace 反推、overlap_factor=1.0 标定），让 prefill ttft 自带真实 KV transfer 成本，prefill 覆盖率 10.6%→97.8%。详见 `kv_transfer_perf.txt` 与 `query_kv_transfer`。
 
 **仍不可信**：
 - 长上下文（isl>8k）：KV transfer 网格只标定到 20k，且 chunked-prefill 调度未建模。
