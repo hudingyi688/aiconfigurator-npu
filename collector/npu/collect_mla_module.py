@@ -261,6 +261,7 @@ def _write_row(
     num_heads: int,
     architecture: str,
     latency_ms: float,
+    gemm_type: str = "float16",
 ) -> None:
     if is_context:
         fname = "dsa_context_module_perf.txt"
@@ -274,7 +275,7 @@ def _write_row(
             "batch_size": batch_size,
             "isl": seq_len,
             "num_heads": num_heads,
-            "gemm_type": "float16",
+            "gemm_type": gemm_type,
             "mla_dtype": "float16",
             "kv_cache_dtype": "float16",
             "architecture": architecture,
@@ -292,7 +293,7 @@ def _write_row(
             "batch_size": batch_size,
             "isl": 1,
             "num_heads": num_heads,
-            "gemm_type": "float16",
+            "gemm_type": gemm_type,
             "mla_dtype": "float16",
             "kv_cache_dtype": "float16",
             "architecture": architecture,
@@ -354,15 +355,23 @@ def run_dsa_module(
     bench_iters: int = 50,
     force_mla: bool = False,
     num_heads_override: int | None = None,
+    quantization: str | None = None,
 ) -> float | None:
     """Benchmark one (seq_len, batch_size) point for DSA module on NPU."""
     is_context = mode == "context"
     op_type = OP_CONTEXT if is_context else OP_GENERATION
     phase = "context" if is_context else "generation"
 
+    # gemm_type column must match what the model queries at runtime: a w8a8
+    # model resolves gemm_quant_mode=w8a8_dynamic, so the row must be tagged
+    # accordingly or the perf DB lookup misses (see B-path fix). bf16 baseline
+    # stays float16.
+    gemm_type = "w8a8_dynamic" if quantization == "ascend" else "float16"
+
     label = "MLA" if force_mla else "DSA"
     heads_note = f", heads={num_heads_override}" if num_heads_override else ""
-    print(f"\n[{label} module] {phase} b={batch_size}, s={seq_len}, model={model_path}{heads_note}")
+    quant_note = f", quant={quantization}" if quantization else ""
+    print(f"\n[{label} module] {phase} b={batch_size}, s={seq_len}, model={model_path}{heads_note}{quant_note}")
 
     spec = DsaModuleSpec(
         op_type=op_type,
@@ -371,6 +380,7 @@ def run_dsa_module(
         model_path=model_path,
         force_mla=force_mla,
         num_heads_override=num_heads_override,
+        quantization=quantization,
     )
 
     try:
@@ -413,6 +423,7 @@ def run_dsa_module(
         num_heads=num_heads,
         architecture=architecture,
         latency_ms=latency_ms,
+        gemm_type=gemm_type,
     )
 
     print(
@@ -479,6 +490,17 @@ def main():
              "without launching distributed ranks. Output rows carry this head "
              "count; the perf DB matches on num_heads at query time.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=[None, "ascend"],
+        help="vllm quantization mode. Omit (None) = bf16 baseline. 'ascend' = "
+             "load the W8A8 quant_config from a real w8a8 model dir (pass that "
+             "dir via --model, e.g. /mnt/.../GLM-5-w8a8) so the MLA projection "
+             "Linears run W8A8 like production; the output gemm_type column "
+             "becomes w8a8_dynamic, matching what the w8a8 model queries.",
+    )
     args = parser.parse_args()
 
     print("Initializing vLLM + Ascend context...")
@@ -498,6 +520,7 @@ def main():
             bench_iters=args.bench_iters,
             force_mla=args.force_mla,
             num_heads_override=args.num_heads_override,
+            quantization=args.quantization,
         )
         return
 
@@ -529,6 +552,7 @@ def main():
                 bench_iters=args.bench_iters,
                 force_mla=args.force_mla,
                 num_heads_override=args.num_heads_override,
+                quantization=args.quantization,
             )
         except Exception as e:
             print(f"  FAILED b={b}, s={s}: {e}")

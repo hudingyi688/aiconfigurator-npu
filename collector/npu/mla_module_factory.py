@@ -194,6 +194,12 @@ class DsaModuleSpec:
                               # collects the TP=2/4/8/16 working set (heads
                               # 32/16/8/4) without launching real distributed
                               # ranks. None = use the model's full head count.
+    quantization: str | None = None  # vllm quantization mode. None = bf16
+                              # baseline. "ascend" = keep the W8A8 quant_config
+                              # vllm builds from a real w8a8 model dir, so the
+                              # MLA projection Linears run W8A8 like production
+                              # (gemm_type column becomes w8a8_dynamic, matching
+                              # what the GLM-5-w8a8 model queries at runtime).
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -245,6 +251,7 @@ def _create_npu_vllm_config(
     num_kv_cache_blocks: int,
     max_num_seqs: int,
     max_num_batched_tokens: int,
+    quantization: str | None = None,
 ):
     """Create a VllmConfig suitable for NPU module-level benchmarking.
 
@@ -273,6 +280,7 @@ def _create_npu_vllm_config(
         seed=0,
         max_model_len=max_model_len,
         enforce_eager=True,
+        quantization=quantization,
     )
 
     cache_config = CacheConfig(
@@ -322,8 +330,11 @@ def _create_npu_vllm_config(
     )
 
     init_ascend_config(vllm_config)
-    # bf16 baseline — no quantization. W8A8 follow-up can replace this.
-    vllm_config.quant_config = None
+    # quantization=None -> bf16 baseline (clear any auto-detected quant_config).
+    # quantization="ascend" -> keep the w8a8 quant_config vllm built from the
+    # model dir, so DSA module projection Linears run W8A8 like production.
+    if quantization is None:
+        vllm_config.quant_config = None
     return vllm_config
 
 
@@ -360,6 +371,7 @@ def _build_attention_module(
     device: str,
     force_mla: bool = False,
     num_heads_override: int | None = None,
+    quantization: str | None = None,
 ):
     """Build a DeepseekV2MLAAttention module with real vllm-ascend wiring.
 
@@ -418,6 +430,7 @@ def _build_attention_module(
         num_kv_cache_blocks=num_kv_cache_blocks,
         max_num_seqs=max_batch_size,
         max_num_batched_tokens=max_num_batched_tokens,
+        quantization=quantization,
     )
 
     # vllm-ascend registers AscendMultiHeadLatentAttention / AscendRMSNorm /
@@ -882,6 +895,7 @@ def create_dsa_module_func(
         device=device,
         force_mla=spec.force_mla,
         num_heads_override=spec.num_heads_override,
+        quantization=spec.quantization,
     )
 
     # 2. Post-load hooks (FP8 packing, W_UK_T materialisation, etc).
