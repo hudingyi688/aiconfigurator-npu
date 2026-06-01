@@ -104,9 +104,10 @@ def test_query_overlap_override_scales_device_total(db):
 
 
 def test_query_default_overlap_is_calibrated_factor(db):
-    # default overlap is calibrated to 0.60 from profiler step wall-clock
-    # (isl=10k real prefill = 2754ms); query == device_total x 0.60.
-    assert DEFAULT_OVERLAP == pytest.approx(0.60)
+    # default overlap calibrated to 0.86 from profiler time-axis: net KV
+    # wall-clock (span − compute union) / device_total is stable ~0.86 across
+    # isl 10k/20k. query == device_total x 0.86.
+    assert DEFAULT_OVERLAP == pytest.approx(0.86)
     got = float(db.query_kv_transfer(20000, 16))
     assert got == pytest.approx(EP16_20000 * DEFAULT_OVERLAP)
 

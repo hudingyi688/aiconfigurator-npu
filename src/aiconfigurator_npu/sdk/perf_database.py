@@ -4787,26 +4787,31 @@ class PerfDatabase:
         return PerformanceResult(result, energy=0.0)
 
     # Fraction of the DEVICE-accumulated KV-transfer time that lands on the
-    # critical-path TTFT. CALIBRATED against the profiler's true per-step
-    # wall-clock, NOT the KV-kernel union (the earlier 1.0 was wrong — it
-    # measured KV-vs-KV overlap only and missed that KV kernels run on
-    # separate streams that overlap with compute and with each other).
+    # critical-path TTFT. CALIBRATED per-time-axis against profiler, NOT a
+    # single-point scalar fudge.
     #
-    # Ground truth: profiler step_trace_time.csv + kernel_details time-axis
-    # span agree exactly on real single-request prefill wall-clock:
-    #   isl=10k -> 2754 ms, isl=20k -> 3833 ms (ep16).
-    # Note sum-of-kernel-durations (6828 ms at 10k) >> wall-clock (2754 ms),
-    # proving heavy cross-stream overlap. Backing the factor out of
-    #   model_compute + device_total x factor = real_wall_clock :
-    #   isl=10k: (2754-1014)/2896 = 0.60   isl=20k: (3833-2923)/3999 = 0.23.
-    # We anchor on isl=10k (0.60): it is the strictest TTFT tier and its
-    # compute estimate is the most trustworthy (the isl=20k compute term is
-    # itself inflated, which is why its back-out is lower). At isl>=20k this
-    # factor makes the prediction conservative (~+39% at 20k), i.e. safe for
-    # SLO sizing. Re-fit when isl>20k KV-transfer data + a per-isl bench TTFT
-    # are available. Together with the per-op sum this supersedes the legacy
-    # _AUTOSCALE_TTFT_CORRECTION_FACTOR=1.8 magic for the prefill side.
-    _KV_TRANSFER_OVERLAP_FACTOR = 0.60
+    # Method: from kernel_details.csv we split each prefill run's timeline into
+    # KV-transfer kernels vs compute kernels (AI_CORE/AI_VECTOR_CORE) and
+    # measure, by interval union, how much of the KV time is NOT hidden behind
+    # compute (KV-exclusive + the KV scheduling gaps that belong to the
+    # critical path). Net KV wall-clock = real prefill span − profiler compute
+    # union:
+    #   ep16 isl=10k: span 2754 − compute 259 = 2495 ms  → 2495/2896 = 0.862
+    #   ep16 isl=20k: span 3833 − compute 395 = 3438 ms  → 3438/3999 = 0.860
+    # The ratio is STABLE at ~0.86 across isl (unlike the naive back-out which
+    # gave 0.60/0.23 — that divergence came from using the model's HYBRID
+    # compute estimate, which is itself inflated, not from KV). So 0.86 is the
+    # physically-grounded exposed fraction: ~14% of KV device time overlaps
+    # compute, the rest is on the critical path.
+    #
+    # NOTE — independent issue, do NOT absorb here: the model's prefill compute
+    # (esp. context DSA attention at TP>1, which falls back to HYBRID SOL) is
+    # itself overestimated (~807 ms modeled vs ~259 ms profiler compute union),
+    # so model prefill_ttff = inflated_compute + KV×0.86 runs ~+27% high at
+    # isl=10k. That gap is the TP>1 DSA silicon data gap (see report §2.3), not
+    # a KVTransfer error — fixing it by lowering this factor would hide one
+    # error behind another. Re-fit when isl>20k KV data + TP>1 DSA silicon land.
+    _KV_TRANSFER_OVERLAP_FACTOR = 0.86
 
     @functools.lru_cache(maxsize=4096)
     def query_kv_transfer(
