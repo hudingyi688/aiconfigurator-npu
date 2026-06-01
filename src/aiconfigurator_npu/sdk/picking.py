@@ -33,9 +33,25 @@ _RATE_MATCHING_PREFILL_DEGRADATION_FACTOR = 0.9
 # comes from not saturating the batchsize slot of decode worker
 _RATE_MATCHING_DECODE_DEGRADATION_FACTOR = 0.92
 
-# TTFT correction for concurrent prefill queueing: with N=10 batches and
-# local concurrency lc=15-20, formula lc/20+0.95 gives ~1.8
-_AUTOSCALE_TTFT_CORRECTION_FACTOR = 1.8
+# TTFT concurrent-queueing correction — DISABLED (set to 1.0).
+#
+# The legacy 1.8 came from a queueing approximation
+#   correction = (lc·(lc+1)/2 + lc·(N-1)) / (lc·N) = (lc+1)/(2N) + (N-1)/N
+# with BOTH parameters hard-coded (local concurrency lc≈15-20, batches N=10).
+# That derivation is not rigorous: the first-batch term alone is (lc+1)/2 =
+# 8-10× at lc=15-20, and it is only dragged down to 1.8 by the steady-state
+# assumption in the N−1 term — i.e. 1.8 is "tuned", not measured, and depends
+# on two unsourced constants. We have no production concurrent-TTFT data to
+# calibrate it against (bench TTFT was not saved).
+#
+# So we do NOT multiply TTFT by it: SLO search compares the single-request
+# TTFT (profiler-validated: isl=10k→2754ms, isl=20k→3833ms) directly against
+# the P50 TTFT target — at low concurrency the P50 is close to the
+# single-request value anyway. Concurrent queueing is reported as a separate
+# risk note, not folded into a magic multiplier. Re-introduce a proper model
+# (lc from concurrency/num_workers, N from real traffic) only with measured
+# concurrent-TTFT to back it.
+_AUTOSCALE_TTFT_CORRECTION_FACTOR = 1.0
 
 
 # ---------------------------------------------------------------------------

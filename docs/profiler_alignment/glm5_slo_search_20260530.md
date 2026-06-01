@@ -28,10 +28,14 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 > `*` isl>20k 超出 KV 标定网格（净KV clamp 在 20k 值 2571ms）+ compute 随 isl 增长，仅外推参考。
 > `**` 模型单请求在 isl≥20k 偏高，纯因 prefill compute 高估（DSA TP>1 走 HYBRID SOL；档1 实测 compute 259ms vs 模型 1014ms），**与 KV 无关**——净KV 已是实测值。修 TP>1 DSA silicon 后收敛。
 
-**核心结论**：档2（isl 10–20k）单请求真实墙钟 **3833ms < SLO 5000ms = 达标**；档1（isl=10k）单请求 2754ms 略超 SLO 2000ms（即使零并发也因 KV 净墙钟 1679ms + compute 而超）。叠加并发排队（×1.8）后各档端到端 TTFT 超 SLO。TPOT 全档 ~81ms 超 70ms（decode 算子固有，见后）。
+**核心结论**：去掉两个不实的 factor（KV overlap_factor、TTFT 并发修正 ×1.8）后，SLO 偏差被干净归因到唯一真实数据缺口——**TP>1 DSA compute 高估**：
 
+- **档2（isl 10–20k）**：单请求真实墙钟 **3833ms < SLO 5000ms = 达标**。但模型因 prefill compute 高估（DSA TP16 走 HYBRID = 2923ms vs profiler 实测 ~395ms）算出 5494ms 被判超；若 compute 准确，prefill = 395+2571(净KV) = **2966ms < 5000 达标**。
+- **档1（isl=10k）**：单请求真实墙钟 2754ms 略超 SLO 2000ms，即使 compute 准确，净 KV 1679ms + 真实 compute 已接近 2000ms，是物理下限。
+- **TPOT**：小 batch 可达标（decode bs≤3 时 TPOT 64.9ms<70；bs=4 起 79.9ms 超）。寻优应在 TPOT<70 约束下取最大可行 decode bs（=3）。
+- **并发排队**：不再乘 ×1.8（该 factor 的 lc、N 两参数都写死无依据，见 picking.py 注释）。P50 TTFT 在低并发下接近单请求值；高并发排队作为单独风险项，需生产实测 TTFT 才能可信建模。
 
-> 单请求为 profiler 实测（最可信）。模型预测因 prefill DSA compute 高估偏高 ~27%（修 TP>1 DSA 数据后收敛）。`*` 标记 isl>20k 超 KVTransfer 网格，外推偏保守。并发场景叠加 ×1.8 排队修正。
+> 修 TP>1 DSA silicon 数据后，档2 模型即与真实墙钟收敛、判为达标。这是当前唯一阻塞 SLO 寻优产出"满足约束配置"的数据缺口。
 
 ## TTFT 归因（按 profiler 时间轴累加）
 
