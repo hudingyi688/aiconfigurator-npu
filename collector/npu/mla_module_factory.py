@@ -272,6 +272,16 @@ def _create_npu_vllm_config(
     )
     from vllm_ascend.ascend_config import init_ascend_config
 
+    # "ascend" is not a native vllm quantization method — vllm-ascend registers
+    # it via @register_quantization_config on AscendModelSlimConfig, which the
+    # full `vllm serve` path triggers but this trimmed collector path does not.
+    # Import it here (lazy in vllm_ascend.quantization.__init__) so ModelConfig
+    # accepts quantization="ascend"; otherwise pydantic rejects it as unknown.
+    if quantization == "ascend":
+        from vllm_ascend.quantization import (  # noqa: F401
+            AscendModelSlimConfig,
+        )
+
     model_config = ModelConfig(
         model=model_name,
         tokenizer=model_name,
