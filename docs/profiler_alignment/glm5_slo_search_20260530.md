@@ -16,14 +16,20 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 
 ## 各档实测最优（disagg）vs SLO
 
-> 下表"单请求真实墙钟"为 profiler 实测 ground truth（step_trace + kernel 跨度两口径吻合）；"模型预测"含 compute 高估（+27%），偏保守。
+> "单请求真实墙钟"为 profiler 实测 ground truth（仅档1/档2 在 KV 标定网格内）；"模型单请求"= compute + 净KV实测；"含并发"= ×1.8 排队修正后的端到端 TTFT。配置：2P2D / 64 卡，prefill tp16(档1/2)或 tp32(档3/4)，decode tp4/dp8/ep32。
 
-| 档 | isl | SLO TTFT | 单请求真实墙钟(profiler) | 模型预测(含compute高估) | TPOT(SLO<70) | prefill | decode |
+| 档 | isl | SLO TTFT | 单请求真实墙钟 | 模型单请求 | 含并发 TTFT | TPOT(<70) | 单请求判定 |
 |---|---|---|---|---|---|---|---|
-| 档1 | 0–10k | <2000ms | **2754ms**（超1.4×） | ~3504ms | 85.5ms ✗ | tp16/ep16 | tp4/dp8/ep32 |
-| 档2 | 10–20k | <5000ms | **3833ms ✓达标** | ~6362ms | 86.7ms ✗ | tp16/ep16 | tp4/dp8/ep32 |
-| 档3 | 20–40k | <8000ms | ~6000ms* | OOM→tp32 | 81.2ms ✗ | tp32/ep32 | tp4/dp8/ep32 |
-| 档4 | 40–80k | <10000ms | 偏保守* | tp32 | 83.0ms ✗ | tp32/ep32 | tp4/dp8/ep32 |
+| 档1 | 0–10k | <2000ms | **2754ms** | 2693ms (-2%) | 5332ms | 81.2ms ✗ | ✗ 超(KV净1679+compute) |
+| 档2 | 10–20k | <5000ms | **3833ms** | 5494ms** | 10879ms | 81.0ms ✗ | **✓ 达标** |
+| 档3 | 20–40k | <8000ms | 外推* | 12028ms** | 23816ms | 81.2ms ✗ | 外推* |
+| 档4 | 40–80k | <10000ms | 外推* | 37354ms** | 73961ms | 83.0ms ✗ | 外推* |
+
+> `*` isl>20k 超出 KV 标定网格（净KV clamp 在 20k 值 2571ms）+ compute 随 isl 增长，仅外推参考。
+> `**` 模型单请求在 isl≥20k 偏高，纯因 prefill compute 高估（DSA TP>1 走 HYBRID SOL；档1 实测 compute 259ms vs 模型 1014ms），**与 KV 无关**——净KV 已是实测值。修 TP>1 DSA silicon 后收敛。
+
+**核心结论**：档2（isl 10–20k）单请求真实墙钟 **3833ms < SLO 5000ms = 达标**；档1（isl=10k）单请求 2754ms 略超 SLO 2000ms（即使零并发也因 KV 净墙钟 1679ms + compute 而超）。叠加并发排队（×1.8）后各档端到端 TTFT 超 SLO。TPOT 全档 ~81ms 超 70ms（decode 算子固有，见后）。
+
 
 > 单请求为 profiler 实测（最可信）。模型预测因 prefill DSA compute 高估偏高 ~27%（修 TP>1 DSA 数据后收敛）。`*` 标记 isl>20k 超 KVTransfer 网格，外推偏保守。并发场景叠加 ×1.8 排队修正。
 
