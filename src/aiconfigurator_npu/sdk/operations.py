@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import math
 from typing import Optional
 
 from aiconfigurator_npu.sdk import common
@@ -1656,24 +1657,49 @@ class ContextDSAModule(Operation):
         self._weights = 0.0
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        """Query context DSA latency with energy data."""
+        """Query context DSA latency with energy data.
+
+        DSA silicon is collected per chunked-prefill STEP: each row is the
+        latency of one step that processes ``dsa_chunk_size`` new query tokens
+        against the cumulative KV (the row's isl = cumulative KV length). A
+        full prefill of ``isl`` tokens runs ceil(isl / dsa_chunk_size) such
+        steps, where step k attends to min((k+1)*chunk, isl) cumulative KV. We
+        therefore sum the per-step silicon over those cumulative-KV points
+        rather than querying the full isl once (which would model a single
+        giant non-chunked attention and overestimate ~19x — see
+        collector/npu/mla_module_factory.py --chunk-query-len).
+
+        dsa_chunk_size defaults to 4096 (production max_num_batched_tokens, the
+        granularity the silicon was collected at).
+        """
         batch_size = kwargs.get("batch_size")
         isl = kwargs.get("s")
         prefix = kwargs.get("prefix", 0)
+        chunk = kwargs.get("dsa_chunk_size", 4096)
 
-        result = database.query_context_dsa_module(
-            b=batch_size,
-            s=isl,
-            prefix=prefix,
-            num_heads=self._num_heads,
-            kvcache_quant_mode=self._kvcache_quant_mode,
-            fmha_quant_mode=self._fmha_quant_mode,
-            gemm_quant_mode=self._gemm_quant_mode,
-            architecture=self._architecture,
-        )
+        # Cumulative-KV length at the end of each prefill step.
+        num_steps = max(1, math.ceil(isl / chunk))
+        step_kvs = [min((k + 1) * chunk, isl) for k in range(num_steps)]
+
+        latency = 0.0
+        energy = 0.0
+        for kv in step_kvs:
+            r = database.query_context_dsa_module(
+                b=batch_size,
+                s=kv,
+                prefix=prefix,
+                num_heads=self._num_heads,
+                kvcache_quant_mode=self._kvcache_quant_mode,
+                fmha_quant_mode=self._fmha_quant_mode,
+                gemm_quant_mode=self._gemm_quant_mode,
+                architecture=self._architecture,
+            )
+            latency += float(r)
+            energy += r.energy
+
         return PerformanceResult(
-            float(result) * self._scale_factor,
-            energy=result.energy * self._scale_factor,
+            latency * self._scale_factor,
+            energy=energy * self._scale_factor,
         )
 
     def get_weights(self, **kwargs):
