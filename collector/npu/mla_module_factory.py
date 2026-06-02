@@ -200,6 +200,15 @@ class DsaModuleSpec:
                               # MLA projection Linears run W8A8 like production
                               # (gemm_type column becomes w8a8_dynamic, matching
                               # what the GLM-5-w8a8 model queries at runtime).
+    chunk_query_len: int | None = None  # Context only. None = full-seq one-shot
+                              # prefill (query=seq_len, PrefillNoCache). Set to
+                              # the per-step query window (e.g. 256, the
+                              # profiler-observed SFA micro-batch) to model
+                              # CHUNKED prefill: q new tokens attending to
+                              # seq_len cumulative KV. Full-seq overestimates
+                              # per-layer DSA ~19x because sparse-flash scales
+                              # with query×topk; production processes only a
+                              # small query window per SFA call.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -693,6 +702,7 @@ def _create_common_attn_metadata(
     block_size: int,
     num_blocks: int,
     device: str,
+    chunk_query_len: int | None = None,
 ):
     """Synthesise AscendCommonAttentionMetadata for one benchmark point.
 
@@ -705,10 +715,25 @@ def _create_common_attn_metadata(
     from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
     if is_context:
-        query_lens = [seq_len] * batch_size
-        seq_lens_list = [seq_len] * batch_size
-        num_input_tokens = batch_size * seq_len
-        attn_state = AscendAttentionState.PrefillNoCache
+        if chunk_query_len is not None:
+            # Chunked-prefill micro-batch: process `chunk_query_len` NEW query
+            # tokens attending to `seq_len` cumulative KV (the prefix already in
+            # cache). This is the production SFA shape — a small fixed query
+            # window against a large sparse KV — NOT a full-seq one-shot
+            # prefill. PrefillNoCache + query=full_isl makes the sparse-flash
+            # kernel scale ~linearly with isl (query×topk) and overestimates
+            # per-layer DSA ~19x vs production, where each SFA call handles only
+            # the micro-batch query window.
+            q = min(chunk_query_len, seq_len)
+            query_lens = [q] * batch_size
+            seq_lens_list = [seq_len] * batch_size
+            num_input_tokens = batch_size * q
+            attn_state = AscendAttentionState.ChunkedPrefill
+        else:
+            query_lens = [seq_len] * batch_size
+            seq_lens_list = [seq_len] * batch_size
+            num_input_tokens = batch_size * seq_len
+            attn_state = AscendAttentionState.PrefillNoCache
     else:
         query_lens = [1] * batch_size
         seq_lens_list = [seq_len] * batch_size
@@ -744,13 +769,27 @@ def _create_common_attn_metadata(
 
     # positions: one int64 per input token.
     if is_context:
-        positions = (
-            torch.arange(seq_len, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-            .reshape(-1)
-            .contiguous()
-        )
+        if chunk_query_len is not None:
+            # Chunked: the q query tokens sit at the END of the seq_len window
+            # (positions [seq_len-q, seq_len)) — they are the new tokens
+            # appended after the cached prefix. Length must match
+            # num_input_tokens (batch_size * q), not batch_size * seq_len.
+            q = min(chunk_query_len, seq_len)
+            positions = (
+                torch.arange(seq_len - q, seq_len, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .reshape(-1)
+                .contiguous()
+            )
+        else:
+            positions = (
+                torch.arange(seq_len, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .reshape(-1)
+                .contiguous()
+            )
     else:
         positions = torch.full(
             (batch_size,), seq_len - 1, dtype=torch.long, device=device
@@ -785,6 +824,7 @@ def _create_kv_cache_and_metadata(
     is_context: bool,
     device: str,
     force_mla: bool = False,
+    chunk_query_len: int | None = None,
 ):
     """Create the KV cache tuple and attention metadata.
 
@@ -844,6 +884,7 @@ def _create_kv_cache_and_metadata(
         block_size=block_size,
         num_blocks=num_blocks,
         device=device,
+        chunk_query_len=chunk_query_len,
     )
 
     kv_cache_spec = MLAAttentionSpec(
@@ -920,6 +961,7 @@ def create_dsa_module_func(
             is_context=is_context,
             device=device,
             force_mla=spec.force_mla,
+            chunk_query_len=spec.chunk_query_len,
         )
 
     # 4. Bind KV cache to the attn layer so its forward() can read it.
@@ -931,14 +973,27 @@ def create_dsa_module_func(
     # 5. Hidden states + positions inputs.
     hidden_size = vllm_config.model_config.hf_config.hidden_size
     if is_context:
-        num_tokens = spec.batch * spec.seq_len
-        positions = (
-            torch.arange(spec.seq_len, device=device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(spec.batch, -1)
-            .reshape(-1)
-            .contiguous()
-        )
+        if spec.chunk_query_len is not None:
+            # Chunked prefill: q new query tokens (must match metadata's
+            # num_input_tokens = batch * q and the positions window).
+            q = min(spec.chunk_query_len, spec.seq_len)
+            num_tokens = spec.batch * q
+            positions = (
+                torch.arange(spec.seq_len - q, spec.seq_len, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(spec.batch, -1)
+                .reshape(-1)
+                .contiguous()
+            )
+        else:
+            num_tokens = spec.batch * spec.seq_len
+            positions = (
+                torch.arange(spec.seq_len, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(spec.batch, -1)
+                .reshape(-1)
+                .contiguous()
+            )
     else:
         num_tokens = spec.batch
         positions = torch.full(

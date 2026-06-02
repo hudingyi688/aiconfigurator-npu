@@ -356,6 +356,7 @@ def run_dsa_module(
     force_mla: bool = False,
     num_heads_override: int | None = None,
     quantization: str | None = None,
+    chunk_query_len: int | None = None,
 ) -> float | None:
     """Benchmark one (seq_len, batch_size) point for DSA module on NPU."""
     is_context = mode == "context"
@@ -381,6 +382,7 @@ def run_dsa_module(
         force_mla=force_mla,
         num_heads_override=num_heads_override,
         quantization=quantization,
+        chunk_query_len=chunk_query_len,
     )
 
     try:
@@ -501,6 +503,16 @@ def main():
              "Linears run W8A8 like production; the output gemm_type column "
              "becomes w8a8_dynamic, matching what the w8a8 model queries.",
     )
+    parser.add_argument(
+        "--chunk-query-len",
+        type=int,
+        default=None,
+        help="Context only. Per-step query window for CHUNKED prefill (e.g. 256, "
+             "the profiler-observed SFA micro-batch). Models q new tokens "
+             "attending to seq_len cumulative KV — matches production sparse "
+             "flash attention. Omit for legacy full-seq one-shot prefill "
+             "(query=seq_len), which overestimates per-layer DSA ~19x.",
+    )
     args = parser.parse_args()
 
     print("Initializing vLLM + Ascend context...")
@@ -521,6 +533,7 @@ def main():
             force_mla=args.force_mla,
             num_heads_override=args.num_heads_override,
             quantization=args.quantization,
+            chunk_query_len=args.chunk_query_len,
         )
         return
 
@@ -553,6 +566,7 @@ def main():
                 force_mla=args.force_mla,
                 num_heads_override=args.num_heads_override,
                 quantization=args.quantization,
+                chunk_query_len=args.chunk_query_len,
             )
         except Exception as e:
             print(f"  FAILED b={b}, s={s}: {e}")
