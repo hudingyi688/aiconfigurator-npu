@@ -7,10 +7,10 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 
 ## 结论速览
 
-DSA prefill 已改为**实测 chunked 数据**（NPU 采集 w8a8/num_heads=4，按 ceil(isl/4096) 个 prefill step 累加），取代之前 full-seq 高估或 HYBRID SOL 估算。基于此重跑 4 档：
+DSA prefill 已改为**实测 chunked 数据**（NPU 采集 w8a8，num_heads=4/2 对应 tp16/tp32，按 ceil(isl/4096) 个 prefill step 累加），取代之前 full-seq 高估或 HYBRID SOL 估算。基于此重跑 4 档：
 
-- **4 档 prefill TTFT 全部超 SLO**；TPOT 全档 ~87ms 超 70ms。
-- **关键认知更新**：chunked 修正后 **DSA（稀疏注意力，随 isl 线性增长的 per-step 重算）成为 prefill 主导项**，超过 KV transfer——推翻了之前"KV transfer 占 prefill 87%"的旧结论（那基于 full-seq 错误数据）。
+- **4 档 prefill TTFT 全部超 SLO**（超 1.8×~4.4×）；TPOT 全档 ~87ms 超 70ms。
+- **关键认知更新**：chunked 修正后 **DSA（稀疏注意力，随 isl 线性增长的 per-step 重算）成为 prefill 主导项**（占 64%~92%），超过 KV transfer——推翻了之前"KV transfer 占 prefill 87%"的旧结论（那基于 full-seq 错误数据）。
 
 ## 各档实测对比（disagg prefill，2P2D / 64 卡）
 
@@ -20,12 +20,10 @@ DSA prefill 已改为**实测 chunked 数据**（NPU 采集 w8a8/num_heads=4，�
 |---|---|---|---|---|---|---|---|---|---|---|
 | 档1 | 0–10k | tp16/ep16 | 4 (命中) | <2000ms | **5201ms** | **2.6× 超** | 3315ms | 1679ms | 207ms | 🟢 可信 |
 | 档2 | 10–20k | tp16/ep16 | 4 (命中) | <5000ms | **9024ms** | **1.8× 超** | 6153ms | 2571ms | 300ms | 🟢 可信 |
-| 档3 | 20–40k | tp32/ep32 | 2 (外推) | <8000ms | 40419ms | 5.1× 超 | 37364ms | 2571ms | 484ms | 🔴 不可信 |
-| 档4 | 40–80k | tp32/ep32 | 2 (外推) | <10000ms | 263416ms | 26× 超 | 259989ms | 2571ms | 856ms | 🔴 不可信 |
+| 档3 | 20–40k | tp32/ep32 | 2 (命中) | <8000ms | **18020ms** | **2.3× 超** | 14965ms | 2571ms | 484ms | 🟢 可信 |
+| 档4 | 40–80k | tp32/ep32 | 2 (命中) | <10000ms | **44382ms** | **4.4× 超** | 40955ms | 2571ms | 856ms | 🟢 可信 |
 
-> 可信度说明：
-> - 🟢 **档1/档2**：prefill tp16 → num_heads=4，**精确命中** silicon 表采集点，DSA 数据可信。
-> - 🔴 **档3/档4**：prefill tp16 在 isl≥40k **OOM**（KV cache 装不下），只能用 tp32；但 tp32 → num_heads=2 **落在 silicon 表 {4,64} 范围外**，DSA 外推失真（260s 是 artifact，非真实）。
+> 全 4 档 num_heads（tp16→4、tp32→2）均**精确命中** silicon 采集点，DSA 数据可信。补采 num_heads=2 后，档3/档4 从之前外推 artifact（40s/260s）修正为真实值（18s/44s）。注：num_heads=2 与 4 延迟接近（DSA module 在小头数区由投影 GEMM/量化/KV 访存主导，非头数本身），这正是之前外推到 {4,64} 区间外失真的原因。
 
 ## TPOT（decode 侧）
 
@@ -37,21 +35,20 @@ decode TPOT 主要由 MoE dispatch + GEMM 单步固有延迟决定，降 batch �
 
 ## 各档 GAP 分析
 
-| 档 | 主要 GAP | 量化 | 性质 |
-|---|---|---|---|
-| 档1 | DSA(3.3s) + KV(1.7s) 已超 SLO 2s | prefill 5.2s vs 2s | DSA 主导，物理瓶颈 |
-| 档2 | DSA(6.2s) 单项就超 SLO 5s | prefill 9s vs 5s | DSA 主导 |
-| 档3/档4 | 数据缺口（num_heads=2 未采）+ tp16 OOM | 无法可信评估 | 数据/内存模型缺口 |
-| 全档 | TPOT 87ms > 70ms | decode 算子固有 | 非并行可解 |
+| 档 | 实测 prefill | SLO | 超出 | 主因 |
+|---|---|---|---|---|
+| 档1 | 5.2s | 2s | 3.2s | DSA 3.3s 主导（占 64%）|
+| 档2 | 9.0s | 5s | 4.0s | DSA 6.2s 单项就超 SLO（占 68%）|
+| 档3 | 18.0s | 8s | 10.0s | DSA 15s 主导（占 83%）|
+| 档4 | 44.4s | 10s | 34.4s | DSA 41s 主导（占 92%）|
+| 全档 | TPOT 87ms | 70ms | 17ms | decode 算子固有，非并行可解 |
 
-**核心 GAP**：chunked 修正后 **DSA 是 prefill 的真实主导项**（档1 占 64%、档2 占 68%），且随 isl 线性增长（每 step 重算累积 KV 的 sparse attention）。降 prefill TTFT 的重点从"减 KV transfer"转向"减 DSA per-step 重算"。
+**核心 GAP**：chunked 修正后 **DSA 是 prefill 的绝对主导项**，占比随 isl 升高（64%→92%），且 DSA 随 isl 近线性增长（每 step 重算累积 KV 的 sparse attention）。降 prefill TTFT 的重点从"减 KV transfer"转向**"减 DSA per-step 重算"**。
 
-> ⚠️ 遗留验证：DSA 累加绝对值（档1 3.3s）的单算子实测可信，但**完整 prefill 累加结果缺单请求 profiler 端到端验证**（profiler 仅采样窗口）。相对趋势（DSA 随 isl 线性、超 KV）是 chunked 物理特性，方向可信。
+> ⚠️ 遗留验证：DSA 单 step、单算子延迟为真机实测（可信）；但**完整 prefill 的累加结果缺单请求 profiler 端到端验证**（现有 profiler 仅采样窗口）。各档相对趋势（DSA 主导、随 isl 增长）是 chunked 物理特性，方向可信；绝对值待端到端锚定。
 
 ## 下一步计划
 
-按优先级：
-
-1. **补采 num_heads=2（tp32）DSA 数据** —— 解锁档3/档4 的可信评估（当前 tp16 OOM、tp32 外推失真两头堵）。命令同前，加 `--num-heads-override 2`。
-2. **单请求 profiler 端到端验证**（遗留问题）—— 跑一个不并发的 isl=10k prefill profiler，数真实 SFA 总次数 + 完整 prefill ttft，锚定 DSA 累加公式（3.3s）和 KV transfer 的绝对值。这是消除所有"绝对值待验证"标注的唯一硬锚点。
-3. **SLO 可达性结论**（数据补全后）—— 当前档1/档2 可信地超 SLO，主因 DSA。若要达标需架构层优化（更激进稀疏 / 减 chunk 重算 / 降 TPOT 的 decode 算子优化），非配置寻优可解。
+1. **单请求 profiler 端到端验证**（遗留问题）—— 跑一个不并发的 isl=10k 完整 prefill profiler，数真实 SFA 总次数 + 完整 prefill TTFT，锚定 DSA 累加公式与 KV transfer 的绝对值。这是把 4 档从"趋势可信"升级到"数值可信"的唯一硬锚点。
+2. **SLO 达标方向** —— 4 档均可信地超 SLO，主因 DSA（占 64%~92%）。达标需架构层优化：更激进稀疏 / 减 chunk 重算（DSA）+ decode 算子优化（TPOT），**非配置寻优可解**。
+3. **配置形态结论** —— 当前数据支撑「相对排名 / 配置形态选择」可信用途；绝对 TTFT 达标判定待第 1 项验证。
