@@ -33,6 +33,19 @@ DSA prefill 已改为**实测 chunked 数据**（NPU 采集 w8a8，num_heads=4/2
 
 decode TPOT 主要由 MoE dispatch + GEMM 单步固有延迟决定，降 batch 也压不到 70ms 以下（isl 越大 KV 越多，TPOT 略升）。
 
+### decode TPOT 的 profiler 校验（batch=1 干净对账）
+
+用生产单请求 decode profiler（isl=10k，batch=1，num_heads=16）整体对账，发现模型 **TPOT 高估 ~1.6×**：
+
+| | 模型 batch=1 | profiler batch=1 实测 |
+|---|---|---|
+| 单步 TPOT | 52.7ms | **32.7ms** |
+| 构成 | MoE 27.6 + attention 24.3（串行相加）| compute 并集 29.1 + 通信 1.5 |
+
+**根因：模型把各 module（attention、MoE）silicon 值纯串行累加，但生产硬件在 module 间 / 层间多流并行**——profiler kernel 总和 76.3ms 被并行压缩到 30.6ms 并集（2.5× 压缩）。模型缺这个跨 module 并行折扣。
+
+> 校验澄清的几点：(1) 各 module 的 silicon 单值是准的（generation DSA 单层 silicon 310us vs profiler DSA module 184~301us，比值 1.0~1.7×，在 module 边界口径差异内，**非数量级高估**）；(2) 之前怀疑的 "KV pool batch_get 70ms 主导 TPOT" 不成立——batch=1 run 根本无 batch_get 也能正常跑，它非必需主导项，且两 profiler（batch 1 vs 7）batch 不可比，无法隔离其贡献；(3) TPOT 真实缺口是 **module 间并行未建模**，需实测驱动的并行折扣（kernel 和 vs 并集 ≈2.5×，待多 batch/配置验证），不是单个算子或 KV pool。
+
 ## 各档 GAP 分析
 
 | 档 | 实测 prefill | SLO | 超出 | 主因 |
