@@ -208,7 +208,7 @@ SUPPORTED_MODELS: dict[str, str] = {
 _CONTEXT_BATCH_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 _CONTEXT_SEQ_LIST = [
     1, 16, 32, 64, 128, 256, 512, 1024, 1536, 2048,
-    3072, 4096, 6144, 8192, 10240, 12288, 16384, 32768,
+    3072, 4096, 6144, 8192, 10240, 12288, 16384, 20480, 32768,
 ]
 _GENERATION_BATCH_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 _GENERATION_SEQ_LIST = [
@@ -485,12 +485,13 @@ def main():
         "--num-heads-override",
         type=int,
         default=None,
-        help="Override attention head count to emulate the per-rank head split "
-             "under TP>1 (heads = num_attention_heads // tp). GLM-5 has 64 heads, "
-             "so use 32/16/8/4 for TP=2/4/8/16. The DSA module is a single-rank "
-             "op driven by head count, so this collects the TP>1 working set "
-             "without launching distributed ranks. Output rows carry this head "
-             "count; the perf DB matches on num_heads at query time.",
+        help="Override attention head count. NOTE: GLM-5 DSA PREFILL uses Context "
+             "Parallelism (sequence-dim split via all-to-all), NOT tensor-parallel "
+             "head split — every rank keeps ALL 64 heads, so use 64 for prefill "
+             "regardless of TP (verified: 32-rank tp16 profiler all show SFA nh=64). "
+             "DECODE does use head split (tp4 -> 16). The DSA module is a single-rank "
+             "op driven by head count; output rows carry this head count and the perf "
+             "DB matches on num_heads at query time.",
     )
     parser.add_argument(
         "--quantization",
@@ -507,11 +508,12 @@ def main():
         "--chunk-query-len",
         type=int,
         default=None,
-        help="Context only. Per-step query window for CHUNKED prefill (e.g. 256, "
-             "the profiler-observed SFA micro-batch). Models q new tokens "
-             "attending to seq_len cumulative KV — matches production sparse "
-             "flash attention. Omit for legacy full-seq one-shot prefill "
-             "(query=seq_len), which overestimates per-layer DSA ~19x.",
+        help="Context only. Per-step query window for CHUNKED prefill. Production "
+             "value = max_num_batched_tokens / cp_size = 4096 / 16 = 256 (verified: "
+             "profiler SFA shape first dim = 256). Models q new tokens attending to "
+             "seq_len cumulative KV — matches production sparse flash attention. "
+             "Omit for legacy full-seq one-shot prefill (query=seq_len), which "
+             "overestimates per-layer DSA ~19x.",
     )
     args = parser.parse_args()
 
