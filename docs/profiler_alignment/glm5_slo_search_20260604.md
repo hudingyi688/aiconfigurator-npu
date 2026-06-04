@@ -41,10 +41,14 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 | 档3 | ~40k | tp32/ep32/dp1 | **3549ms** | 485ms | 2571ms* | 493ms | 14% | 🟡 |
 | 档4 | ~80k | tp32/ep32/dp1 | **4473ms** | 1029ms | 2571ms* | 873ms | 23% | 🟡 |
 
-> **\* KV transfer 在档3/4 被 clamp**：KV-transfer 实测表仅标定到 isl=20k，isl>20k
-> 持平在 20k 值（2571ms），是下界近似。档3/4 的 prefill 总值因此**偏低**（真实
-> KV transfer 随 isl 增长），标 🟡。DSA 部分仍可信（表覆盖到 KV=20480，且 SFA
-> 已饱和、indexer 线性外推稳定）。
+> **\* KV transfer 在 isl>20k 用线性外推（2026-06-04 改，原为 clamp 持平）**：实测表
+> 仅标定到 isl=20k，原先 isl>20k 持平在 20k 值（2571ms）严重低估。现按顶部两点
+> 线性外推（KV-transfer ~线性于 isl：chunk 数线性、per-call 延迟近常数）：
+> isl=40k→4354ms，80k→7921ms。仅 2 点拟合斜率，是有物理依据的**估计非实测**，标 🟡。
+> 注意：**agg 模式不付 KV transfer**（KVTransfer 仅在 disagg prefill 计费），故上表
+> agg 最优值不受外推影响；外推让 disagg 路径 TTFT 更准（更高），强化了「disagg 在这些
+> SLO 下不划算」的结论（档3 disagg 外推后因 TTFT 超 8000 无解）。DSA 部分仍可信
+> （表覆盖到 KV=20480，SFA 已饱和、indexer 线性外推稳定）。
 
 ## DSA 的端到端锚定（本版核心证据）
 
@@ -142,8 +146,10 @@ qk_rope64 + indexer128，×78 层 ×2B），单请求 KV 随 isl 线性涨：
 
 ## 已知不可信区 / 待办
 
-1. **isl>20k 的 KV transfer**：表仅到 20k，档3/4 持平为下界近似 → prefill 总偏低。
-   需补采 isl=40k/80k 的 KV-transfer profiler 才能让档3/4 数值可信。
+1. **isl>20k 的 KV transfer**：表仅到 20k，已改为线性外推（顶部两点斜率，
+   isl=40k→4354ms / 80k→7921ms）替代原 clamp 持平。是有物理依据的估计（chunk 数线性 +
+   per-call 近常数），但仅 2 点拟合斜率；补采 isl=40k/80k 的 KV-transfer profiler 可升级
+   为实测。注：agg 不付 KV transfer，此项只影响 disagg 路径的精度。
 2. **architecture dims 错配**：GLM-5 config 声明 `DeepseekV32ForCausalLM`，但实际
    dims（hidden6144/q_lora2048/v256/idx32）匹配 `GlmMoeDsaForCausalLM` 条目。投影
    SOL 当前用 DeepseekV32 dims，影响投影绝对值（~百 us/层级，占 DSA 小头）。DSA
