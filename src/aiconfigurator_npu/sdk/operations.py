@@ -1647,6 +1647,7 @@ class ContextDSAModule(Operation):
         fmha_quant_mode: common.FMHAQuantMode,
         gemm_quant_mode: common.GEMMQuantMode,
         architecture: str = "DeepseekV32ForCausalLM",
+        cp_size: int = 1,
     ) -> None:
         super().__init__(name, scale_factor)
         self._num_heads = num_heads
@@ -1654,23 +1655,39 @@ class ContextDSAModule(Operation):
         self._fmha_quant_mode = fmha_quant_mode
         self._gemm_quant_mode = gemm_quant_mode
         self._architecture = architecture
+        # Context-Parallel size for DSA prefill. GLM-5 splits the query/sequence
+        # dim across cp_size ranks (= tp_size) while keeping ALL heads, so each
+        # rank's per-step query window is dsa_chunk_size / cp_size. cp_size=1
+        # means no CP split (every other model / the legacy path).
+        self._cp_size = max(1, cp_size)
         self._weights = 0.0
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
-        """Query context DSA latency with energy data.
+        """Query context (prefill) DSA latency with energy data.
 
-        DSA silicon is collected per chunked-prefill STEP: each row is the
-        latency of one step that processes ``dsa_chunk_size`` new query tokens
-        against the cumulative KV (the row's isl = cumulative KV length). A
-        full prefill of ``isl`` tokens runs ceil(isl / dsa_chunk_size) such
-        steps, where step k attends to min((k+1)*chunk, isl) cumulative KV. We
-        therefore sum the per-step silicon over those cumulative-KV points
-        rather than querying the full isl once (which would model a single
-        giant non-chunked attention and overestimate ~19x — see
-        collector/npu/mla_module_factory.py --chunk-query-len).
+        Production GLM-5 prefill is chunked (max_num_batched_tokens=4096) AND
+        context-parallel: the 4096-token chunk is split across ``cp_size`` ranks
+        (= tp_size) along the sequence dim, so each rank processes a per-step
+        query window of ``chunk / cp_size`` NEW tokens (256 at CP16) while
+        keeping ALL heads. A full prefill of ``isl`` tokens runs
+        ceil(isl / chunk) steps; step k attends to min((k+1)*chunk, isl)
+        cumulative KV.
 
-        dsa_chunk_size defaults to 4096 (production max_num_batched_tokens, the
-        granularity the silicon was collected at).
+        Two regimes:
+
+        * **profiler-derived (preferred)** — when the profiler attention-core
+          table is loaded (GLM-5), per-layer cost for each step =
+          ``query_dsa_context_attn_core(cum_kv)`` (measured SFA+indexer+bmm+rope)
+          + ``query_context_dsa_projection_sol(per_step_q)`` (analytical
+          projection GEMMs). This replaces the synthetic whole-module silicon,
+          whose SFA kernel is unmeasurable on the collection box (binary
+          missing) and reads ~100-188x too low.
+
+        * **legacy** — otherwise, sum the whole-module ``query_context_dsa_module``
+          over cumulative-KV points (SOL/silicon), as before. Keeps non-GLM /
+          no-profiler-table systems working unchanged.
+
+        dsa_chunk_size defaults to 4096 (production max_num_batched_tokens).
         """
         batch_size = kwargs.get("batch_size")
         isl = kwargs.get("s")
@@ -1681,21 +1698,47 @@ class ContextDSAModule(Operation):
         num_steps = max(1, math.ceil(isl / chunk))
         step_kvs = [min((k + 1) * chunk, isl) for k in range(num_steps)]
 
+        attn_core_table = getattr(database, "_dsa_context_attn_core_data", None)
+        use_profiler = attn_core_table is not None and getattr(attn_core_table, "loaded", False)
+
         latency = 0.0
         energy = 0.0
-        for kv in step_kvs:
-            r = database.query_context_dsa_module(
-                b=batch_size,
-                s=kv,
-                prefix=prefix,
-                num_heads=self._num_heads,
-                kvcache_quant_mode=self._kvcache_quant_mode,
-                fmha_quant_mode=self._fmha_quant_mode,
-                gemm_quant_mode=self._gemm_quant_mode,
-                architecture=self._architecture,
+        if use_profiler:
+            # Per-rank query window under CP (sequence-dim split, all heads kept).
+            # The profiler attn-core table and the projection SOL are both
+            # measured at the FULL chunk window (query = chunk / cp_size, e.g.
+            # 256 at CP16). A trailing partial chunk processes fewer new tokens,
+            # and both the attention core (SFA + indexer ∝ query, verified ∝query
+            # to ~7% against profiler) and the projection GEMMs (∝ query) scale
+            # down linearly. So scale each step by (step new tokens / chunk).
+            proj_full = float(
+                database.query_context_dsa_projection_sol(
+                    q=max(1, chunk // self._cp_size),
+                    num_heads=self._num_heads,
+                    gemm_quant_mode=self._gemm_quant_mode,
+                    architecture=self._architecture,
+                )
             )
-            latency += float(r)
-            energy += r.energy
+            for k, kv in enumerate(step_kvs):
+                step_new_tokens = kv - k * chunk  # global new query this step
+                q_frac = max(0.0, min(1.0, step_new_tokens / chunk))
+                core = database.query_dsa_context_attn_core(cum_kv=kv)
+                latency += (float(core) + proj_full) * q_frac
+                energy += core.energy * q_frac
+        else:
+            for kv in step_kvs:
+                r = database.query_context_dsa_module(
+                    b=batch_size,
+                    s=kv,
+                    prefix=prefix,
+                    num_heads=self._num_heads,
+                    kvcache_quant_mode=self._kvcache_quant_mode,
+                    fmha_quant_mode=self._fmha_quant_mode,
+                    gemm_quant_mode=self._gemm_quant_mode,
+                    architecture=self._architecture,
+                )
+                latency += float(r)
+                energy += r.energy
 
         return PerformanceResult(
             latency * self._scale_factor,

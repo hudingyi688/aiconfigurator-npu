@@ -585,6 +585,12 @@ class PerfDataFilename(Enum):
     mla_generation_module = "mla_generation_module_perf.txt"
     dsa_context_module = "dsa_context_module_perf.txt"
     dsa_generation_module = "dsa_generation_module_perf.txt"
+    # Profiler-derived DSA prefill attention-core (SFA + indexer + bmm + rope),
+    # per-layer latency vs cumulative KV at the production CP shape (nh=64,
+    # per-rank query=256). Replaces the synthetic dsa_context_module silicon for
+    # GLM-5 prefill, whose SFA kernel is unmeasurable on the collection box
+    # (binary missing). Projection GEMMs stay on the analytical SOL path.
+    dsa_context_attn_core = "dsa_context_attn_core_perf.txt"
 
 
 QuantMapping = namedtuple("QuantMapping", ["memory", "compute", "name"])

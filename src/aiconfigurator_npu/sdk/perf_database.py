@@ -885,6 +885,55 @@ def load_kv_transfer_data(kv_transfer_file):
     return kv_transfer_data
 
 
+def load_dsa_context_attn_core_data(dsa_attn_core_file):
+    """
+    Load the profiler-derived DSA prefill attention-core cost table.
+
+    Columns: ``cum_kv, per_layer_us``. Each row is the per-LAYER latency (us) of
+    the DSA attention core — SparseFlashAttention + LightningIndexer + the two
+    absorption BMMs + rope — at the production chunked-prefill CP shape (single
+    rank, nh=64 full heads under Context Parallelism, per-rank query window=256 =
+    max_num_batched_tokens/cp = 4096/16), as a function of the cumulative global
+    KV length reached at that prefill step.
+
+    This REPLACES the synthetic ``dsa_context_module`` silicon for GLM-5 prefill:
+    the SparseFlashAttention kernel binary is missing on the collection box
+    (FIA self-test errno 561002), so the synthetic collector returns a no-op
+    value ~100-188x below the real per-layer cost. The values here are read
+    straight off production profiler kernel timelines (10k + 20k prefill runs,
+    cross-validated to <4% at shared KV points).
+
+    Scope is attention-core ONLY. Projection GEMMs (kv_a_proj/q_b_proj/o_proj,
+    ~49% of module FLOP) are interleaved with MoE GEMMs in the profiler and
+    cannot be name-separated, so they stay on the analytical SOL path in
+    ``query_context_dsa_module``.
+
+    Shape note: the stored sum captures two superposed behaviours — SFA SATURATES
+    above KV~=index_topk (sparse cap), while the LightningIndexer grows LINEARLY
+    (it scans full KV for MQA logits). 1-D interpolation over cum_kv absorbs both.
+
+    Returns:
+        dict: ``{cum_kv (int): per_layer_ms (float)}``. ``None`` when the file is
+              absent (optional table — non-GLM systems fall back to SOL).
+    """
+    if not os.path.exists(dsa_attn_core_file):
+        logger.debug(f"DSA context attn-core data file {dsa_attn_core_file} not found.")
+        return None
+
+    dsa_attn_core_data = {}
+
+    with open(dsa_attn_core_file, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cum_kv = int(row["cum_kv"])
+            per_layer_ms = float(row["per_layer_us"]) / 1000.0  # us -> ms
+            if cum_kv in dsa_attn_core_data:
+                logger.debug(f"value conflict in dsa_context_attn_core data: cum_kv{cum_kv}")
+            dsa_attn_core_data[cum_kv] = per_layer_ms
+
+    return dsa_attn_core_data
+
+
 def load_context_attention_data(context_attention_file):
     """
     Load the context attention data with power support (backward compatible).
@@ -2235,6 +2284,7 @@ class PerfDatabase:
                 PerfDataFilename.moe: load_moe_data,
                 PerfDataFilename.moe_dispatch_combine: load_moe_dispatch_combine_data,
                 PerfDataFilename.kv_transfer: load_kv_transfer_data,
+                PerfDataFilename.dsa_context_attn_core: load_dsa_context_attn_core_data,
                 PerfDataFilename.custom_allreduce: load_custom_allreduce_data,
                 PerfDataFilename.nccl: load_nccl_data,
                 PerfDataFilename.context_mla: load_context_mla_data,
@@ -2281,6 +2331,9 @@ class PerfDatabase:
         self._moe_dispatch_combine_data = _load_op_data(PerfDataFilename.moe_dispatch_combine)
         # vllm-ascend PD-disaggregated KV-transfer cost table (optional)
         self._kv_transfer_data = _load_op_data(PerfDataFilename.kv_transfer)
+
+        # Profiler-derived DSA prefill attention-core table (optional; GLM-5)
+        self._dsa_context_attn_core_data = _load_op_data(PerfDataFilename.dsa_context_attn_core)
 
         # Comm ops
         self._custom_allreduce_data = _load_op_data(PerfDataFilename.custom_allreduce)
@@ -4847,6 +4900,107 @@ class PerfDatabase:
             net_kv_wallclock_ms = float(self._interp_1d([ep_lo, ep_hi], [net_lo, net_hi], ep_clamped))
 
         return PerformanceResult(net_kv_wallclock_ms, energy=0.0)
+
+    @functools.lru_cache(maxsize=4096)
+    def query_dsa_context_attn_core(self, cum_kv: int) -> PerformanceResult:
+        """
+        Query the profiler-derived DSA prefill attention-core PER-LAYER cost.
+
+        Returns the per-layer latency (ms) of the DSA attention core (SFA +
+        LightningIndexer + absorption BMMs + rope) at the production CP shape
+        (nh=64, per-rank query=256) for a prefill step whose cumulative global
+        KV length is ``cum_kv``. Projection GEMMs are NOT included here — they
+        stay on the analytical SOL path (see ``query_context_dsa_module``).
+
+        1-D linear interpolation over the measured cum_kv grid; ``cum_kv`` is
+        clamped into range (hold flat at the boundaries). Clamp-flat is correct
+        at the HIGH end (SFA saturates at the sparse topk cap; the indexer's
+        linear growth beyond 20k is a minor, deliberately-unmodeled tail), and
+        the LOW end (>=4096) is always in range for chunked prefill.
+
+        Args:
+            cum_kv: cumulative global KV length at this prefill step.
+
+        Returns:
+            PerformanceResult: per-layer attention-core latency in ms; energy 0.
+
+        Raises:
+            ValueError: when the table is not loaded or is empty.
+        """
+        self._dsa_context_attn_core_data.raise_if_not_loaded()
+
+        kv_points = sorted(self._dsa_context_attn_core_data.keys())
+        if not kv_points:
+            raise ValueError("dsa_context_attn_core data is loaded but empty")
+
+        kv_clamped = min(max(cum_kv, kv_points[0]), kv_points[-1])
+        left, right = self._nearest_1d_point_helper(kv_clamped, kv_points, inner_only=False)
+        per_layer_ms = float(
+            self._interp_1d(
+                [left, right],
+                [self._dsa_context_attn_core_data[left], self._dsa_context_attn_core_data[right]],
+                kv_clamped,
+            )
+        )
+        return PerformanceResult(per_layer_ms, energy=0.0)
+
+    @functools.lru_cache(maxsize=4096)
+    def query_context_dsa_projection_sol(
+        self,
+        q: int,
+        num_heads: int,
+        gemm_quant_mode: common.GEMMQuantMode = common.GEMMQuantMode.float16,
+        *,
+        architecture: str = DEFAULT_DSA_ARCHITECTURE,
+    ) -> PerformanceResult:
+        """
+        SOL estimate of the DSA prefill PROJECTION-GEMM group for one layer.
+
+        Covers ONLY the linear projections + absorption BMMs of the DSA block
+        (kv_a_proj, q_b_proj, indexer wq_b + weights_proj, o_proj, BMM pre/post).
+        It is the analytical complement to ``query_dsa_context_attn_core`` (which
+        is the profiler-measured attention core): the full per-layer DSA module
+        latency = projection SOL + profiler attention core.
+
+        Projections scale with the per-step QUERY token count ``q`` (the per-rank
+        chunk window, e.g. 256 under CP16), NOT the cumulative KV — they touch
+        only the new tokens. This is the exact ``gemm_group_ops`` FLOP formula
+        from ``query_context_dsa_module``'s SOL, kept in sync with it.
+
+        Args:
+            q: per-step query tokens for this rank (e.g. 256 under CP16).
+            num_heads: attention heads on this rank (64 for GLM-5 CP prefill).
+            gemm_quant_mode: GEMM quant mode (governs tensor-core throughput).
+            architecture: HF architecture string (selects DSA_MODEL_DIMS).
+
+        Returns:
+            PerformanceResult: per-layer projection-GEMM latency in ms; energy 0.
+        """
+        dims = DSA_MODEL_DIMS.get(architecture, DSA_MODEL_DIMS[DEFAULT_DSA_ARCHITECTURE])
+        hidden_size = dims["hidden_size"]
+        q_lora = dims["q_lora_rank"]
+        kv_lora = dims["kv_lora_rank"]
+        qk_nope = dims["qk_nope_head_dim"]
+        qk_rope = dims["qk_rope_head_dim"]
+        v_dim = dims["v_head_dim"]
+        index_n_heads = dims["index_n_heads"]
+        index_head_dim = dims["index_head_dim"]
+        qk_head_dim = qk_nope + qk_rope
+        proj_out = q_lora + kv_lora + qk_rope + index_head_dim
+
+        tokens = q
+        gemm_group_ops = (
+            2 * tokens * hidden_size * proj_out
+            + 2 * tokens * q_lora * (num_heads * qk_head_dim)
+            + 2 * tokens * q_lora * (index_n_heads * index_head_dim)
+            + 2 * tokens * hidden_size * index_n_heads
+            + 2 * tokens * (num_heads * v_dim) * hidden_size
+            + 2 * num_heads * tokens * qk_nope * kv_lora
+            + 2 * num_heads * tokens * kv_lora * v_dim
+        )
+        gemm_flops = self._get_quant_tc_flops(gemm_quant_mode)
+        sol_ms = gemm_group_ops / gemm_flops * 1000
+        return PerformanceResult(sol_ms, energy=0.0)
 
     # to simplify, we no longer support allreduce_strategy
     @functools.lru_cache(maxsize=32768)

@@ -1621,6 +1621,13 @@ class DeepSeekV32Model(BaseModel):
             else self.config.workload_distribution
         )
         local_heads = self._num_heads // tp_size
+        # DSA PREFILL uses Context Parallelism (sequence-dim split), NOT TP head
+        # split: every rank keeps ALL heads and processes 1/cp of the query
+        # tokens (verified: tp16 prefill profiler shows SFA nh=64, per-rank
+        # query=256=4096/16). DECODE still uses head split (local_heads). So the
+        # context DSA module gets the FULL head count + cp_size=tp_size; the
+        # generation DSA module keeps local_heads.
+        context_dsa_heads = self._num_heads
 
         self.context_ops.extend(
             [
@@ -1629,11 +1636,12 @@ class DeepSeekV32Model(BaseModel):
                 ops.ContextDSAModule(
                     "context_attention",
                     self._num_layers,
-                    local_heads,
+                    context_dsa_heads,
                     kvcache_quant_mode,
                     fmha_quant_mode,
                     gemm_quant_mode,
                     architecture=self.architecture,
+                    cp_size=tp_size,
                 ),
                 ops.ElementWise("context_add_norm_2", self._num_layers, 2 * h, 2 * h, 0.8),
                 ops.GEMM(
