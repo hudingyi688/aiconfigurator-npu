@@ -29,7 +29,11 @@ DEVICE="${DEVICE:-npu:0}"
 # -----------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="${CANN_SITE}:${SCRIPT_DIR}:${PYTHONPATH:-}"
+# bench_engine.py lives in collector/ (parent of collector/npu/), and
+# collect_mla_module.py does `from bench_engine import ...`, so the COLLECTOR
+# ROOT must be on PYTHONPATH (not just collector/npu/).
+COLLECTOR_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${CANN_SITE}:${COLLECTOR_ROOT}:${SCRIPT_DIR}:${PYTHONPATH:-}"
 
 echo "[collect-dsa-prefill] model=${MODEL_DIR}"
 echo "[collect-dsa-prefill] PYTHONPATH=${PYTHONPATH}"
