@@ -40,14 +40,22 @@
 
 ## 待办采集命令
 
-### ep32 moe_dispatch_combine（生产 EP）
+### moe_dispatch_combine 大 ep（生产 EP=32）
+
+**A3 环境（单节点 16 DIE = 16 NPU device）**：EP 组是真实 HCCL 子组，需 `WORLD % ep == 0` 且每 rank 是物理 device，不能在更少 device 上模拟更大 ep。所以：
+- **ep16 → 单节点（WORLD=16），现在就能采** —— 比当前 ep8 clamp 更接近生产 ep32，强烈建议先采这个。
+- **ep32 → 2 个 A3 节点（2×16=32）** —— 不是 4 节点（那是按每节点 8 device 算的旧假设）。
+
+封装脚本 `collector/npu/collect_moe_dispatch_ep32.sh`（自动探测 device_count，默认 EP=16/单节点）：
+
 ```bash
-# NPU，需 32 卡 torchrun（或按 collector 的 world_size 约定）
-cd collector/npu
-torchrun --nproc_per_node=8 --nnodes=4 collect_moe_dispatch_combine.py \
-  --ep-size 32 --hidden 6144 --inter 2048 --num-experts 256 --topk 8 \
-  --quant-types bf16 w8a8_dynamic \
-  --num-tokens-list 1 2 4 8 16 32 64 128 256 512 1024 2048 4096 \
-  --output-dir ./moe_dispatch_ep32
+# 立即可做：单 A3 节点采 ep16
+EP=16 NNODES=1 bash collector/npu/collect_moe_dispatch_ep32.sh
+
+# 拿到第 2 个 A3 节点后：采 ep32（每节点都跑，NODE_RANK 0/1，MASTER_ADDR 同一个）
+EP=32 NNODES=2 NODE_RANK=0 MASTER_ADDR=<node0_ip> bash collector/npu/collect_moe_dispatch_ep32.sh  # 节点0
+EP=32 NNODES=2 NODE_RANK=1 MASTER_ADDR=<node0_ip> bash collector/npu/collect_moe_dispatch_ep32.sh  # 节点1
 ```
-采回后合并进 `moe_dispatch_combine_perf.txt`（两树都要更新），解锁生产 ep32 精确值（当前 clamp 到 ep8）。
+（`GPUS` 留空会自动探测 `torch.npu.device_count()`；A3 应为 16。若探测为 8，则每节点 8 device，ep32 需 4 节点。）
+
+采回后合并 `moe_dispatch_combine_ep{16,32}.csv` 进**两个 systems 树**的 `moe_dispatch_combine_perf.txt`，ep16/ep32 查询即命中实测（当前 clamp 到 ep8）。
