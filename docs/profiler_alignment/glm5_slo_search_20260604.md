@@ -118,6 +118,23 @@ tok/s/gpu）。
 3. 单卡吞吐随 isl 升高而降（62→39→9 tok/s/gpu），长序列下达标所需的并发 batch 变小
    （档1 bs16 → 档3 bs2），prefill/KV 占比上升。
 
+### 为何档3（isl=40k）单卡只有 9.2 —— KV 内存墙
+
+不是吞吐模型异常，是**内存约束**：GLM-5 DSA 单 token 全层 KV ≈ 107 KB（kv_lora512 +
+qk_rope64 + indexer128，×78 层 ×2B），单请求 KV 随 isl 线性涨：
+
+| 档 | isl | 单请求 KV | 达标 batch | 单卡 tok/s |
+|---|---|---|---|---|
+| 1 | 10k | 1.1 GB | 16 | 62 |
+| 2 | 20k | 2.2 GB | 11 | 39 |
+| 3 | 40k | 4.4 GB | **2** | 9.2 |
+
+910B 单卡 ~64GB HBM，扣 w8a8 权重（~10.5GB/卡）+ 激活 buffer 后留给 KV 的有限，KV
+翻倍 → 能塞的 batch 大致减半，batch 从 16→11→2 断崖收缩，单卡吞吐随之跳水。验证：
+**放宽 SLO 到 ttft=30s/tpot=200ms，档3 仍 bs≤2 / 9.2**，排除 SLO 因素，纯内存墙。
+这是物理约束，非寻优可解——提高需加卡（更多 HBM）或 KV 量化（int8 KV 使单请求 KV
+减半、batch 翻倍）。
+
 > 复现：`aic-npu default --model zai-org/GLM-5 --system ascend_910b --backend
 > vllm-ascend --backend-version 0.18.0 --database-mode HYBRID --total-gpus 64
 > --isl <ISL> --osl 2500 --ttft <TTFT> --tpot 70`。
