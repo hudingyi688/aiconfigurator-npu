@@ -29,7 +29,9 @@
    - 问题：root 树的 DSA txt 停留在旧版（nh64/float16，124/333 行），且缺 `moe_dispatch_combine`；package 树是补采后的完整数据。运行时用 package 树所以结果无误，但 root 树是过时孤儿，曾误导分析（一度把 root 的 124 行旧表当作当前数据）。
    - 处理：把 `dsa_context_module` / `dsa_generation_module` / `moe_dispatch_combine` 从 package 树同步到 root 树，两树 txt 现一致。root 树 CSV（采集源）保留。
 
-2. **moe_dispatch_combine 缺生产 ep32（待采）**：现仅 ep2/4/8。生产 ep32 靠 clamp 到 ep8 近似，偏差未量化。采集命令见下。
+2. **moe_dispatch_combine 缺生产 ep32（已采，2026-06-04）**：原仅 ep2/4/8，生产 ep32 clamp 到 ep8（高估 dispatch ~16%）。已在 2×A3 节点补采 ep32 实测合并进两树，grid 现 {2,4,8,32}。修正后 SLO 单卡吞吐 +10.8×（见 glm5_slo_search_20260604.md）。
+
+3. **architecture dims 错配（已知，标注不修 — YAGNI）**：GLM-5 config 声明 `DeepseekV32ForCausalLM`，但真实 dims（hidden6144/q_lora2048/v256/idx_n32）匹配 `GlmMoeDsaForCausalLM` 条目，非 DeepseekV32（hidden7168/q_lora1536）。`DeepSeekV32Model` 同时服务 GLM-5 和 DeepSeek-V3.2，靠 arch 字符串区分，但 `DSA_MODEL_DIMS` 按 arch 查 dims → GLM-5 取到 V3.2 的 dims。**影响面**：仅 `query_context_dsa_projection_sol`（GLM-5 prefill 投影 GEMM SOL），**低估 ~34%**（115 vs 174 us/层 @q256 nh64 w8a8），E2E 占 prefill 仅 **~0.69%**（投影是小头，attention 核心是 profiler 实测、不受影响）。silicon 表行标 DeepseekV32 且 silicon 命中不走 dims 公式，故 decode/silicon 路径不受影响。正确修复需把 config 实际 dims 穿进 op 管道或拆分共享 arch key，性价比低，故仅在代码（perf_database.py `query_context_dsa_projection_sol`）加注释标注，不改逻辑。
 
 ## agent 误报、实测澄清（不是问题）
 

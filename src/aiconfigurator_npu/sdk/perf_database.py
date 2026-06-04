@@ -4976,6 +4976,17 @@ class PerfDatabase:
         Returns:
             PerformanceResult: per-layer projection-GEMM latency in ms; energy 0.
         """
+        # KNOWN dims mismatch (low impact, deliberately not fixed — YAGNI):
+        # GLM-5's HF config declares architecture="DeepseekV32ForCausalLM" but its
+        # real dims (hidden=6144, q_lora=2048, v_head=256, idx_n=32) match the
+        # GlmMoeDsaForCausalLM entry, NOT DeepseekV32 (hidden=7168, q_lora=1536).
+        # Since GLM-5 passes the DeepseekV32 arch string, this projection SOL uses
+        # the DeepseekV32 dims and UNDER-estimates GLM-5's projection GEMMs ~34%
+        # (115 vs 174 us/layer @q256 nh64 w8a8). E2E that is only ~0.69% of prefill
+        # (proj is a small slice; the attention core is profiler-measured), so the
+        # fix (threading real config dims through the op pipeline, or splitting the
+        # shared DeepseekV32/GlmMoeDsa arch key) isn't worth it. See
+        # docs/profiler_alignment/collector_shape_audit_20260604.md.
         dims = DSA_MODEL_DIMS.get(architecture, DSA_MODEL_DIMS[DEFAULT_DSA_ARCHITECTURE])
         hidden_size = dims["hidden_size"]
         q_lora = dims["q_lora_rank"]
