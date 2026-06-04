@@ -4888,9 +4888,22 @@ class PerfDatabase:
         def _isl_interp(ep_key: int) -> float:
             isl_table = self._kv_transfer_data[ep_key]
             isl_points = sorted(isl_table.keys())
-            isl_clamped = min(max(isl, isl_points[0]), isl_points[-1])
-            left, right = self._nearest_1d_point_helper(isl_clamped, isl_points, inner_only=False)
-            return float(self._interp_1d([left, right], [isl_table[left], isl_table[right]], isl_clamped))
+            # Below the measured range: clamp (hold flat) — extrapolating the
+            # low-end slope down would go negative / nonphysical.
+            if isl <= isl_points[-1]:
+                isl_clamped = max(isl, isl_points[0])
+                left, right = self._nearest_1d_point_helper(isl_clamped, isl_points, inner_only=False)
+                return float(self._interp_1d([left, right], [isl_table[left], isl_table[right]], isl_clamped))
+            # Above the measured range (isl > 20k): LINEARLY EXTRAPOLATE from the
+            # top two points rather than clamping flat. KV-transfer wall-clock is
+            # ~ (chunk count) x (per-call latency); chunk count grows ~linearly
+            # with isl and per-call latency is ~constant (latency-bound), so the
+            # net cost is ~linear in isl. Clamping flat severely underestimates
+            # long context (e.g. isl=40k would otherwise read the 20k value).
+            # Only two measured points anchor this slope — it is a physically
+            # grounded estimate, not a measurement; flagged in the SLO doc.
+            hi, lo = isl_points[-1], isl_points[-2]
+            return float(self._interp_1d([lo, hi], [isl_table[lo], isl_table[hi]], isl))
 
         net_lo = _isl_interp(ep_lo)
         if ep_hi == ep_lo:

@@ -2,7 +2,8 @@
 
 Covers the loader (load_kv_transfer_data), the query method
 (PerfDatabase.query_kv_transfer) including exact-grid lookup, isl/ep
-interpolation, both-axis hold-flat clamping (stored value is the measured net KV wall-clock, no overlap_factor); plus the
+interpolation, low-end / ep hold-flat clamping AND high-end isl linear
+extrapolation (stored value is the measured net KV wall-clock, no overlap_factor); plus the
 operations-layer KVTransfer gating: the cost is charged ONCE on the vllm-ascend
 disagg prefill path and is zero everywhere else (agg mode, decode, missing
 table).
@@ -121,9 +122,17 @@ def test_query_clamps_isl_below(db):
     assert got == pytest.approx(EP16_2500)
 
 
-def test_query_clamps_isl_above(db):
-    got = float(db.query_kv_transfer(10**6, 1))
-    assert got == pytest.approx(EP1_20000)
+def test_query_extrapolates_isl_above(db):
+    # isl above the measured range (>20k) LINEARLY EXTRAPOLATES from the top two
+    # points (KV-transfer cost ~ linear in isl: chunk-count linear, per-call
+    # latency ~constant), NOT clamped flat. ep16 slope = (2571-1679)/10000 per
+    # token, so isl=40000 -> 2571 + slope*20000 = 4354.6 ms.
+    slope = (EP16_20000 - EP16_10000) / (20000 - 10000)
+    expected_40k = EP16_20000 + slope * (40000 - 20000)
+    got = float(db.query_kv_transfer(40000, 16))
+    assert got == pytest.approx(expected_40k)
+    # strictly greater than the 20k value (clamp would wrongly return 2571)
+    assert got > EP16_20000
 
 
 def test_query_clamps_ep_below(db):
