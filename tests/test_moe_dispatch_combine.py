@@ -67,12 +67,18 @@ def test_loader_returns_none_for_missing_file():
 
 
 def test_loader_structure_and_grid(raw_data):
-    assert sorted(raw_data.keys()) == [2, 4, 8]
+    assert sorted(raw_data.keys()) == [2, 4, 8, 32]
     for ep in (2, 4, 8):
         assert sorted(raw_data[ep].keys()) == ["bf16", "w8a8_dynamic"]
         # 24 distinct token counts per (ep, dtype)
         assert len(raw_data[ep]["bf16"]) == 24
         assert len(raw_data[ep]["w8a8_dynamic"]) == 24
+    # ep32 is the production EP, collected on 2x A3 nodes (2x16 DIE). Its token
+    # grid is the 13-point default sweep (sparser than the 24-point ep2/4/8
+    # grids); interpolation over num_tokens covers the gaps.
+    assert sorted(raw_data[32].keys()) == ["bf16", "w8a8_dynamic"]
+    assert len(raw_data[32]["bf16"]) == 13
+    assert len(raw_data[32]["w8a8_dynamic"]) == 13
 
 
 def test_loader_unit_conversion_us_to_ms(raw_data):
