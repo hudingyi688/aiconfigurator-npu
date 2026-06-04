@@ -80,29 +80,43 @@ decode TPOT 模型经双 batch（batch=1 / batch=7）stream 对账，确认**模
 > DSA 虽随 isl 增长（每 step 重算累积 KV 的 sparse attention），但 sparse topk 封顶
 > 使其增长受限，绝对值远小于 KV transfer。
 
-## SLO 寻优最优配置（64 卡，osl=2500，TPOT<70ms）
+## SLO 寻优最优配置（64 卡，osl=2500，TPOT<70ms；**ep32 实测后**）
 
-用 `aic-npu default`（HYBRID）跑 4 档 SLO 配置搜索，各档吞吐最优配置：
+用 `aic-npu default`（HYBRID）跑 4 档 SLO 配置搜索。**本表为补采生产 ep32
+moe_dispatch silicon 后的结果**（见下方"ep32 修正"），各档吞吐最优配置：
 
-| 档 | isl | TTFT 约束 | 最优模式 | 并行配置 | TTFT | TPOT | 单卡 tok/s | 单用户 tok/s |
-|---|---|---|---|---|---|---|---|---|
-| 档1 | 10k | <2000ms | agg | tp4/dp8/ep32 | 1937ms | 43.1ms | **5.75** | 23.2 |
-| 档2 | 20k | <5000ms | agg | tp4/dp16/ep64 | 4321ms | 43.2ms | **5.67** | 23.2 |
-| 档3 | 40k | <8000ms | agg | tp8/dp8/ep64 | 5101ms | 42.5ms | **2.87** | 23.5 |
-| 档4 | 80k | <10000ms | — | **无解** | — | — | — | — |
+| 档 | isl | TTFT 约束 | 最优模式 | 并行配置 | bs/并发 | TTFT | TPOT | 单卡 tok/s | 单用户 tok/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 档1 | 10k | <2000ms | agg | tp8/dp8/ep64 | 16/128 | 1980ms | 31.2ms | **62.0** | 32.0 |
+| 档2 | 20k | <5000ms | agg | tp8/dp8/ep64 | 11/88 | 3426ms | 33.6ms | **38.9** | 29.7 |
+| 档3 | 40k | <8000ms | agg | tp8/dp8/ep64 | 2/16 | 5505ms | 26.1ms | **9.2** | 38.3 |
+| 档4 | 80k | <10000ms | — | **无解** | — | — | — | — | — |
 
 > 档4：isl=80k 在 64 卡上**放不下**（模型权重 + KV cache 超 HBM，与 SLO 无关，放宽
 > SLO 仍无解）；需更多卡。
+> 注：ep64 配置在 dispatch 表里 snap 到最近的 ep32（grid {2,4,8,32}）。
+
+### ep32 修正（重大，10.8× 单卡吞吐）
+
+补采前 dispatch silicon 只有 ep2/4/8，生产 ep32/ep64 **clamp 到 ep8**，把 dispatch
+高估 ~16%（ep8=405us vs ep32 实测=340us @tok256 w8a8）。这个高估让所有高并发
+（bs>1）配置的 TPOT/TTFT 算超 SLO 被滤掉，寻优只剩 **bs=1**（档1 旧值 5.75
+tok/s/gpu）。
+
+补采 ep32 实测后，bs=16/并发128 的 TTFT 压到 1980<2000、TPOT 31<70 达标，单卡吞吐
+跃至 **62 tok/s/gpu**。单变量 A/B 验证（移除 ep32 行干净退回 bs=1/5.75）确认这是
+**ep32 数据单独导致**，非其他改动。**旧的"全 bs=1、5.75 tok/s/gpu"是 ep8-clamp
+高估 dispatch 的 artifact，已作废。**
 
 ### 关键结论
 
-1. **最优全是 agg（聚合）模式，disagg（PD 分离）在这些 SLO 下不划算**：档1/档3
-   disagg 无可行解，档2 disagg 仅 0.44× agg 吞吐。原因正是本版的核心——prefill 由
-   KV transfer 主导（1.7~2.6s），PD 分离把 KV 流式传输的开销暴露在关键路径上，反而
-   被 agg（无跨节点 KV transfer）超过。
-2. **TPOT 全档 ~43ms，远达标（<70）**。这推翻 05-30 版「TPOT ~87ms 超标」——印证
-   decode 模型修正后 TPOT 准确（batch=1 实测对账 −0.6%）。TTFT 全档达标。
-3. 单卡吞吐随 isl 升高而降（5.75→2.87 tok/s/gpu），因长序列 prefill/KV 占比上升。
+1. **最优全是 agg（聚合）模式**：档1/档3 disagg 无可行解，档2 disagg 仅 ~0.47× agg。
+   prefill 由 KV transfer 主导（1.7~2.6s），PD 分离把 KV 流式传输开销暴露在关键路径，
+   反被 agg（无跨节点 KV transfer）超过。
+2. **TPOT 全档 26~34ms，远达标（<70）**；TTFT 全档达标。推翻 05-30 版「TPOT 87ms
+   超标」——decode 模型修正后准确（batch=1 对账 −0.6%）。
+3. 单卡吞吐随 isl 升高而降（62→39→9 tok/s/gpu），长序列下达标所需的并发 batch 变小
+   （档1 bs16 → 档3 bs2），prefill/KV 占比上升。
 
 > 复现：`aic-npu default --model zai-org/GLM-5 --system ascend_910b --backend
 > vllm-ascend --backend-version 0.18.0 --database-mode HYBRID --total-gpus 64
