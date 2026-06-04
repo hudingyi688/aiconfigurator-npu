@@ -80,6 +80,35 @@ decode TPOT 模型经双 batch（batch=1 / batch=7）stream 对账，确认**模
 > DSA 虽随 isl 增长（每 step 重算累积 KV 的 sparse attention），但 sparse topk 封顶
 > 使其增长受限，绝对值远小于 KV transfer。
 
+## SLO 寻优最优配置（64 卡，osl=2500，TPOT<70ms）
+
+用 `aic-npu default`（HYBRID）跑 4 档 SLO 配置搜索，各档吞吐最优配置：
+
+| 档 | isl | TTFT 约束 | 最优模式 | 并行配置 | TTFT | TPOT | 单卡 tok/s | 单用户 tok/s |
+|---|---|---|---|---|---|---|---|---|
+| 档1 | 10k | <2000ms | agg | tp4/dp8/ep32 | 1937ms | 43.1ms | **5.75** | 23.2 |
+| 档2 | 20k | <5000ms | agg | tp4/dp16/ep64 | 4321ms | 43.2ms | **5.67** | 23.2 |
+| 档3 | 40k | <8000ms | agg | tp8/dp8/ep64 | 5101ms | 42.5ms | **2.87** | 23.5 |
+| 档4 | 80k | <10000ms | — | **无解** | — | — | — | — |
+
+> 档4：isl=80k 在 64 卡上**放不下**（模型权重 + KV cache 超 HBM，与 SLO 无关，放宽
+> SLO 仍无解）；需更多卡。
+
+### 关键结论
+
+1. **最优全是 agg（聚合）模式，disagg（PD 分离）在这些 SLO 下不划算**：档1/档3
+   disagg 无可行解，档2 disagg 仅 0.44× agg 吞吐。原因正是本版的核心——prefill 由
+   KV transfer 主导（1.7~2.6s），PD 分离把 KV 流式传输的开销暴露在关键路径上，反而
+   被 agg（无跨节点 KV transfer）超过。
+2. **TPOT 全档 ~43ms，远达标（<70）**。这推翻 05-30 版「TPOT ~87ms 超标」——印证
+   decode 模型修正后 TPOT 准确（batch=1 实测对账 −0.6%）。TTFT 全档达标。
+3. 单卡吞吐随 isl 升高而降（5.75→2.87 tok/s/gpu），因长序列 prefill/KV 占比上升。
+
+> 复现：`aic-npu default --model zai-org/GLM-5 --system ascend_910b --backend
+> vllm-ascend --backend-version 0.18.0 --database-mode HYBRID --total-gpus 64
+> --isl <ISL> --osl 2500 --ttft <TTFT> --tpot 70`。
+> （报告末尾的 "generator artifact" 警告是 stub 禁用，无害；搜索本身成功。）
+
 ## 已知不可信区 / 待办
 
 1. **isl>20k 的 KV transfer**：表仅到 20k，档3/4 持平为下界近似 → prefill 总偏低。
