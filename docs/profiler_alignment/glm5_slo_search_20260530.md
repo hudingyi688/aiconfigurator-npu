@@ -1,5 +1,15 @@
 # GLM-5 SLO 配置寻优结果
 
+# GLM-5 SLO 配置寻优结果
+
+> ⚠️ **已过时 (2026-06-04)。本文档的「DSA 是 prefill 绝对主导 (64%→92%)」结论已作废**
+> ——它基于错误的 DSA 口径（nh=4 合成 silicon + query 未按 Context Parallelism 切分，
+> 把单请求 DSA 放大了约 20×）。修正后 prefill 由 KV transfer 主导，DSA 仅占 8%~23%。
+> 另外「TPOT 高估 1.6×」也已作废（错误对账所致，模型 TPOT 实际 −0.6% 准确）。
+> **请改用 [glm5_slo_search_20260604.md](./glm5_slo_search_20260604.md)。** 以下内容仅作历史存档。
+
+---
+
 状态：2026-05-30
 部署：2P2D / 4 节点 / 64 卡 Ascend 910B，vllm-ascend 0.18.0，GLM-5-w8a8
 工具：`aic-npu`（HYBRID 模式，chunked-prefill）

@@ -52,9 +52,11 @@ def run_ctx(tp, ep, dp, isl):
 if __name__ == "__main__":
     print(f"{'档':>3} {'isl':>6} {'cfg':>12} {'DSA(ms)':>9} {'prefill总(ms)':>12} {'DSA占比':>7}")
     cases = [
-        # tp * dp == moe_tp * moe_ep  =>  16*2 == 1*32
-        ("档1", 10000, 16, 32, 2),
+        # tp * dp == moe_tp * moe_ep
+        ("档1", 10000, 16, 32, 2),   # 16*2 == 1*32
         ("档2", 20480, 16, 32, 2),
+        ("档3", 40960, 32, 32, 1),   # 32*1 == 1*32
+        ("档4", 81920, 32, 32, 1),
     ]
     for tag, isl, tp, ep, dp in cases:
         dsa, total, cdict = run_ctx(tp, ep, dp, isl)

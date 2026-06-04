@@ -1704,27 +1704,29 @@ class ContextDSAModule(Operation):
         latency = 0.0
         energy = 0.0
         if use_profiler:
-            # Per-rank query window under CP (sequence-dim split, all heads kept).
-            # The profiler attn-core table and the projection SOL are both
-            # measured at the FULL chunk window (query = chunk / cp_size, e.g.
-            # 256 at CP16). A trailing partial chunk processes fewer new tokens,
-            # and both the attention core (SFA + indexer ∝ query, verified ∝query
-            # to ~7% against profiler) and the projection GEMMs (∝ query) scale
-            # down linearly. So scale each step by (step new tokens / chunk).
-            proj_full = float(
-                database.query_context_dsa_projection_sol(
-                    q=max(1, chunk // self._cp_size),
+            # The profiler attn-core table was collected at the production CP16
+            # shape: per-rank query window = chunk/cp = 4096/16 = 256 tokens.
+            # Both the attention core (SFA + indexer, ∝ per-rank query, verified
+            # ∝query to ~7% vs profiler) and the projection GEMMs (∝ query) scale
+            # linearly with the per-rank query a step actually processes:
+            #     per_rank_q = step_new_global_tokens / cp_size
+            # So the core table value is scaled by per_rank_q / 256 (this both
+            # rescales for cp != 16 AND shrinks a trailing partial chunk), and
+            # the projection SOL is queried at the step's per-rank query directly.
+            ref_q = max(1, chunk // 16)  # per-rank query the table was collected at (256)
+            for k, kv in enumerate(step_kvs):
+                step_new_tokens = kv - k * chunk  # global new query this step
+                per_rank_q = max(1, step_new_tokens // self._cp_size)
+                core = database.query_dsa_context_attn_core(cum_kv=kv)
+                proj = database.query_context_dsa_projection_sol(
+                    q=per_rank_q,
                     num_heads=self._num_heads,
                     gemm_quant_mode=self._gemm_quant_mode,
                     architecture=self._architecture,
                 )
-            )
-            for k, kv in enumerate(step_kvs):
-                step_new_tokens = kv - k * chunk  # global new query this step
-                q_frac = max(0.0, min(1.0, step_new_tokens / chunk))
-                core = database.query_dsa_context_attn_core(cum_kv=kv)
-                latency += (float(core) + proj_full) * q_frac
-                energy += core.energy * q_frac
+                core_scale = per_rank_q / ref_q
+                latency += float(core) * core_scale + float(proj)
+                energy += core.energy * core_scale + proj.energy
         else:
             for kv in step_kvs:
                 r = database.query_context_dsa_module(
