@@ -2,19 +2,24 @@
 """Scan a directory tree for Ascend `kernel_details.csv` profiler files and
 report which ones are usable for **prefill DSA absolute-value validation**.
 
-A profiler is usable only if BOTH hold (see docs/profiler_alignment notes):
-  1. SFA num_heads == per-rank heads of the target TP (GLM-5: 64 heads / tp16 = 4).
-     A mismatch (e.g. 64 = TP1 full heads) makes SFA compute differ ~16x — not comparable.
-  2. The window is a COMPLETE request, not a sampled fragment:
-     sum(SFA query dim) / num_layers ≈ isl. A fragment (e.g. 626 tok/layer << 10000)
-     cannot validate the per-step DSA accumulation.
+GLM-5 DSA prefill uses Context Parallelism (CP): each rank keeps ALL heads
+(nh=64) but processes only 1/cp of the query tokens (sequence-dim split via
+all-to-all + o_proj full-gather). This is DIFFERENT from decode, which is
+tensor-parallel head-split (tp4 -> nh16). So for a prefill profiler:
+
+  1. SFA num_heads should equal the FULL head count (GLM-5: 64), regardless of
+     tp. A head-split value (e.g. 4) would mean a non-CP / non-prefill capture.
+  2. The window is a COMPLETE request when sum(SFA query)/layers ≈ isl/cp
+     (per-rank query after CP split), NOT ≈ isl. e.g. 10k / cp16 ≈ 626 tok/layer
+     is COMPLETE, not a fragment — the earlier "fragment" reading was wrong.
 
 Usage:
-    python3 find_prefill_profiler.py [ROOT] [--heads 4] [--layers 80] \
-        [--isl 10000] [--isl-tol 0.2]
+    python3 find_prefill_profiler.py [ROOT] [--heads 64] [--layers 80] \
+        [--isl 10000] [--cp 16] [--isl-tol 0.2]
 
-ROOT defaults to the current directory. Exit code is 0 if at least one usable
-profiler is found, 1 otherwise (handy for scripting on the NPU box).
+The completeness target is isl/cp. Set --cp 1 to require the full isl per rank
+(non-CP capture). ROOT defaults to the current directory. Exit code is 0 if at
+least one usable profiler is found, 1 otherwise (handy for scripting on NPU).
 """
 from __future__ import annotations
 
@@ -40,13 +45,18 @@ class ProbeResult:
     query_per_layer: float
     error: str | None = None
 
-    def verdict(self, want_heads: int, isl: int, isl_tol: float) -> str:
+    def per_rank_target(self, isl: int, cp: int) -> float:
+        """Expected per-rank query/layer after CP split = isl / cp."""
+        return isl / cp if cp else float(isl)
+
+    def verdict(self, want_heads: int, isl: int, cp: int, isl_tol: float) -> str:
         if self.error:
             return "ERR"
         if self.sfa_count == 0:
             return "SKIP"  # no DSA attention — not a GLM-5/DSA run
         heads_ok = self.num_heads == want_heads
-        lo, hi = isl * (1 - isl_tol), isl * (1 + isl_tol)
+        target = self.per_rank_target(isl, cp)
+        lo, hi = target * (1 - isl_tol), target * (1 + isl_tol)
         isl_ok = lo <= self.query_per_layer <= hi
         return "OK_USABLE" if (heads_ok and isl_ok) else "NO"
 
@@ -89,12 +99,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Find prefill profilers usable for DSA absolute-value validation."
     )
     p.add_argument("root", nargs="?", default=".", help="root dir to scan (default: .)")
-    p.add_argument("--heads", type=int, default=4,
-                   help="required per-rank SFA heads (GLM-5 tp16 = 64/16 = 4)")
+    p.add_argument("--heads", type=int, default=64,
+                   help="required SFA heads (GLM-5 DSA prefill = full 64, CP keeps all heads)")
     p.add_argument("--layers", type=int, default=80, help="model layers (GLM-5 = 80)")
-    p.add_argument("--isl", type=int, default=10000, help="target input seq len")
+    p.add_argument("--isl", type=int, default=10000, help="target GLOBAL input seq len")
+    p.add_argument("--cp", type=int, default=16,
+                   help="context-parallel size; per-rank query target = isl/cp (default 16 = tp16)")
     p.add_argument("--isl-tol", type=float, default=0.2,
-                   help="fractional tolerance on query/layer vs isl (default 0.2)")
+                   help="fractional tolerance on query/layer vs isl/cp (default 0.2)")
     return p.parse_args(argv)
 
 
@@ -109,21 +121,23 @@ def main(argv: list[str]) -> int:
     usable: list[ProbeResult] = []
     for path in files:
         res = probe(path, args.layers)
-        verdict = res.verdict(args.heads, args.isl, args.isl_tol)
+        verdict = res.verdict(args.heads, args.isl, args.cp, args.isl_tol)
         if verdict == "SKIP":
             continue  # quiet: not a DSA run
         if verdict == "ERR":
             print(f"ERR  {path}: {res.error}")
             continue
         nh = res.num_heads
+        target = res.per_rank_target(args.isl, args.cp)
         reason = ""
         if verdict == "NO":
             bad_h = "" if nh == args.heads else f" heads≠{args.heads}"
-            lo, hi = args.isl * (1 - args.isl_tol), args.isl * (1 + args.isl_tol)
-            bad_i = "" if lo <= res.query_per_layer <= hi else " fragment(q/layer≪isl)"
+            lo, hi = target * (1 - args.isl_tol), target * (1 + args.isl_tol)
+            bad_i = "" if lo <= res.query_per_layer <= hi else \
+                f" coverage≠isl/cp(want≈{target:.0f})"
             reason = f" <-{bad_h}{bad_i}"
         print(f"{verdict:9} nh={nh} q/layer={res.query_per_layer:.0f} "
-              f"SFA={res.sfa_count}  {path}{reason}")
+              f"(target≈{target:.0f}) SFA={res.sfa_count}  {path}{reason}")
         if verdict == "OK_USABLE":
             usable.append(res)
 
@@ -131,8 +145,9 @@ def main(argv: list[str]) -> int:
         print(f"\n{len(usable)} usable profiler(s). Use this one:")
         print(f"  {usable[0].path}")
         return 0
-    print("\nNo usable profiler. Re-collect: P-node, tp16(nh4), "
-          "--max-concurrency 1 --num-prompts 3 --random-input-len 10000.")
+    print("\nNo usable profiler. Re-collect: P-node, full prefill, "
+          f"--max-concurrency 1 --num-prompts 3 --random-input-len {args.isl}. "
+          f"Expect nh={args.heads}, q/layer≈{args.isl/args.cp:.0f} (CP{args.cp}).")
     return 1
 
 
