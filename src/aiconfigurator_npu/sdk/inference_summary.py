@@ -57,6 +57,8 @@ class InferenceSummary:
         self._generation_latency_dict = {}  # ms
         self._context_energy_wms_dict = {}  # RENAMED from _context_power_dict, W·ms
         self._generation_energy_wms_dict = {}  # RENAMED from _generation_power_dict, W·ms
+        self._context_source_dict: dict = {}   # QuerySource per op (context phase)
+        self._generation_source_dict: dict = {} # QuerySource per op (generation phase)
         self._is_oom = None
 
         # NEW: Store computed power averages
@@ -110,7 +112,21 @@ class InferenceSummary:
         """
         return self._generation_latency_dict
 
-    # NEW: Energy dict accessors (explicit _wms naming for clarity)
+    def set_context_source_dict(self, source_dict: dict) -> None:
+        """Set per-op QuerySource for the context (prefill) phase."""
+        self._context_source_dict = source_dict
+
+    def get_context_source_dict(self) -> dict:
+        """Get per-op QuerySource for the context (prefill) phase."""
+        return self._context_source_dict
+
+    def set_generation_source_dict(self, source_dict: dict) -> None:
+        """Set per-op QuerySource for the generation (decode) phase."""
+        self._generation_source_dict = source_dict
+
+    def get_generation_source_dict(self) -> dict:
+        """Get per-op QuerySource for the generation (decode) phase."""
+        return self._generation_source_dict
     def set_context_energy_wms_dict(self, energy_wms_dict: dict[str, float]) -> None:
         """
         Set context energy dict (units: W·ms).

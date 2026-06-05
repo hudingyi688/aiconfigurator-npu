@@ -42,9 +42,10 @@ class BaseBackend(ABC):
         batch_size: int,
         isl: int,
         prefix: int,
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict]:
         context_latency_dict = defaultdict(float)
         context_energy_wms_dict = defaultdict(float)
+        context_source_dict: dict[str, object] = {}
 
         effective_isl = isl - prefix
         if effective_isl <= 0:
@@ -64,8 +65,9 @@ class BaseBackend(ABC):
             )
             context_latency_dict[op._name] += float(result)
             context_energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+            context_source_dict[op._name] = getattr(result, "source", None)
 
-        return context_latency_dict, context_energy_wms_dict
+        return context_latency_dict, context_energy_wms_dict, context_source_dict
 
     def _run_generation_phase(
         self,
@@ -77,15 +79,17 @@ class BaseBackend(ABC):
         isl: int,
         osl: int,
         stride: int,
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict]:
         generation_latency_dict = defaultdict(float)
         generation_energy_wms_dict = defaultdict(float)
+        generation_source_dict: dict[str, object] = {}
 
         batch_size = batch_size * (model._nextn + 1)
 
         for i in range(0, osl - 1, stride):
             latency_dict = defaultdict(float)
             energy_wms_dict = defaultdict(float)
+            source_dict: dict[str, object] = {}
 
             for op in model.generation_ops:
                 result = op.query(
@@ -99,13 +103,16 @@ class BaseBackend(ABC):
                 )
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
+                source_dict[op._name] = getattr(result, "source", None)
 
             repeat_count = min(stride, osl - 1 - i)
             for op in latency_dict:
                 generation_latency_dict[op] += latency_dict[op] * repeat_count
                 generation_energy_wms_dict[op] += energy_wms_dict[op] * repeat_count
+                # source is per-op: last step's value is representative (same shape each step)
+                generation_source_dict[op] = source_dict[op]
 
-        return generation_latency_dict, generation_energy_wms_dict
+        return generation_latency_dict, generation_energy_wms_dict, generation_source_dict
 
     def _run_static_breakdown(
         self,
@@ -115,7 +122,7 @@ class BaseBackend(ABC):
         mode: str,
         stride: int = 32,
         latency_correction_scale: float = 1.0,
-    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float], dict, dict]:
         batch_size, beam_width, isl, osl, prefix = (
             runtime_config.batch_size,
             runtime_config.beam_width,
@@ -124,22 +131,22 @@ class BaseBackend(ABC):
             runtime_config.prefix,
         )
 
-        context_latency_dict, context_energy_wms_dict = {}, {}
-        generation_latency_dict, generation_energy_wms_dict = {}, {}
+        context_latency_dict, context_energy_wms_dict, context_source_dict = {}, {}, {}
+        generation_latency_dict, generation_energy_wms_dict, generation_source_dict = {}, {}, {}
 
         if mode == "static_ctx":
-            context_latency_dict, context_energy_wms_dict = self._run_context_phase(
+            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
                 model, database, runtime_config, batch_size, isl, prefix
             )
         elif mode == "static_gen":
-            generation_latency_dict, generation_energy_wms_dict = self._run_generation_phase(
+            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
                 model, database, runtime_config, batch_size, beam_width, isl, osl, stride
             )
         else:
-            context_latency_dict, context_energy_wms_dict = self._run_context_phase(
+            context_latency_dict, context_energy_wms_dict, context_source_dict = self._run_context_phase(
                 model, database, runtime_config, batch_size, isl, prefix
             )
-            generation_latency_dict, generation_energy_wms_dict = self._run_generation_phase(
+            generation_latency_dict, generation_energy_wms_dict, generation_source_dict = self._run_generation_phase(
                 model, database, runtime_config, batch_size, beam_width, isl, osl, stride
             )
 
@@ -157,6 +164,8 @@ class BaseBackend(ABC):
             context_energy_wms_dict,
             generation_latency_dict,
             generation_energy_wms_dict,
+            context_source_dict,
+            generation_source_dict,
         )
 
     def run_static_latency_only(
@@ -178,6 +187,8 @@ class BaseBackend(ABC):
             context_latency_dict,
             _,
             generation_latency_dict,
+            _,
+            _,
             _,
         ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
         return sum(context_latency_dict.values()) + sum(generation_latency_dict.values())
@@ -220,6 +231,8 @@ class BaseBackend(ABC):
             context_energy_wms_dict,
             generation_latency_dict,
             generation_energy_wms_dict,
+            context_source_dict,
+            generation_source_dict,
         ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
 
         if mode == "static_ctx":
@@ -337,6 +350,8 @@ class BaseBackend(ABC):
         summary.set_generation_latency_dict(generation_latency_dict)
         summary.set_context_energy_wms_dict(context_energy_wms_dict)  # UPDATED: explicit units
         summary.set_generation_energy_wms_dict(generation_energy_wms_dict)  # UPDATED: explicit units
+        summary.set_context_source_dict(context_source_dict)
+        summary.set_generation_source_dict(generation_source_dict)
         summary.set_context_power_avg(context_power_avg)
         summary.set_generation_power_avg(generation_power_avg)
         summary.set_e2e_power_avg(e2e_power_avg)

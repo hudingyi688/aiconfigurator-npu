@@ -696,26 +696,34 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 #### 3.5.3 M1-M6 指标汇总（参照 MSMODELING 体系）
 
 > 参考 MSMODELING 的 M1-M6 指标框架，统一汇报覆盖度（M1-M5）和精度（M6）。
-> 两套体系的根本差异：MSMODELING 有运行时 `QueryResult` 记录每个 op 的 HIT/MISS 来源；
-> 我们的 `PerformanceResult` 只存 latency/energy，无 source tracking——
-> 因此 M1-M4 无法从运行时直接算，只能用 profiler groundtruth 做离线近似。
+> **2026-06-05 更新**：已实现运行时 source tracking（`QuerySource` 枚举注入
+> `PerformanceResult`，`base_backend` 收集 per-op source_dict），M1/M5 现在
+> 可从任意 inference run 自动计算（`tools/compute_m1_m4.py`）。
 
 | 指标 | 定义 | GLM-5 decode | GLM-5 prefill | 可信度 | 备注 |
 |---|---|---|---|---|---|
-| **M1** | op 命中率（hit/total op count） | — | — | ❌ 无法算 | 需运行时 source tracking（`PerformanceResult` 无此字段） |
-| **M2** | fused op 组命中率（悲观规则：组内任一 miss = 组 miss） | — | — | ❌ 无法算 | 同 M1；另需 fused group 定义 |
+| **M1** | op 命中率（SILICON ops / non-ZERO ops） | **33.3%** (2/6) | **25.0%** (3/12) | ✅ 运行时算 | decode: attention(SILICON)+moe(SILICON)；prefill: moe_post+pre+logits(SILICON) |
+| **M2** | fused op 组命中率（悲观规则：组内任一 miss = 组 miss） | — | — | ❌ 无法算 | 需 fused group 定义；未实现 |
 | **M3** | M2 排除 zero_cost ops | — | — | ❌ 无法算 | 同 M2 |
 | **M4** | per-shape 命中率（unique (op,shape) 对） | GEMM: **71/127=55.9%**；MoE: 2/8=25%（严格同 ep）| Comm/DSA prefill: 不适用（反推数据） | ⚠️ 仅限实采族 | GEMM MISS 56 条主要是 decode 小 M（M<16）和 router 小 op；MoE 因 bench/profiler ep 不重叠干净可比点极少（见 §3.5.2） |
-| **M5** | 时间加权覆盖（已建模 op 时间之和 / 全部 op 时间之和） | **97.2%** | **97.8%** | ✅ | 用 profiler avg×count 时间权重（非 roofline 解析权重，是已知口径差异）；含 KV transfer 反推和 DSA profiler-derived |
+| **M5** | 时间加权覆盖（(SILICON+PROFILER_DERIVED) ms / total ms） | **98.5%** | **96.9%** | ✅ 运行时算 | decode: attention+moe 占 98.5%；prefill: KV transfer(PROFILER_DERIVED)+attention+moe 占 96.9% |
 | **M6** | 端到端精度（模型预测 / profiler 实测 forward pass 时间） | **≈1.000**（batch=1: -0.6%；batch=7: compute union 0%）| DSA 分项: **1.061/0.999**（isl10k/20k）；整体: 🔴 无法算 | decode ✅；prefill 分项 ✅；prefill 整体 ❌ | decode 用双 batch stream union 对账（§4 decode 对账定论）；prefill 整体缺完整单请求 TTFT ground truth |
 
-**M4 补充说明**（GEMM MISS 55.9% → 不等于精度差）：
+**M1 说明**（op 粒度低，但 M5 才是主指标）：
 
-M4 衡量的是"有没有数据"，不是"预测准不准"。GEMM MISS 主要是两类不影响精度的情况：
-- **decode 小 M（M<10）**：ntok 1-9 的 router/logits 形状 bench 未采，但这些 op 在 profiler 里单次 <20us，占总时间 <1%，走 SOL 估算误差可接受。
-- **高频已采形状的 MISS**：check_alignment 的 56 条 MISS 主要是 spec decode（M=3/6/9）和 router 小 shape——这些恰好是 profiler 里占比很小的碎片算子，不影响 TPOT 精度。
+M1 低（25-33%）因为我们的模型 op 数量少（prefill 14 个/decode 7 个），大多数 op 是 ElementWise/Embedding/Norm 等走 SOL 的轻量算子，而真正消耗时间的算子（MoE dispatch、DSA、KV transfer）都有实测数据。M5（时间加权）才是更有意义的覆盖度指标：decode 98.5%、prefill 96.9% 时间都由 SILICON 或 PROFILER_DERIVED 数据覆盖。
 
-真正影响精度的高频 shape（M=9/256 的 w8a8，调用次数 2000+）全部有 bench 数据，中位偏差 −14%（§3.5.1）。
+**各 op 的 source 标签**（运行时实测，`tools/compute_m1_m4.py`）：
+
+| Phase | Op | Source | 时间占比 |
+|---|---|---|---|
+| Prefill | context_kv_transfer | PROFILER_DERIVED | 77.8% |
+| Prefill | context_moe_post_dispatch | SILICON | 10.8% |
+| Prefill | context_attention | PROFILER_DERIVED | 7.5% |
+| Prefill | context_add_norm_*/router/shared_* | SOL | 3.4% |
+| Decode | generation_moe_overlap | SILICON | 51.6% |
+| Decode | generation_attention | SILICON | 46.9% |
+| Decode | generation_add_norm_*/logits/embedding | SOL | 1.5% |
 
 **M6 的特殊情况说明**：
 

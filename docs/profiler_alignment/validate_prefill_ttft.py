@@ -41,7 +41,7 @@ def run_ctx(tp, ep, dp, isl):
     rc = config.RuntimeConfig(batch_size=1, beam_width=1, isl=isl, osl=1)
     # context-only breakdown
     backend = sess._backend
-    cdict, _, gdict, _ = backend._run_static_breakdown(
+    cdict, _, gdict, _, _, _ = backend._run_static_breakdown(
         sess._model, sess._database, rc, "static_ctx", 32, 1.0
     )
     dsa = cdict.get("context_attention", 0.0)

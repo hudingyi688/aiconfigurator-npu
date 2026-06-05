@@ -7,7 +7,7 @@ from typing import Optional
 
 from aiconfigurator_npu.sdk import common
 from aiconfigurator_npu.sdk.perf_database import PerfDatabase
-from aiconfigurator_npu.sdk.performance_result import PerformanceResult
+from aiconfigurator_npu.sdk.performance_result import PerformanceResult, QuerySource
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +52,12 @@ class CustomAllReduce(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query custom allreduce latency with power data."""
         if self._tp_size == 1:
-            return PerformanceResult(0.0, 0.0)
+            return PerformanceResult(0.0, 0.0, source=QuerySource.ZERO)
         # count, not size in bytes
         size = kwargs.get("x") * self._h
 
         result = database.query_custom_allreduce(common.CommQuantMode.half, self._tp_size, size)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -79,13 +79,13 @@ class P2P(Operation):
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query P2P latency with power data."""
         if self._pp_size == 1:
-            return PerformanceResult(0.0, 0.0)
+            return PerformanceResult(0.0, 0.0, source=QuerySource.ZERO)
 
         size = kwargs.get("x") * self._h
         p2p_bytes = size * 2
 
         result = database.query_p2p(p2p_bytes)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -117,7 +117,7 @@ class NCCL(Operation):
         message_size = kwargs.get("x") * self._num_elements_per_token
 
         result = database.query_nccl(self._comm_quant_mode, self._num_gpus, self._nccl_op, message_size)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -202,6 +202,7 @@ class GEMM(Operation):
         return PerformanceResult(
             latency=latency * self._scale_factor,
             energy=energy * self._scale_factor,
+            source=getattr(result, "source", None),
         )
 
     def get_weights(self, **kwargs):
@@ -318,7 +319,7 @@ class TrtLLMWideEPMoE(Operation):
             workload_distribution=self._workload_distribution,
         )
 
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         """Get the weight memory size for this MoE layer."""
@@ -445,7 +446,7 @@ class TrtLLMWideEPMoEDispatch(Operation):
             comm_latency = float(combine_result)
 
         # MoEDispatch returns no energy (communication ops don't track energy)
-        return PerformanceResult(comm_latency * self._scale_factor, energy=0.0)
+        return PerformanceResult(comm_latency * self._scale_factor, energy=0.0, source=QuerySource.SILICON)
 
     def get_weights(self, **kwargs):
         """MoE dispatch has no weight memory."""
@@ -516,7 +517,7 @@ class MoE(Operation):
             database.backend == common.BackendName.vllm_ascend.value
             and self._moe_ep_size > 1
         ):
-            return PerformanceResult(0.0, energy=0.0)
+            return PerformanceResult(0.0, energy=0.0, source=QuerySource.ZERO)
 
         # attention dp size will scale up the total input tokens.
         x = kwargs.get("x") * self._attention_dp_size
@@ -539,7 +540,7 @@ class MoE(Operation):
             enable_eplb=self._enable_eplb,
         )
 
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -843,7 +844,7 @@ class MoEDispatch(Operation):
             raise NotImplementedError(f"MoEDispatch: Not implemented for backend {database.backend}")
 
         # MoEDispatch calculates latency rather than querying, so energy=0
-        return PerformanceResult(comm_latency * self._scale_factor, energy=0.0)
+        return PerformanceResult(comm_latency * self._scale_factor, energy=0.0, source=QuerySource.SILICON)
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -939,14 +940,14 @@ class KVTransfer(Operation):
             database.backend == common.BackendName.vllm_ascend.value
             and self._is_disagg_prefill
         ):
-            return PerformanceResult(0.0, energy=0.0)
+            return PerformanceResult(0.0, energy=0.0, source=QuerySource.ZERO)
 
         # isl arrives as the per-request sequence length (s). The table is
         # keyed on the EP size of the prefill worker; ep<=1 clamps to the
         # measured ep=0 (dp-only, no EP) row inside query_kv_transfer.
         isl = int(kwargs.get("s"))
         result = database.query_kv_transfer(isl, self._moe_ep_size)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights
@@ -1016,7 +1017,7 @@ class ContextAttention(Operation):
         if seq_imbalance_correction_scale != 1.0:
             result = result * seq_imbalance_correction_scale
 
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1075,7 +1076,7 @@ class GenerationAttention(Operation):
         )
         if gen_seq_imbalance_correction_scale != 1.0:
             result = result * gen_seq_imbalance_correction_scale
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1116,7 +1117,7 @@ class ContextMLA(Operation):
             kvcache_quant_mode=self._kvcache_quant_mode,
             fmha_quant_mode=self._fmha_quant_mode,
         )
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1150,7 +1151,7 @@ class GenerationMLA(Operation):
         s = kwargs.get("s")
 
         result = database.query_generation_mla(batch_size, s, self._num_heads, self._kv_cache_dtype)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1184,7 +1185,7 @@ class MLABmm(Operation):
         batch_size = kwargs.get("batch_size")
 
         result = database.query_mla_bmm(batch_size, self._num_heads, self._quant_mode, self._if_pre)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1217,7 +1218,7 @@ class Embedding(Operation):
         d2d_bytes = x * self._column_size * 2
 
         result = database.query_mem_op(d2d_bytes)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1254,7 +1255,7 @@ class ElementWise(Operation):
         write_bytes = x * self._dim_out * 2
 
         result = database.query_mem_op(read_bytes + write_bytes)
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1295,7 +1296,7 @@ class WideEPGenerationMLA(Operation):
             self._fmha_quant_mode,
             self._attn_backend,
         )
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1338,7 +1339,7 @@ class WideEPContextMLA(Operation):
             fmha_quant_mode=self._fmha_quant_mode,
             attention_backend=self._attn_backend,
         )
-        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor)
+        return PerformanceResult(float(result) * self._scale_factor, energy=result.energy * self._scale_factor, source=getattr(result, "source", None))
 
     def get_weights(self, **kwargs):
         return self._weights * self._scale_factor
@@ -1399,6 +1400,7 @@ class Mamba2Kernel(Operation):
         return PerformanceResult(
             latency=float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", None),
         )
 
     def get_weights(self, **kwargs):
@@ -1463,6 +1465,7 @@ class GDNKernel(Operation):
         return PerformanceResult(
             latency=float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", None),
         )
 
     def get_weights(self, **kwargs):
@@ -1614,6 +1617,7 @@ class Mamba2(Operation):
         return PerformanceResult(
             latency=total_latency * self._scale_factor,
             energy=total_energy * self._scale_factor,
+            source=QuerySource.SOL,
         )
 
     def get_weights(self, **kwargs):  # Mamba2 weights
@@ -1745,6 +1749,7 @@ class ContextDSAModule(Operation):
         return PerformanceResult(
             latency * self._scale_factor,
             energy=energy * self._scale_factor,
+            source=QuerySource.PROFILER_DERIVED if use_profiler else QuerySource.SOL,
         )
 
     def get_weights(self, **kwargs):
@@ -1796,6 +1801,7 @@ class GenerationDSAModule(Operation):
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", None),
         )
 
     def get_weights(self, **kwargs):
@@ -1838,21 +1844,34 @@ class OverlapOp(Operation):
         """
         latency_a = 0.0
         energy_a = 0.0
+        sources_a: list = []
         for op in self._group_a:
             result = op.query(database, **kwargs)
             latency_a += float(result)
             energy_a += getattr(result, "energy", 0.0)
+            sources_a.append(getattr(result, "source", None))
 
         latency_b = 0.0
         energy_b = 0.0
+        sources_b: list = []
         for op in self._group_b:
             result = op.query(database, **kwargs)
             latency_b += float(result)
             energy_b += getattr(result, "energy", 0.0)
+            sources_b.append(getattr(result, "source", None))
+
+        # Pick source from the dominant (slower) group's best data quality
+        all_sources = set(sources_a + sources_b) - {None}
+        dominant_source = (
+            QuerySource.SILICON if QuerySource.SILICON in all_sources
+            else QuerySource.PROFILER_DERIVED if QuerySource.PROFILER_DERIVED in all_sources
+            else QuerySource.SOL
+        )
 
         return PerformanceResult(
             latency=max(latency_a, latency_b),
             energy=energy_a + energy_b,
+            source=dominant_source,
         )
 
     def get_weights(self, **kwargs):
