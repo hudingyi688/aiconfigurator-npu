@@ -503,6 +503,13 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 **覆盖率定义口径**:  
 AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径执行时间的份额**（profiler时间占比，= avg×count）。
 
+**执行时间说明**：
+- **执行时间（Execution Time）** = 从请求开始到结束的真实耗时（wall-clock时间）
+- 包括kernel计算、通信、调度、同步等待等所有环节
+- 区别于"device时间"：device时间只统计GPU/NPU纯计算时间，不含调度和等待开销
+- Prefill执行时间：prefill阶段（首个token生成前）的总耗时，即TTFT
+- Decode执行时间：decode阶段（后续每个token生成）的平均耗时，即TPOT
+
 **Prefill阶段覆盖率分解**（KV transfer占87.2%，采用§2.2所述profiler反推建模）:
 
 | 建模方式 | 时间占比 | 主要算子类型 |
