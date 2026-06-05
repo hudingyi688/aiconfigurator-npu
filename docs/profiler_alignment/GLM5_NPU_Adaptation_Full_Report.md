@@ -500,6 +500,8 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 
 ### 3.3 算子覆盖率现状（按profiler执行时间份额）
 
+> **本节只回答"覆盖度"**：profiler 出现的算子，txt 里有没有对应建模（有/无，及占多少时间份额）。**不涉及精度**——精度（实采值与 profiler 的偏差）见 §3.5，且只对实采算子有意义。
+
 **覆盖率定义口径**:  
 AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径执行时间的份额**（profiler时间占比，= avg×count）。
 
@@ -577,17 +579,36 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 本轮新建模KVTransfer算子 → 覆盖率10.6%→97.8%
 ```
 
-### 3.5 GEMM算子级偏差验证（check_alignment.py全量结果）
+### 3.5 算子时间匹配度（仅对 microbench 实采的算子）
+
+> **三件事必须分开看**（本节只讲第 2 件）：
+> 1. **采集方式** —— 数据怎么来的：microbench 实采 vs profiler 反推。决定了"能不能比"。
+> 2. **算子时间匹配度** —— txt 实采值 vs profiler 实测的偏差。**只对 microbench 实采的算子有意义**（GEMM、MoE dispatch）；profiler 反推的数据（KV transfer、prefill DSA）是从 profiler 提取的，自己比自己无意义，不在此列。
+> 3. **覆盖度** —— profiler 出现的算子/shape，txt 里有没有对应数据（见 §3.3，纯有无，不掺精度）。
+>
+> 按采集方式分类（详见 §5）：
+>
+> | 算子族 | profiler 时间占比* | 采集方式 | 能否做匹配度对齐 |
+> |---|---|---|---|
+> | GEMM | 20.4% | microbench 实采 | ✅ 见 §3.5.1 |
+> | MoE dispatch (FusedMC2) | 20.0% | microbench 实采 | ⚠️ 可比点极少，见 §3.5.2 |
+> | Comm (KV transfer 为主) | 56.0% | **profiler 反推** | ❌ 数据即来自 profiler |
+> | DSA prefill | (含在 1.8%) | **profiler 反推** | ❌ 同上，靠端到端锚定（§4.5）|
+> | DSA decode / ElementWise / 其他 | <3% | 实采 / SOL | decode 可比；SOL 部分 YAGNI |
+>
+> \* 跨 prefill/decode 多 run 求和的占比，KV transfer 被累加放大；单配置下 prefill comm ~80%、decode 近 0。
+
+#### 3.5.1 GEMM 匹配度（check_alignment.py）
 
 **对齐工具**: `tools/check_alignment.py`  
 - 逐shape比对profiler median vs bench实测
 - 纯CSV解析，不依赖运行时框架
-- 用法：`python3 tools/check_alignment.py --groundtruth docs/profiler_alignment/groundtruth/by_op_family.csv`
+- 用法：`python3 tools/check_alignment.py`
 
 **数据集统计**:
 - 71条 real-signal（kernel≥30us）
 - 14条 small-op（<30us，~1%时间占比）
-- 57条 bench MISS（该shape未采）
+- 56条 bench MISS（该shape未采）
 
 **整体偏差分布**:
 
@@ -642,7 +663,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 - 方向一致偏低~20%，疑似bench TP切分边界与profiler实际切法差异
 - 绝对偏差<50%，可接受，未阻塞寻优
 
-**（D）bench未采的高频shape — 57条MISS**
+**（D）bench未采的高频shape — 56条MISS**
 
 | shape (M,N,K) | Profiler调用次数 | Profiler中位 | 说明 |
 |---|---:|---:|---|
@@ -651,6 +672,26 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 | (3,32,6144) | 8611 | 12.2us | router小op |
 
 > **小结**: 71条real-signal中位偏差-14%，61条在±50%内。异常多为算子归类错位（非数据质量问题），高频算子对齐良好。
+
+#### 3.5.2 MoE dispatch 匹配度（check_moe_alignment.py）
+
+**对齐工具**: `tools/check_moe_alignment.py`（本轮新增，覆盖 FusedMC2 融合算子）
+
+为什么不能套 GEMM 那张表的口径——两个必须按 (phase, ep) 切分的陷阱：
+
+1. **`by_op_family.csv` 聚合污染**：它把不同 (phase, ep) 的同 num_tokens 行求 median，会把 decode（小 M、ep8/10）和 prefill（大计算量、ep0/16）混成一个无意义的中位数。本工具改用 `detail.csv`，按 (phase, ep, num_tokens) 严格分组。
+2. **dispatch 强 ep 依赖，跨 ep 不能比**：实测 ntok=8 时 ep2=1711us / ep8=867 / ep32=301，差 **5.7×**。所以拿 profiler 的 ep0/10/16 去夹取到 bench 的 ep2/4/8/32 会制造 +100%~+190% 的**假偏差**。只能在严格同 ep 的点上比。
+
+**比对结果（严格同 ep）**:
+
+| phase | ep | ntok | profiler中位(us) | bench(us) | 偏差 | 备注 |
+|---|---|---|---|---|---|---|
+| decode | 8 | 1 | 267.7 | 303.0 | +13.2% | ✅ OK |
+| decode | 8 | 2 | 322.6 | 502.7 | +55.9% | ⚠️ bench 小 M 区 artifact（ntok=2 反常峰值）|
+
+**关键现实**: bench 表 ep∈{2,4,8,32}、profiler 实测 ep∈{0,8,10,16}，几乎不重叠——**干净可比点只有 decode ep8 的 ntok=1/2 两个**。这说明 MoE dispatch 的可信度**不来自匹配度**（没有足够可比点），而来自**采集方式**：它是生产 ep32 直接实采的 microbench，ep32 那次 **10.8× 吞吐修正**就是用实采值替换了原来的 ep8-clamp（§4.3）。profiler 侧 prefill 的 256-token（2000+us）与 decode 的同 num_tokens（~300us）是不同物理量（prefill 每 token attend 累积 KV），更不能混比。
+
+> **小结**: GEMM 有 71 个可比点、匹配度 -14% 可信；MoE dispatch 几乎无干净可比点，靠实采采集方式保证（非匹配度）。两者都只覆盖**实采**算子——profiler 占比最大的 KV transfer（反推）不在匹配度范畴，其可信度见 §4.1 端到端 union 锚定。
 
 ### 3.6 配置寻优结果验证（commit 6849445）
 
@@ -1219,7 +1260,10 @@ def create_dsa_module(num_heads_override):
 > - ✅ **KV transfer 去 overlap_factor**：改 net 墙钟直存 + isl>20k 线性外推（§4.1）
 > - ✅ **prefill comm 收口**：证伪"多流高估"（§3.8）
 
-### 6.1 剩余高优先级（需 NPU 环境）
+### 6.1 剩余高优先级（需 NPU 环境）—— 属【采集方式】补齐，非匹配度
+
+> KV transfer 是 **profiler 反推**的数据，不进 §3.5 的匹配度对账（自己比自己无意义）。
+> 它的改进路径是**补齐采集**：把 isl>20k 的线性外推换成实采点，让反推表覆盖更全。
 
 **1. 补采 isl=40k/80k 的 KV transfer profiler（唯一未实测数据项）**
 
