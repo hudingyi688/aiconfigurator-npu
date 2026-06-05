@@ -441,7 +441,64 @@ GLM-5是671B级MoE模型，采用DeepSeek V3架构，核心参数：
 > SparseFlashAttention = 78 层 + 2 个 MTP（推测解码）层；本报告凡涉及单请求
 > 层聚合处统一用 78 层主干口径。
 
-### 3.2 算子覆盖率现状（按profiler墙钟时间份额）
+### 3.2 完整算子类型与采集覆盖
+
+**算子类型由模型config决定存在性，由vllm-ascend决定具体实现路径**：
+
+| 算子类型 | 维度/参数 | 层数分布 | 作用说明 | 采集脚本 | 采集状态 |
+|---------|----------|---------|---------|---------|---------|
+| **Embedding** | vocab=154880 → hidden=6144 | 1层 | Token ID到hidden向量映射，prefill首token执行 | - | ✅ 忽略（延迟<50us） |
+| **Dense MLP** | 6144 → 12288×2 → 6144 | 3层（layer0-2） | `first_k_dense_replace=3`，标准FFN（gate_up+down） | `collect_gemm.py` | ✅ 已有BF16/W8A8数据 |
+| **MoE routed experts** | 6144 → 2048×2 → 6144，256专家topk=8 | 75层（layer3-77） | 每token路由到8个expert，GroupedGEMM并行 | `collect_moe.py` | ✅ DeepSeek-V3数据复用 |
+| **MoE shared expert** | 6144 → 2048×2 → 6144，1专家 | 75层 | 所有token都经过，与routed并行后相加 | `collect_gemm.py` | ✅ 已有数据（同Dense MLP） |
+| **DSA Attention** | MLA参数 + index_topk=2048 | 全部78层 | 完整MLA模块：投影→稀疏attention→输出 | `collect_mla_module.py` | ✅ profiler-derived（§4.5） |
+| **RMSNorm** | hidden=6144 | 78×2+1=157次 | 每层的input/post norm + 最终norm | `collect_elementwise.py` | ✅ 已有数据 |
+| **LM Head** | 6144 → 154880 | 1层 | Hidden投影到词表，取argmax得next token | `collect_gemm.py` | ✅ 已有数据（大N GEMM） |
+| **AllReduce** | hidden=6144 | 每层（TP>1） | TP模式attention/MLP后的通信合并 | - | ✅ SOL解析估算 |
+| **AllToAll** | token维度 | 每MoE层（EP>1） | EP模式token dispatch/combine | `collect_moe_dispatch_combine.py` | ✅ 已有ep32实测（§4.3） |
+
+**关键发现：MoE数据无需重采**
+
+GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
+
+| 参数 | GLM-5 | DeepSeek-V3 | 数据复用情况 |
+|------|-------|-------------|-------------|
+| MoE hidden输入 | 7168 | 7168 | ✅ 完全一致 |
+| intermediate_size | 2048 | 2048 | ✅ 完全一致 |
+| num_experts | 256 | 256 | ✅ 完全一致 |
+| topk | 8 | 8 | ✅ 完全一致 |
+
+`moe_perf.txt`已包含该配置（GroupedGEMM BF16/W8A8），无需重新采集。
+
+**采集脚本覆盖矩阵**：
+
+| 采集脚本 | 覆盖算子 | 输出文件 | 状态 |
+|---------|---------|---------|------|
+| `collect_gemm.py` | Dense MLP、shared expert、LM Head | `gemm_perf.txt` | ✅ 已有实测（4942行） |
+| `collect_moe.py` | MoE routed experts | `moe_perf.txt` | ✅ 已有实测（196行） |
+| `collect_mla_module.py` | DSA Attention完整module | `dsa_context_attn_core_perf.txt`<br>`dsa_generation_module_perf.txt` | ✅ profiler-derived（§4.5） |
+| `collect_moe_dispatch_combine.py` | FusedMC2（AllToAll融合） | `moe_dispatch_combine_perf.txt` | ✅ 已有实测（170行，含ep32） |
+| `collect_elementwise.py` | RMSNorm | `rmsnorm_perf.txt`等 | ✅ 已有实测 |
+| `collect_attn.py` | 标准MHA（非DSA） | `context/generation_attention_perf.txt` | — GLM-5不使用 |
+| 解析模型 | AllReduce | - | ✅ SOL估算 |
+
+**数据依赖关系**：
+- **SILICON模式**：全部使用实测数据（GEMM/MoE/DSA/FusedMC2），缺数据则报错
+- **HYBRID模式**：实测优先，缺失算子退回SOL解析（如AllReduce）
+- **CALIBRATION模式**：SOL解析 + profiler校准系数
+
+**本轮适配进展**：
+
+| 阶段 | 状态 | 关键里程碑 |
+|------|------|-----------|
+| 架构分析 | ✅ 完成 | GLM-5算子类型、维度梳理完成 |
+| MoE数据 | ✅ 完成 | DeepSeek-V3数据覆盖，无需重采 |
+| DSA采集 | ✅ 完成 | 改profiler-derived（§4.5），端到端锚定 |
+| FusedMC2 | ✅ 完成 | 补采ep32（§4.3），触发10.8×吞吐修正 |
+| KV Transfer | ✅ 完成 | Profiler反推建模（§4.1），覆盖率10.6%→97.8% |
+| 配置寻优验证 | ✅ 完成 | 推荐配置与生产100%一致（§3.6） |
+
+### 3.3 算子覆盖率现状（按profiler墙钟时间份额）
 
 **覆盖率定义口径**:  
 AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径墙钟时间的份额**（profiler时间占比，= avg×count）。
@@ -465,7 +522,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 | **已建模合计** | **97.2%** | - |
 | 未覆盖 | 2.8% | misc + TP>1 DSA经HYBRID |
 
-> **注（2026-06 口径变化）**: Prefill的KV transfer建模采用profiler反推方式（§2.2），区别于常规算子的SILICON/CALIBRATION/HYBRID三类方式。prefill的DSA建模来源已从合成silicon改为profiler-derived（§4.5）——这不改变覆盖率份额（DSA在prefill墙钟里本就只占个位数百分比），只改变DSA那部分的数据来源与绝对值精度。覆盖率口径下"prefill主导项是KV transfer"与§3.6的单请求建模口径一致。
+> **注（2026-06 口径变化）**: Prefill的KV transfer建模采用profiler反推方式（§2.2），区别于常规算子的SILICON/CALIBRATION/HYBRID三类方式。prefill的DSA建模来源已从合成silicon改为profiler-derived（§4.5）——这不改变覆盖率份额（DSA在prefill墙钟里本就只占个位数百分比），只改变DSA那部分的数据来源与绝对值精度。覆盖率口径下"prefill主导项是KV transfer"与§3.7的单请求建模口径一致。
 
 **Decode实测数据构成**（墙钟份额，按算子类型）:
 
@@ -478,7 +535,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 | mla_preprocess/DynamicQuant | 2.2% | SOL估算 | MLA预处理+量化 |
 | 其他碎片算子 | 2.8% | 未建模 | Pad/MemSet/batch_get/采样等 |
 
-### 3.3 与生产Profiler算子对比（Top算子墙钟时间）
+### 3.4 与生产Profiler算子对比（Top算子墙钟时间）
 
 **数据源**: 11个GLM-5生产profiler run  
 - Prefill/decode × dp/ep配置组合
@@ -513,7 +570,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 本轮新建模KVTransfer算子 → 覆盖率10.6%→97.8%
 ```
 
-### 3.4 GEMM算子级偏差验证（check_alignment.py全量结果）
+### 3.5 GEMM算子级偏差验证（check_alignment.py全量结果）
 
 **对齐工具**: `tools/check_alignment.py`  
 - 逐shape比对profiler median vs bench实测
@@ -588,7 +645,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 
 > **小结**: 71条real-signal中位偏差-14%，61条在±50%内。异常多为算子归类错位（非数据质量问题），高频算子对齐良好。
 
-### 3.5 配置寻优结果验证（commit 6849445）
+### 3.6 配置寻优结果验证（commit 6849445）
 
 **寻优流程执行**:
 
@@ -643,7 +700,7 @@ Pin约束后（task.py:250-252）:
 **验证结论**:  
 推荐配置与生产配置完全一致，证明寻优模型在**配置形态选择**上有效。
 
-### 3.6 SLO 寻优结果与可信边界（profiler-derived DSA + ep32 修正版）
+### 3.7 SLO 寻优结果与可信边界（profiler-derived DSA + ep32 修正版）
 
 > ⚠️ **本节相对 2026-05-30 初版有三处重大推翻**：
 > （1）prefill 主导项是 **KV transfer 不是 DSA**；（2）TPOT **达标不超标**；
@@ -666,7 +723,7 @@ Pin约束后（task.py:250-252）:
 | Prefill DSA 口径 | nh=4 合成 + 无 CP 切（放大 ~20×） | profiler-derived + CP 切 query | 端到端锚定，DSA 回到真实 8%~23% |
 | Decode MoE dispatch ep | ep8-clamp 高估 16% | 补采生产 ep32 | **10.8× 单卡吞吐修正** |
 | KV transfer isl>20k | clamp 持平（低估） | 顶部两点线性外推 | disagg 长序列 TTFT 更准 |
-| prefill comm 重叠疑虑 | 怀疑多流高估 | 三路全 overlap-aware（§3.7）| 怀疑收口，无高估 |
+| prefill comm 重叠疑虑 | 怀疑多流高估 | 三路全 overlap-aware（§3.8）| 怀疑收口，无高估 |
 
 **SLO 寻优最优配置**（64 卡，osl=2500，TPOT<70ms，HYBRID；**ep32 实测后**）:
 
@@ -706,7 +763,7 @@ Pin约束后（task.py:250-252）:
 > DSA 退居次要（8%~23%，sparse topk 封顶使其增长受限）。降 prefill TTFT 的重点是
 > **减 mooncake KV transfer**（连接器/带宽/重叠），而非初版以为的「减 DSA 重算」。
 
-### 3.7 Prefill 通信（comm）建模收口（2026-06-05）
+### 3.8 Prefill 通信（comm）建模收口（2026-06-05）
 
 **疑问**: AIConfigurator 把各算子延迟串行相加（`base_backend.py` 对 context_ops
 做 `sum()`，无 union/overlap 逻辑）。那 profiler 里与 compute **重叠**的通信
@@ -888,7 +945,7 @@ ep8-clamp 高估 dispatch
 ```
 
 > 旧版"全 bs=1、5.75 tok/s/gpu"是 ep8-clamp 高估 dispatch 的 artifact，**已作废**。
-> 详细 SLO 结果见 §3.6。当前 ep64 仍 snap 到最近的 ep32（grid 最大点），是已知近似。
+> 详细 SLO 结果见 §3.7。当前 ep64 仍 snap 到最近的 ep32（grid 最大点），是已知近似。
 
 ### 4.4 Wrapper内存溢出
 
@@ -1153,7 +1210,7 @@ def create_dsa_module(num_heads_override):
 > - ✅ **DSA num_heads 覆盖**：补采 nh∈{2,4,16}，prefill 进一步转 profiler-derived（§4.5）
 > - ✅ **prefill DSA 单请求端到端锚定**：用生产单请求 profiler kernel timeline 锚定（isl≤20k 核心 +0.0%/+6%，§4.5）
 > - ✅ **KV transfer 去 overlap_factor**：改 net 墙钟直存 + isl>20k 线性外推（§4.1）
-> - ✅ **prefill comm 收口**：证伪"多流高估"（§3.7）
+> - ✅ **prefill comm 收口**：证伪"多流高估"（§3.8）
 
 ### 6.1 剩余高优先级（需 NPU 环境）
 
@@ -1473,7 +1530,7 @@ A6: 大部分已 close，剩余很少：
 
 **Q7: 既然算子串行相加，prefill 里与 compute 重叠的通信会不会被高估？**
 
-A7: 不会（2026-06-05 核实，§3.7）：
+A7: 不会（2026-06-05 核实，§3.8）：
 - GLM-5 prefill 几乎不注册独立解析 comm op（无通用 all-reduce/reduce-scatter）
 - 主要 comm 走**实测墙钟**：fused MoE（on-device kernel，重叠 baked-in）+ KV
   transfer（net 墙钟，重叠已扣）
