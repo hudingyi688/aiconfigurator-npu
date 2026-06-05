@@ -2,50 +2,25 @@
 
 > **状态**: 2026-06-05 更新版（基于 profiler-derived DSA 修正 + ep32 实测 + comm 收口）  
 > **分支**: `local/dsa-debug-snapshot` (HEAD 316a8e0)  
-> **适用对象**: GLM-5-w8a8 / Ascend 910B / vllm-ascend 0.18.0  
-> **总时长**: 75分钟技术分享
-
----
-
-## 0. 版本修正记录（2026-05-30 → 2026-06-05，必读）
-
-本报告初版（2026-05-30）的几项核心结论在 6 月初的深入核查中被**实测推翻**。
-若读到旧版结论请以本节为准。三项作废结论 + 三项新增工作：
-
-**已作废（旧版错误，根因已定位）**:
-
-| 旧版结论（2026-05-30） | 实测修正（2026-06-04/05） | 根因 |
-|---|---|---|
-| DSA 是 prefill 绝对主导（占 64%→92%） | **KV transfer 才是主导（77%~82%）；DSA 仅占 8%~23%** | 旧版用 `nh=4` 合成 silicon + 没按 Context Parallelism 切 query（每卡 query 当成完整 chunk 4096，实际 CP16 下只 256），把 DSA 放大 ~20× |
-| 4 档 prefill TTFT 全超 SLO 2.6×~4.4×、TPOT 87ms 超标 | **TPOT 全档 26~34ms 达标；agg 模式 4 档吞吐 62/39/9 tok/s/gpu** | DSA 口径错 + dispatch ep8-clamp 高估，连锁放大 |
-| TPOT 高估 1.6×（module 间并行未建模） | **模型本就准（batch=1 对账 −0.6%）**，attention‖MoE 硬件串行，串行相加结构正确 | 旧版是错误对账的产物（拿 b=1 预测对错了口径的 profiler 数据） |
-
-**新增工作（6 月）**:
-1. **prefill DSA 改 profiler-derived**（放弃合成 silicon——该机 SFA binary 缺失 561002 无法合成采集）：用生产单请求 profiler 实测的 attention 核心建表 `dsa_context_attn_core_perf.txt`，CP 切 query，端到端锚定（isl=20480 核心 +0.0% / 10k −5.7%）。详见 §4.5。
-2. **MoE dispatch 补采生产 ep32**（2×A3 节点），grid 从 {2,4,8} 扩到 {2,4,8,32}；修掉 ep8-clamp 高估，触发 **10.8× 单卡吞吐修正**。详见 §4.3。
-3. **KV transfer 去掉 overlap_factor 改 net 墙钟直存** + isl>20k 线性外推（原 clamp 持平低估）。详见 §4.1。
-4. **prefill 通信（comm）收口（2026-06-05）**：核实「comm 重叠是否被当全暴露串行加」——结论**否**，模型对 prefill comm 三路处理全 overlap-aware（fused MoE→实测 kernel 墙钟 / KV transfer→net 墙钟 / attention all-reduce→SOL×profiler 校准 0.1409），不存在多流高估。详见 §3.6。
-
-**当前状态**: 工作区干净，63 测试通过，已推送 `local/dsa-debug-snapshot`（HEAD 316a8e0）。
+> **适用对象**: GLM-5-w8a8 / Ascend 910B / vllm-ascend 0.18.0
 
 ---
 
 ## 目录
 
-0. [版本修正记录（必读）](#0-版本修正记录2026-05-30--2026-06-05必读)
-1. [项目背景与目标](#1-项目背景与目标-5分钟)
-2. [技术方案核心设计](#2-技术方案核心设计-10分钟)
-3. [GLM-5适配情况与结果](#3-glm-5适配情况与结果-20分钟)
-4. [技术难点与解决方案](#4-技术难点与解决方案-10分钟)
-5. [数据采集工程实践](#5-数据采集工程实践-8分钟)
-6. [后续计划](#6-后续计划-5分钟)
-7. [项目价值总结](#7-项目价值总结-2分钟)
-8. [与传统Profiling方法的对比](#8-与传统profiling方法的对比-5分钟)
-9. [Q&A](#9-qa-5分钟)
+1. [项目背景与目标](#1-项目背景与目标)
+2. [技术方案核心设计](#2-技术方案核心设计)
+3. [GLM-5适配情况与结果](#3-glm-5适配情况与结果)
+4. [技术难点与解决方案](#4-技术难点与解决方案)
+5. [数据采集工程实践](#5-数据采集工程实践)
+6. [后续计划](#6-后续计划)
+7. [项目价值总结](#7-项目价值总结)
+8. [与传统Profiling方法的对比](#8-与传统profiling方法的对比)
+9. [Q&A](#9-qa)
 
 ---
 
-## 1. 项目背景与目标 (5分钟)
+## 1. 项目背景与目标
 
 ### 1.1 项目定位
 
@@ -138,7 +113,7 @@ Decode Worker:
 
 ---
 
-## 2. 技术方案核心设计 (10分钟)
+## 2. 技术方案核心设计
 
 ### 2.1 设计范式
 
@@ -219,6 +194,18 @@ AIConfigurator的核心设计范式：
        ..., max_output_size=calculated_size
    )
    ```
+
+6. **KV Transfer建模方式（profiler trace反推，非单算子采集）**  
+   
+   KV transfer是PD分离模式下Mooncake P2P KV传输的组合行为，包含调度器+IPC+AICPU+HCCL操作，**不是单算子**，无法用常规采集脚本独立计时。建模方式：
+   
+   - **数据来源**：生产profiler kernel timeline（11个run）
+   - **建模方法**：按(ep, isl)聚合KV传输族算子的**net墙钟时间**（时间轴union − 与compute重叠）
+   - **输出文件**：`kv_transfer_perf.txt`（6行实测网格：ep∈{1,16} × isl∈{2500,10k,20k}）
+   - **口径关键**：存的是profiler实测net KV墙钟（不是device时间×overlap_factor），必用median（mean被rank同步气泡污染）
+   - **长序列处理**：isl>20k按顶部两点线性外推（标记为🟡估计非实测）
+   
+   这种"profiler反推建模"方式是对调度器不可见行为的补充建模，区别于§2.3的三类建模方式（SILICON/CALIBRATION/HYBRID），专门用于**算子级不可见的系统级行为**（详见§4.1）。
 
 ### 2.3 三类建模方式
 
@@ -324,27 +311,33 @@ _AUTOSCALE_TTFT_CORRECTION_FACTOR = 1.0  # 已禁用
 
 ---
 
-## 3. GLM-5适配情况与结果 (20分钟) ⭐核心章节
+## 3. GLM-5适配情况与结果
 
 ### 3.1 算子覆盖率现状（按profiler墙钟时间份额）
 
 **覆盖率定义口径**:  
 AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径墙钟时间的份额**（profiler时间占比，= avg×count）。
 
-| 阶段 | SILICON实测 | CALIBRATION | KV transfer建模 | **已建模合计** | 未覆盖 |
-|------|------------|-------------|----------------|-----------|--------|
-| **Prefill** | 6.6% | 4.0% | **87.2%** | **97.8%** | 2.2%（misc内存搬运/采样） |
-| **Decode** | **94.9%** | 0.0% | - | **97.2%** | 2.8%（misc + TP>1 DSA经HYBRID） |
+**Prefill阶段覆盖率分解**（KV transfer占87.2%，采用§2.2所述profiler反推建模）:
 
-**本轮两项关键变化**:
-1. Prefill：KVTransfer建模 → 87.2%从「未覆盖」转为「已建模」，覆盖率10.6%→97.8%
-2. Decode：FusedMC2硅表 → MoE dispatch（45.5%）从calibration升级为silicon，calibration清零
+| 建模方式 | 墙钟占比 | 主要算子类型 |
+|------|------|---------|
+| SILICON实测 | 6.6% | MatMul/投影GEMM/attention core(profiler-derived) |
+| CALIBRATION | 4.0% | SOL解析+系数修正 |
+| KV Transfer建模 | **87.2%** | Mooncake KV传输族（profiler反推，见§2.2/§4.1） |
+| **已建模合计** | **97.8%** | - |
+| 未覆盖 | 2.2% | misc内存搬运/采样 |
 
-> **注（2026-06 口径变化）**: 上表覆盖率份额是**生产 profiler 墙钟时间占比**，仍有效。
-> 但 prefill 的 **DSA 建模来源已从合成 silicon 改为 profiler-derived**（详见 §4.5）——
-> 这不改变覆盖率份额（DSA 在 prefill 墙钟里本就只占个位数百分比），只改变 DSA 那部分
-> 的数据来源与绝对值精度。覆盖率口径下"prefill 主导项是 KV transfer"与下文 §3.5 的
-> 单请求建模口径一致。
+**Decode阶段覆盖率分解**:
+
+| 建模方式 | 墙钟占比 | 主要算子类型 |
+|------|------|---------|
+| SILICON实测 | **94.9%** | MoE dispatch+FFN+combine融合算子、W8A8 GEMM、DSA module |
+| CALIBRATION | 0.0% | calibration清零（FusedMC2硅表取代） |
+| **已建模合计** | **97.2%** | - |
+| 未覆盖 | 2.8% | misc + TP>1 DSA经HYBRID |
+
+> **注（2026-06 口径变化）**: Prefill的KV transfer建模采用profiler反推方式（§2.2），区别于常规算子的SILICON/CALIBRATION/HYBRID三类方式。prefill的DSA建模来源已从合成silicon改为profiler-derived（§4.5）——这不改变覆盖率份额（DSA在prefill墙钟里本就只占个位数百分比），只改变DSA那部分的数据来源与绝对值精度。覆盖率口径下"prefill主导项是KV transfer"与§3.5的单请求建模口径一致。
 
 **Decode实测数据构成**（墙钟份额，按算子类型）:
 
@@ -620,7 +613,7 @@ Pin约束后（task.py:250-252）:
 
 ---
 
-## 4. 技术难点与解决方案 (10分钟)
+## 4. 技术难点与解决方案
 
 ### 4.1 KV Transfer建模攻关（本轮核心突破）
 
@@ -868,7 +861,7 @@ v256/idx32）匹配 `GlmMoeDsaForCausalLM` 条目。投影 SOL 沿用 DeepseekV3
 
 ---
 
-## 5. 数据采集工程实践 (8分钟)
+## 5. 数据采集工程实践
 
 ### 5.1 采集脚本体系
 
@@ -1025,7 +1018,7 @@ def create_dsa_module(num_heads_override):
 
 ---
 
-## 6. 后续计划 (5分钟)
+## 6. 后续计划
 
 > **已完成项（6 月，原计划列在"高优先级"，现已落地）**:
 > - ✅ **MoE dispatch 补采生产 ep32**（2×A3 节点）→ grid {2,4,8,32}，触发 10.8× 吞吐修正（§4.3）
@@ -1084,7 +1077,7 @@ batch profiler 验证 KV pool 是否仍 < compute。
 
 ---
 
-## 7. 项目价值总结 (2分钟)
+## 7. 项目价值总结
 
 ### 7.1 量化成果
 
@@ -1155,7 +1148,7 @@ KVTransfer.query(ep, isl) = interpolate_grid(kv_transfer_perf.txt)  # net_kv_wal
 
 ---
 
-## 8. 与传统Profiling方法的对比 (5分钟) ⭐核心章节
+## 8. 与传统Profiling方法的对比
 
 ### 8.1 方法论本质差异
 
@@ -1295,7 +1288,7 @@ AIConfigurator表现:
 
 ---
 
-## 9. Q&A (5分钟)
+## 9. Q&A
 
 ### 9.1 常见问题预设
 
@@ -1471,16 +1464,6 @@ def _build_disagg_summary_dict(
 
 ---
 
-**总时长**: 75分钟
-
-**核心重点**:
-- §3 GLM-5适配情况（20分钟，含详细量化数据）
-- §8 与传统方法对比（5分钟，突出方法论差异与互补性）
-- §2 配置寻优技术（10分钟，含搜索空间与修正系数）
-- §4 技术难点攻关（10分钟，KV Transfer与DSA SFA突破）
-
----
-
 **文档版本**: v2.0（profiler-derived DSA + ep32 实测 + comm 收口）  
-**生成时间**: 2026-06-05（初版 2026-05-30，见 §0 修正记录）  
+**生成时间**: 2026-06-05  
 **适用场景**: 技术分享、项目复盘、技术评审
