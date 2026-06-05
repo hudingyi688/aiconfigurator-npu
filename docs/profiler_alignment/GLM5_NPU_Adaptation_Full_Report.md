@@ -517,7 +517,7 @@ Pin约束后（task.py:250-252）:
 
 ### 3.5 SLO 寻优结果与可信边界（profiler-derived DSA + ep32 修正版）
 
-> ⚠️ **本节相对 2026-05-30 初版有三处重大推翻**，见 §0 修正记录。简言之：
+> ⚠️ **本节相对 2026-05-30 初版有三处重大推翻**：
 > （1）prefill 主导项是 **KV transfer 不是 DSA**；（2）TPOT **达标不超标**；
 > （3）4 档在 agg 模式下 **吞吐可观、非全超 SLO**。
 
@@ -874,7 +874,7 @@ v256/idx32）匹配 `GlmMoeDsaForCausalLM` 条目。投影 SOL 沿用 DeepseekV3
 | `collect_moe.py` | MoE FFN (group GEMM) | num_tokens∈[1..4096] × 9个模型配置 | `moe_perf.txt` | 196 |
 | `collect_mla_module.py` | DSA module整段forward | batch×seq×heads（含num_heads override） | `dsa_context_module_perf.txt` | 369 |
 | `collect_mla_module.py` | 同上（generation模式） | 同上 | `dsa_generation_module_perf.txt` | 696 |
-| `collect_moe_dispatch_combine.py` | FusedMC2融合算子 | ep{2,4,8}×dtype×num_tokens | `moe_dispatch_combine_perf.txt` | 145 |
+| `collect_moe_dispatch_combine.py` | FusedMC2融合算子 | ep∈{2,4,8,32}×dtype×num_tokens | `moe_dispatch_combine_perf.txt` | 170 |
 
 **统一计时引擎**: `collector/bench_engine.py:benchmark_npu()`
 
