@@ -498,14 +498,14 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 | KV Transfer | ✅ 完成 | Profiler反推建模（§4.1），覆盖率10.6%→97.8% |
 | 配置寻优验证 | ✅ 完成 | 推荐配置与生产100%一致（§3.6） |
 
-### 3.3 算子覆盖率现状（按profiler墙钟时间份额）
+### 3.3 算子覆盖率现状（按profiler执行时间份额）
 
 **覆盖率定义口径**:  
-AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径墙钟时间的份额**（profiler时间占比，= avg×count）。
+AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定义为**已建模算子占生产热路径执行时间的份额**（profiler时间占比，= avg×count）。
 
 **Prefill阶段覆盖率分解**（KV transfer占87.2%，采用§2.2所述profiler反推建模）:
 
-| 建模方式 | 墙钟占比 | 主要算子类型 |
+| 建模方式 | 时间占比 | 主要算子类型 |
 |------|------|---------|
 | SILICON实测 | 6.6% | MatMul/投影GEMM/attention core(profiler-derived) |
 | CALIBRATION | 4.0% | SOL解析+系数修正 |
@@ -515,18 +515,18 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 
 **Decode阶段覆盖率分解**:
 
-| 建模方式 | 墙钟占比 | 主要算子类型 |
+| 建模方式 | 时间占比 | 主要算子类型 |
 |------|------|---------|
 | SILICON实测 | **94.9%** | MoE dispatch+FFN+combine融合算子、W8A8 GEMM、DSA module |
 | CALIBRATION | 0.0% | calibration清零（FusedMC2硅表取代） |
 | **已建模合计** | **97.2%** | - |
 | 未覆盖 | 2.8% | misc + TP>1 DSA经HYBRID |
 
-> **注（2026-06 口径变化）**: Prefill的KV transfer建模采用profiler反推方式（§2.2），区别于常规算子的SILICON/CALIBRATION/HYBRID三类方式。prefill的DSA建模来源已从合成silicon改为profiler-derived（§4.5）——这不改变覆盖率份额（DSA在prefill墙钟里本就只占个位数百分比），只改变DSA那部分的数据来源与绝对值精度。覆盖率口径下"prefill主导项是KV transfer"与§3.7的单请求建模口径一致。
+> **注（2026-06 口径变化）**: Prefill的KV transfer建模采用profiler反推方式（§2.2），区别于常规算子的SILICON/CALIBRATION/HYBRID三类方式。prefill的DSA建模来源已从合成silicon改为profiler-derived（§4.5）——这不改变覆盖率份额（DSA在prefill执行时间里本就只占个位数百分比），只改变DSA那部分的数据来源与绝对值精度。覆盖率口径下"prefill主导项是KV transfer"与§3.7的单请求建模口径一致。
 
-**Decode实测数据构成**（墙钟份额，按算子类型）:
+**Decode实测数据构成**（时间份额，按算子类型）:
 
-| 算子类别 | 墙钟占比 | 数据来源 | 说明 |
+| 算子类别 | 时间占比 | 数据来源 | 说明 |
 |------|------|---------|------|
 | DispatchFFNCombine | **45.5%** | SILICON实测 | MoE dispatch+FFN+combine融合算子 |
 | QuantBatchMatmulV3 | **45.0%** | SILICON实测 | W8A8量化GEMM（gate_up/ffn2/router） |
@@ -535,7 +535,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 | mla_preprocess/DynamicQuant | 2.2% | SOL估算 | MLA预处理+量化 |
 | 其他碎片算子 | 2.8% | 未建模 | Pad/MemSet/batch_get/采样等 |
 
-### 3.4 与生产Profiler算子对比（Top算子墙钟时间）
+### 3.4 与生产Profiler算子对比（Top算子执行时间）
 
 **数据源**: 11个GLM-5生产profiler run  
 - Prefill/decode × dp/ep配置组合
@@ -560,7 +560,7 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 **KV transfer族分析**（prefill主瓶颈）:
 ```
 合计调用：11520次
-总时长：165549ms（占prefill墙钟87.2%）
+总时长：165549ms（占prefill执行时间87.2%）
 组成：
   - broadcastAicpuKernel: Mooncake KV producer push（AICPU驱动）
   - reduce_scatterAicpuKernel: KV pool sync（AICPU驱动）
@@ -806,7 +806,7 @@ Pin约束后（task.py:250-252）:
 Prefill系统性低估50%，配置寻优方向正确但绝对吞吐偏差大。
 
 **根因分析**:  
-KV transfer（Mooncake P2P KV传输）占prefill 87.2%墙钟时间：
+KV transfer（Mooncake P2P KV传输）占prefill 87.2%执行时间：
 - **不是单算子**: 调度器+IPC+AICPU+HCCL组合行为
 - **按设计前提天然不可见**: AIConfigurator设计前提"系统延迟=算子延迟之和"，调度器行为盲点
 
@@ -835,7 +835,7 @@ union − 与 compute 的重叠，直接从 `kernel_details.csv` 的
 - isl=2500 是线性外推（原始 2500 窗口被同步气泡污染）。
 - **overlap≈1.0 的实测含义**：4 个干净 run（isl 10k/20k × ep 1/16）的
   union ÷ device-median ≈ 1.0~1.05 → KV transfer kernel 基本**串行执行**，既不
-  互相重叠也不藏在 compute 后——这正是「KV transfer = 87% prefill 墙钟」的字面意思。
+  互相重叠也不藏在 compute 后——这正是「KV transfer = 87% prefill 执行时间」的字面意思。
 
 **isl>20k 线性外推（2026-06-04 改，原为 clamp 持平）**:  
 实测表只标定到 isl=20k。原先 isl>20k 持平在 20k 值（2571ms）严重低估长序列。
@@ -1268,7 +1268,7 @@ batch profiler 验证 KV pool 是否仍 < compute。
 
 | 成果项 | 量化结果 | 说明 |
 |---|---|---|
-| **覆盖率** | prefill 97.8% / decode 97.2% | 按 profiler 墙钟时间份额 |
+| **覆盖率** | prefill 97.8% / decode 97.2% | 按 profiler 执行时间份额 |
 | **配置寻优** | 推荐配置与生产 100% 一致 | tp16/dp2/ep32 prefill + tp4/dp8/ep32 decode |
 | **算子对齐** | GEMM 中位偏差 -14% | 高频 W8A8 算子 ±20%，71 条 real-signal 验证 |
 | **数据采集** | ~9400 行实测数据，11 类核心算子 | GEMM/Attention/MoE/DSA(profiler-derived)/KV Transfer/FusedMC2(含 ep32) 等 |
@@ -1378,7 +1378,7 @@ AIConfigurator方案:
 现象: Disagg prefill TTFT预测值系统性偏低~50%
 
 根因分析:
-  KV transfer（prefill墙钟87.2%）是调度器+IPC行为，非单算子
+  KV transfer（prefill执行时间87.2%）是调度器+IPC行为，非单算子
   
 MSMODELING表现:
   ✅ 自动包含（profiling trace含broadcastAicpuKernel等）
@@ -1487,7 +1487,7 @@ A1: 三层保障机制：
 **Q2: 为什么prefill覆盖率从10.6%跳到97.8%？**
 
 A2: KV transfer建模突破：
-- Prefill原有缺口：KV transfer占87.2%墙钟时间未建模
+- Prefill原有缺口：KV transfer占87.2%执行时间未建模
 - 本轮新增：KVTransfer算子（profiler trace反推）
 - 效果：填补最大缺口，覆盖率10.6%→97.8%
 
