@@ -82,22 +82,146 @@ AIConfigurator的核心设计范式：
 算子级微基准 → 性能数据库 → 解析插值 → 配置寻优
 ```
 
-**三个核心环节**:
+**三个核心环节及代码关系**:
 
-1. **数据采集（Collect）**  
-   - 在真机NPU上，构造单个算子的输入张量
-   - 单独计时kernel，得硅数据表
-   - 扫描shape空间：M×N×K（GEMM）、batch×seq×heads（Attention）、num_tokens×ep（MoE）
+#### 1. 数据采集（Collect）
 
-2. **性能建模（Model）**  
-   - 把一个layer拆成有序Operation序列
-   - 每个Operation在估算时查硅表 + 解析插值
-   - 三类建模方式：SILICON、CALIBRATION、HYBRID
+**功能**：
+- 在真机NPU上，构造单个算子的输入张量
+- 单独计时kernel，得硅数据表
+- 扫描shape空间：M×N×K（GEMM）、batch×seq×heads（Attention）、num_tokens×ep（MoE）
 
-3. **配置寻优（Search）**  
-   - 在tp/dp/ep/batch等并行维度扫描
-   - 对每个配置累加算子延迟得TTFT/TPOT
-   - 在SLA约束下挑吞吐最优配置（Pareto前沿）
+**代码结构**（`collector/`）：
+
+```
+collector/
+├── bench_engine.py              # 统一计时引擎（NPU Graph捕获 + Event计时）
+└── npu/
+    ├── collect_gemm.py          # GEMM采集脚本 → gemm_perf.txt
+    ├── collect_attn.py          # Attention采集脚本 → context/generation_attention_perf.txt
+    ├── collect_moe.py           # MoE FFN采集脚本 → moe_perf.txt
+    ├── collect_mla_module.py    # DSA module采集脚本 → dsa_*_module_perf.txt
+    ├── collect_moe_dispatch_combine.py  # FusedMC2采集 → moe_dispatch_combine_perf.txt
+    ├── gemm_factory.py          # GEMM算子构造工厂
+    ├── attn_factory.py          # Attention算子构造工厂
+    ├── moe_factory.py           # MoE算子构造工厂
+    ├── moe_dispatch_factory.py  # FusedMC2算子构造工厂（绕过wrapper）
+    └── mla_module_factory.py    # DSA module构造工厂
+```
+
+**数据流向**：
+```
+collector/npu/collect_*.py  →  bench_engine.py  →  systems/data/*.txt
+(构造算子输入)                 (计时kernel)         (硅数据表入库)
+```
+
+#### 2. 性能建模（Model）
+
+**功能**：
+- 把一个layer拆成有序Operation序列
+- 每个Operation在估算时查硅表 + 解析插值
+- 三类建模方式：SILICON、CALIBRATION、HYBRID
+
+**代码结构**（`src/aiconfigurator_npu/sdk/`）：
+
+```
+src/aiconfigurator_npu/sdk/
+├── perf_database.py             # 性能数据库（加载silicon表，提供query接口）
+│   ├── PerfDatabase.query_gemm()
+│   ├── PerfDatabase.query_kv_transfer()
+│   └── PerfDatabase.query_moe_dispatch_combine()
+│
+├── operations.py                # 算子建模定义（Operation类）
+│   ├── class GEMM(Operation)
+│   ├── class Attention(Operation)
+│   ├── class MoEDispatch(Operation)
+│   ├── class KVTransfer(Operation)
+│   └── class ContextDSAModule(Operation)
+│
+├── models.py                    # 模型定义（layer拆解）
+│   ├── class DeepSeekV32Model
+│   └── def build_model_from_config()
+│
+├── inference_session.py         # 推理会话（组合Operations估算）
+│   ├── InferenceSession.prefill()
+│   ├── InferenceSession.decode()
+│   └── 累加Operations延迟 → TTFT/TPOT
+│
+└── backends/
+    ├── base_backend.py          # Backend基类（定义估算框架）
+    └── deepseekv2_backend.py    # DeepSeek模型backend
+```
+
+**数据流向**：
+```
+systems/data/*.txt  →  perf_database.py  →  operations.py  →  inference_session.py
+(硅数据表)             (数据库查询)          (算子建模)         (组合估算)
+```
+
+#### 3. 配置寻优（Search）
+
+**功能**：
+- 在tp/dp/ep/batch等并行维度扫描
+- 对每个配置累加算子延迟得TTFT/TPOT
+- 在SLA约束下挑吞吐最优配置（Pareto前沿）
+
+**代码结构**（`src/aiconfigurator_npu/sdk/`）：
+
+```
+src/aiconfigurator_npu/sdk/
+├── task.py                      # 任务定义（搜索空间）
+│   ├── build_disagg_parallel_lists()  # 定义tp/dp/ep扫描范围
+│   ├── ConfigLayer条件约束             # Pin特定配置
+│   └── enumerate_parallel_config()    # 枚举候选配置
+│
+├── inference_session.py         # 静态估算（执行）
+│   ├── 对每个候选配置调用prefill()/decode()
+│   └── 计算TTFT/TPOT/tokens/s/gpu
+│
+├── picking.py                   # Pareto最优筛选
+│   ├── _build_disagg_summary_dict()   # 构建结果表
+│   ├── Rate matching修正系数（0.9/0.92）
+│   └── Pareto前沿筛选
+│
+├── pareto_analysis.py           # Pareto前沿分析
+│
+└── inference_summary.py         # 结果汇总展示
+```
+
+**数据流向**：
+```
+task.py  →  inference_session.py  →  picking.py  →  inference_summary.py
+(定义搜索)  (静态估算)              (Pareto筛选)    (结果展示)
+```
+
+**完整流程示例**：
+
+```python
+# 1. 数据采集（离线执行）
+python collector/npu/collect_gemm.py --quant-mode w8a8
+# 输出：systems/data/gemm_perf.txt（4942行）
+
+# 2. 配置寻优（在线执行）
+from aiconfigurator_npu.sdk import task, picking
+
+# 定义搜索空间
+configs = task.build_disagg_parallel_lists(
+    prefill_tp_candidates=[1,2,4,8,16],
+    decode_tp_candidates=[1,2,4,8],
+    moe_ep_candidates=[1,2,4,8,16,32,64],
+)
+
+# 静态估算
+session = InferenceSession(model_config, database)
+results = []
+for config in configs:
+    ttft = session.prefill(config)
+    tpot = session.decode(config)
+    results.append({"config": config, "ttft": ttft, "tpot": tpot})
+
+# Pareto筛选
+pareto_front = picking.filter_pareto(results, ttft_target=3000, tpot_target=50)
+```
 
 ### 2.2 数据采集机制
 
