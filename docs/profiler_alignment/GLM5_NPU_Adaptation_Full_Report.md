@@ -693,41 +693,61 @@ AIConfigurator设计前提"系统延迟=各算子延迟之和"，故覆盖率定
 
 > **小结**: GEMM 有 71 个可比点、匹配度 -14% 可信；MoE dispatch 几乎无干净可比点，靠实采采集方式保证（非匹配度）。两者都只覆盖**实采**算子——profiler 占比最大的 KV transfer（反推）不在匹配度范畴，其可信度见 §4.1 端到端 union 锚定。
 
-#### 3.5.3 M1-M6 指标汇总（参照 MSMODELING 体系）
+#### 3.5.3 覆盖率与精度指标（AIConfigurator 自身体系）
 
-> 参考 MSMODELING 的 M1-M6 指标框架，统一汇报覆盖度（M1-M5）和精度（M6）。
 > **2026-06-05 更新**：已实现运行时 source tracking（`QuerySource` 枚举注入
-> `PerformanceResult`，`base_backend` 收集 per-op source_dict），M1/M5 现在
+> `PerformanceResult`，`base_backend` 收集 per-op source_dict），时间覆盖率现在
 > 可从任意 inference run 自动计算（`tools/compute_m1_m4.py`）。
+>
+> **注意**：AIConfigurator 的基本单元是**模型级 op 类型**（如 `context_kv_transfer`、
+> `generation_moe_overlap`，共 ~12/7 个），而非 kernel 调用次数或 (op, shape) 对。
+> 因此本节指标均在 op 类型粒度上定义，与 MSMODELING 的 kernel 调用次数体系**不可直接比较**。
 
-| 指标 | 定义 | GLM-5 decode | GLM-5 prefill | 可信度 | 备注 |
-|---|---|---|---|---|---|
-| **M1** | op 命中率（SILICON ops / non-ZERO ops） | **33.3%** (2/6) | **25.0%** (3/12) | ✅ 运行时算 | decode: attention(SILICON)+moe(SILICON)；prefill: moe_post+pre+logits(SILICON) |
-| **M2** | fused op 组命中率（悲观规则：组内任一 miss = 组 miss） | — | — | ❌ 无法算 | 需 fused group 定义；未实现 |
-| **M3** | M2 排除 zero_cost ops | — | — | ❌ 无法算 | 同 M2 |
-| **M4** | per-shape 命中率（unique (op,shape) 对） | GEMM: **71/127=55.9%**；MoE: 2/8=25%（严格同 ep）| Comm/DSA prefill: 不适用（反推数据） | ⚠️ 仅限实采族 | GEMM MISS 56 条主要是 decode 小 M（M<16）和 router 小 op；MoE 因 bench/profiler ep 不重叠干净可比点极少（见 §3.5.2） |
-| **M5** | 时间加权覆盖（(SILICON+PROFILER_DERIVED) ms / total ms） | **98.5%** | **96.9%** | ✅ 运行时算 | decode: attention+moe 占 98.5%；prefill: KV transfer(PROFILER_DERIVED)+attention+moe 占 96.9% |
-| **M6** | 端到端精度（模型预测 / profiler 实测 forward pass 时间） | **≈1.000**（batch=1: -0.6%；batch=7: compute union 0%）| DSA 分项: **1.061/0.999**（isl10k/20k）；整体: 🔴 无法算 | decode ✅；prefill 分项 ✅；prefill 整体 ❌ | decode 用双 batch stream union 对账（§4 decode 对账定论）；prefill 整体缺完整单请求 TTFT ground truth |
+**指标定义**：
 
-**M1 说明**（op 粒度低，但 M5 才是主指标）：
+AIConfigurator 自身体系使用以下三个指标，分别回答不同问题：
 
-M1 低（25-33%）因为我们的模型 op 数量少（prefill 14 个/decode 7 个），大多数 op 是 ElementWise/Embedding/Norm 等走 SOL 的轻量算子，而真正消耗时间的算子（MoE dispatch、DSA、KV transfer）都有实测数据。M5（时间加权）才是更有意义的覆盖度指标：decode 98.5%、prefill 96.9% 时间都由 SILICON 或 PROFILER_DERIVED 数据覆盖。
+| 指标 | 公式 | 回答的问题 |
+|---|---|---|
+| **op 覆盖率** | SILICON/PROFILER_DERIVED op 数 / 非 ZERO op 数 | 有几个 op 有实测数据支撑？ |
+| **时间覆盖率** | (SILICON+PROFILER_DERIVED) 延迟 / 全部延迟 | 有实测数据的算子覆盖了多少预测时间？ |
+| **E2E 精度** | 模型预测延迟 / profiler 实测墙钟 | 预测值与真实运行差多少？ |
 
-**各 op 的 source 标签**（运行时实测，`tools/compute_m1_m4.py`）：
+> **两个覆盖率的区别**：op 覆盖率和时间覆盖率都反映数据来源质量，但回答不同问题——
+> op 覆盖率低（25-33%）是因为 SOL 轻量 op 数量多；时间覆盖率高（96-98%）是因为
+> 真正耗时的大算子（KV transfer、MoE、DSA）都有实测数据，SOL 算子虽然数量多但
+> 总时间占比不到 4%。两者都不等于精度：**时间覆盖率是精度的前提条件，不是充分条件**——
+> 覆盖率高说明大部分预测"有据可查"，但数据本身若采错（如 isl>20k 外推），预测仍可能偏。
+> E2E 精度是最终验证，覆盖率高才能通过 E2E 精度验证来闭环。
+
+**GLM-5 实测结果**：
+
+| 指标 | GLM-5 decode | GLM-5 prefill | 可信度 |
+|---|---|---|---|
+| **op 覆盖率** | **33.3%** (2/6 非 ZERO op) | **41.7%** (5/12 非 ZERO op) | ✅ 运行时算 |
+| **时间覆盖率** | **98.5%** (450.7/457.6 ms) | **96.9%** (2090.8/2158.1 ms) | ✅ 运行时算 |
+| **E2E 精度** | **≈1.000**（batch=1: −0.6%；batch=7: compute union 0%）| DSA 分项: **1.061/0.999**（isl10k/20k）；整体: 🔴 无法算 | decode ✅；prefill 分项 ✅；prefill 整体 ❌ |
+
+> prefill E2E 精度整体无法算：KV transfer isl>20k 用线性外推，缺完整单请求 TTFT
+> profiler ground truth；decode 用双 batch stream union 对账（§4 decode 对账定论）。
+
+**各 op source 明细**（`tools/compute_m1_m4.py` 实测）：
 
 | Phase | Op | Source | 时间占比 |
 |---|---|---|---|
 | Prefill | context_kv_transfer | PROFILER_DERIVED | 77.8% |
 | Prefill | context_moe_post_dispatch | SILICON | 10.8% |
 | Prefill | context_attention | PROFILER_DERIVED | 7.5% |
-| Prefill | context_add_norm_*/router/shared_* | SOL | 3.4% |
+| Prefill | context_moe_pre_dispatch | SILICON | 0.8% |
+| Prefill | context_logits_gemm | SILICON | 0.0% |
+| Prefill | context_add_norm_*/router/shared_*/embedding | SOL | 3.4% |
 | Decode | generation_moe_overlap | SILICON | 51.6% |
 | Decode | generation_attention | SILICON | 46.9% |
 | Decode | generation_add_norm_*/logits/embedding | SOL | 1.5% |
 
-**M6 的特殊情况说明**：
-
-MSMODELING 的 M6 分子是"TC trace 中 MEASURED/INTERPOLATED 事件的 kernel 时间之和"，分母是"clean forward pass profiler 的 kernel 总时间"——两者都是 **kernel 时间**（非 wallclock）。我们没有 TC chrome trace，用的是 stream union（attn_union + moe_union = compute wallclock）和 TPOT wallclock。decode 配置（tp4/ep32/dp8）与现有 profiler 配置（tp0/ep8/dp2）不严格一致，但 TPOT 对账证明模型在可比口径下准确。口径差异已知，不影响"模型 decode 预测可信"的结论。
+> op 覆盖率分子统计 SILICON + PROFILER_DERIVED 的 op 类型数：
+> prefill 共 5 个（kv_transfer/moe_post/attention/moe_pre/logits），decode 共 2 个（moe_overlap/attention）。
+> ZERO op（context_moe/context_p2p/generation_p2p）为关闭的 gate，不计入分母。
 
 ### 3.6 配置寻优结果验证（commit 6849445）
 
@@ -804,7 +824,7 @@ Pin约束后（task.py:250-252）:
 
 | 改善项 | 前状态 | 后状态 | 收益 |
 |---|---|---|---|
-| Prefill DSA 口径 | nh=4 合成 + 无 CP 切（放大 ~20×） | profiler-derived + CP 切 query | 端到端锚定，DSA 回到真实 8%~23% |
+| Prefill DSA 口径 | nh=4 合成 + 无 CP 切（放大 ~20×） | profiler-derived + CP 切 query | 端到端锚定，DSA 回到真实 8%~13% |
 | Decode MoE dispatch ep | ep8-clamp 高估 16% | 补采生产 ep32 | **10.8× 单卡吞吐修正** |
 | KV transfer isl>20k | clamp 持平（低估） | 顶部两点线性外推 | disagg 长序列 TTFT 更准 |
 | prefill comm 重叠疑虑 | 怀疑多流高估 | 三路全 overlap-aware（§3.8）| 怀疑收口，无高估 |
@@ -826,14 +846,14 @@ Pin约束后（task.py:250-252）:
 |---|---|---|---|---|---|---|---|---|
 | 档1 | ~10k | tp16/ep32/dp2 | 2049ms | 162ms | 1679ms | 208ms | 8% | 🟢 |
 | 档2 | ~20k | tp16/ep32/dp2 | 3305ms | 428ms | 2571ms | 306ms | 13% | 🟢 |
-| 档3 | ~40k | tp32/ep32/dp1 | 3549ms | 485ms | 4354ms* | 493ms | 14% | 🟡 |
-| 档4 | ~80k | tp32/ep32/dp1 | 4473ms | 1029ms | 7921ms* | 873ms | 23% | 🟡 |
+| 档3 | ~40k | tp32/ep32/dp1 | **5332ms** | 485ms | 4354ms* | 493ms | 9% | 🟡 |
+| 档4 | ~80k | tp32/ep32/dp1 | **9823ms** | 1029ms | 7921ms* | 873ms | 10% | 🟡 |
 
 > \* isl>20k 的 KV transfer 是线性外推（非实测），标 🟡。
 
 **三条核心结论**:
 
-1. **最优全是 agg（聚合）模式**：prefill 由 KV transfer 主导（1.7~2.6s），PD 分离把
+1. **最优全是 agg（聚合）模式**：prefill 由 KV transfer 主导（isl≤20k 实测 1.7~2.6s，isl>20k 外推 4.4~7.9s），PD 分离把
    mooncake KV 流式传输暴露在关键路径，收益被吃掉，反被 agg（无跨节点 KV transfer）
    超过。档1/档3 disagg 无可行解，档2 disagg 仅 ~0.47× agg。
 2. **TPOT 全档 26~34ms，远达标（<70）**；TTFT 全档达标。推翻初版「TPOT 87ms 超标」
@@ -843,9 +863,9 @@ Pin约束后（task.py:250-252）:
    验证：放宽 SLO 到 ttft=30s/tpot=200ms，档3 仍 bs≤2，排除 SLO 因素纯内存墙。提高
    需加卡或 KV 量化（int8 KV 使单请求 KV 减半）。
 
-> **核心认知（修正版）**: prefill 由 **KV transfer 主导**（isl≤20k 占 78%~82%），
-> DSA 退居次要（8%~23%，sparse topk 封顶使其增长受限）。降 prefill TTFT 的重点是
-> **减 mooncake KV transfer**（连接器/带宽/重叠），而非初版以为的「减 DSA 重算」。
+> **核心认知（修正版）**: prefill 由 **KV transfer 主导**（全档占 78%~82%），
+> DSA 退居次要（8%~13%，sparse topk 封顶使其增长受限；isl>20k 为外推估算）。
+> 降 prefill TTFT 的重点是**减 mooncake KV transfer**（连接器/带宽/重叠），而非初版以为的「减 DSA 重算」。
 
 ### 3.8 Prefill 通信（comm）建模收口（2026-06-05）
 
@@ -1355,14 +1375,16 @@ batch profiler 验证 KV pool 是否仍 < compute。
 
 | 成果项 | 量化结果 | 说明 |
 |---|---|---|
-| **覆盖率** | prefill 97.8% / decode 97.2% | 按 profiler 执行时间份额 |
+| **覆盖率** | prefill 97.8% / decode 97.2% | 按 profiler 执行时间份额（见 §3.3） |
+| **时间覆盖率** | prefill 96.9% / decode 98.5% | (SILICON+PROFILER_DERIVED) 延迟 / 全部延迟（见 §3.5.3） |
+| **E2E 精度** | decode ≈1.000（−0.6%）；prefill isl≤20k 分项 ✅ | 模型预测 / profiler 实测墙钟；prefill 整体待补采 isl>20k KVt |
 | **配置寻优** | 推荐配置与生产 100% 一致 | tp16/dp2/ep32 prefill + tp4/dp8/ep32 decode |
 | **算子对齐** | GEMM 中位偏差 -14% | 高频 W8A8 算子 ±20%，71 条 real-signal 验证 |
 | **数据采集** | ~9400 行实测数据，11 类核心算子 | GEMM/Attention/MoE/DSA(profiler-derived)/KV Transfer/FusedMC2(含 ep32) 等 |
 | **prefill DSA 锚定** | isl≤20k 核心 +0.0%/+6% | 生产单请求 profiler 端到端锚定 |
 | **decode TPOT 对账** | batch=1 −0.6% | 双 batch stream union 对账，模型本就准 |
 | **SLO 寻优（agg）** | 62 / 38.9 / 9.2 tok/s/gpu（档1/2/3）| TPOT 全档 26~34ms 达标；ep32 修正 10.8× |
-| **测试覆盖** | 63 项全通过 | 单元测试 + 集成测试 |
+| **测试覆盖** | 74 项全通过 | 单元测试 + 集成测试 |
 
 ### 7.2 方法论价值
 

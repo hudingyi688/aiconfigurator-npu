@@ -23,7 +23,7 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 
 ## 结论速览
 
-- prefill 主导项 = **KV transfer**（isl≤20k 实测；DSA 退居次要，占 8%→23%）。
+- prefill 主导项 = **KV transfer**（isl≤20k 实测，isl>20k 外推；DSA 退居次要，占 8%~13%）。
 - DSA 现为 **profiler-derived**：单卡 attention 核心按累积 KV 查实测表（SFA 在
   KV≥8192 sparse topk 封顶、indexer ∝KV 线性），投影 GEMM 走解析 SOL；每卡 query
   按 CP 切分（query = chunk / cp），末 chunk 按实际 query 比例缩放。
@@ -38,17 +38,17 @@ SLO：osl=2500，P90 TPOT < 70ms，P50 TTFT 分档
 |---|---|---|---|---|---|---|---|---|
 | 档1 | ~10k | tp16/ep32/dp2 | **2049ms** | 162ms | 1679ms | 208ms | 8% | 🟢 |
 | 档2 | ~20k | tp16/ep32/dp2 | **3305ms** | 428ms | 2571ms | 306ms | 13% | 🟢 |
-| 档3 | ~40k | tp32/ep32/dp1 | **3549ms** | 485ms | 2571ms* | 493ms | 14% | 🟡 |
-| 档4 | ~80k | tp32/ep32/dp1 | **4473ms** | 1029ms | 2571ms* | 873ms | 23% | 🟡 |
+| 档3 | ~40k | tp32/ep32/dp1 | **5332ms** | 485ms | 4354ms* | 493ms | 9% | 🟡 |
+| 档4 | ~80k | tp32/ep32/dp1 | **9823ms** | 1029ms | 7921ms* | 873ms | 10% | 🟡 |
 
 > **\* KV transfer 在 isl>20k 用线性外推（2026-06-04 改，原为 clamp 持平）**：实测表
 > 仅标定到 isl=20k，原先 isl>20k 持平在 20k 值（2571ms）严重低估。现按顶部两点
 > 线性外推（KV-transfer ~线性于 isl：chunk 数线性、per-call 延迟近常数）：
 > isl=40k→4354ms，80k→7921ms。仅 2 点拟合斜率，是有物理依据的**估计非实测**，标 🟡。
-> 注意：**agg 模式不付 KV transfer**（KVTransfer 仅在 disagg prefill 计费），故上表
-> agg 最优值不受外推影响；外推让 disagg 路径 TTFT 更准（更高），强化了「disagg 在这些
-> SLO 下不划算」的结论（档3 disagg 外推后因 TTFT 超 8000 无解）。DSA 部分仍可信
-> （表覆盖到 KV=20480，SFA 已饱和、indexer 线性外推稳定）。
+> 注意：**agg 模式不付 KV transfer**（KVTransfer 仅在 disagg prefill 计费），故 SLO
+> 寻优最优值（agg 配置）不受外推影响；外推让 disagg 路径 TTFT 更准（更高），
+> 进一步强化了「disagg 在这些 SLO 下不划算」的结论（档3 disagg TTFT 外推后达 5332ms
+> 超 8000ms 约束无解，档4 达 9823ms）。
 
 ## DSA 的端到端锚定（本版核心证据）
 
@@ -115,7 +115,7 @@ tok/s/gpu）。
 ### 关键结论
 
 1. **最优全是 agg（聚合）模式**：档1/档3 disagg 无可行解，档2 disagg 仅 ~0.47× agg。
-   prefill 由 KV transfer 主导（1.7~2.6s），PD 分离把 KV 流式传输开销暴露在关键路径，
+   prefill 由 KV transfer 主导（isl≤20k 实测 1.7~2.6s，isl>20k 外推 4.4~7.9s），PD 分离把 KV 流式传输开销暴露在关键路径，
    反被 agg（无跨节点 KV transfer）超过。
 2. **TPOT 全档 26~34ms，远达标（<70）**；TTFT 全档达标。推翻 05-30 版「TPOT 87ms
    超标」——decode 模型修正后准确（batch=1 对账 −0.6%）。
