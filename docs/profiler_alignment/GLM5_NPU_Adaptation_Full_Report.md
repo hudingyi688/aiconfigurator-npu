@@ -11,12 +11,11 @@
 1. [项目背景与目标](#1-项目背景与目标)
 2. [技术方案核心设计](#2-技术方案核心设计)
 3. [GLM-5适配情况与结果](#3-glm-5适配情况与结果)
-4. [技术难点与解决方案](#4-技术难点与解决方案)
-5. [数据采集工程实践](#5-数据采集工程实践)
-6. [后续计划](#6-后续计划)
-7. [项目价值总结](#7-项目价值总结)
-8. [与传统Profiling方法的对比](#8-与传统profiling方法的对比)
-9. [Q&A](#9-qa)
+4. [数据采集工程实践](#4-数据采集工程实践)
+5. [后续计划](#5-后续计划)
+6. [项目价值总结](#6-项目价值总结)
+7. [与传统Profiling方法的对比](#7-与传统profiling方法的对比)
+8. [Q&A](#8-qa)
 
 附录A. [Collect脚本详细说明](#附录acollect脚本详细说明)
 附录B. [核心代码引用](#附录b核心代码引用)
@@ -256,6 +255,18 @@ pareto_front = picking.filter_pareto(results, ttft_target=3000, tpot_target=50)
 5. **特殊建模**：KV transfer 和 prefill DSA 采用 profiler 反推建模（详见§4.1/§4.5）
 
 **数据流向**：`collector/npu/*.py` → `bench_engine.py`（计时） → `systems/data/*.txt`（性能数据库）
+
+**特殊建模：KV Transfer**
+
+KV transfer 是 PD 分离模式下 Mooncake P2P KV传输的组合行为（调度器+IPC+AICPU+HCCL），不是单算子，无法用常规采集脚本独立计时。采用 profiler 反推建模：
+
+- **数据来源**：生产 profiler kernel timeline（11个run），按(ep, isl)聚合KV传输族算子的**net墙钟时间**（时间轴 union − compute 重叠）
+- **输出文件**：`kv_transfer_perf.txt`（6行实测网格：ep∈{1,16} × isl∈{2500,10k,20k}）
+- **口径关键**：存的是 profiler实测net KV墙钟（不是device时间×overlap_factor），必用median（mean被rank同步气泡污染）
+- **长序列处理**：isl>20k按顶部两点线性外推（标记🟡估计非实测）
+- **效果**：Prefill覆盖率 10.6% → 97.8%（KV transfer占87.2%转为已建模）
+
+这种"profiler反推建模"是对调度器不可见行为的补充建模，区别于§2.3的三类建模方式（SILICON/CALIBRATION/HYBRID）。
 
 ### 2.3 三类建模方式
 
@@ -678,255 +689,8 @@ Pin约束后（task.py:250-252）:
 
 ---
 
-## 4. 技术难点与解决方案
 
-### 4.1 KV Transfer建模攻关（本轮核心突破）
-
-**问题现象**:  
-Prefill系统性低估50%，配置寻优方向正确但绝对吞吐偏差大。
-
-**根因分析**:  
-KV transfer（Mooncake P2P KV传输）占prefill 87.2%执行时间：
-- **不是单算子**: 调度器+IPC+AICPU+HCCL组合行为
-- **按设计前提天然不可见**: AIConfigurator设计前提"系统延迟=算子延迟之和"，调度器行为盲点
-
-**解决方案**: Profiler trace 反推建模（存 net 墙钟，非 device 和）
-
-```
-# kv_transfer_perf.txt（6 行实测网格，cols: ep_size,isl,net_kv_wallclock_ms）
-# 11 个 profiler run，按 ep×isl 聚合
-ep=1,  isl=2500  → 867.0ms
-ep=1,  isl=10000 → 1260.4ms
-ep=1,  isl=20000 → 1785.1ms
-ep=16, isl=2500  → 1011.0ms
-ep=16, isl=10000 → 1679.4ms
-ep=16, isl=20000 → 2571.0ms
-```
-
-**口径关键（2026-05-30 → 06-04 演进）**:  
-表里存的是 **profiler 实测的 net KV 墙钟**（`net_kv_wallclock_ms`），不是
-device 时间和 × overlap_factor。早期的 `device_total × overlap_factor`
-（1.0→0.60→0.86 几经反复）被**移除**——那个标量把「median-vs-mean」+「KV
-流间重叠」+「KV-compute 重叠」三件事糊成一个魔数。net 墙钟 = KV-kernel 时间轴
-union − 与 compute 的重叠，直接从 `kernel_details.csv` 的
-`Start Time`+`Duration` 算时间轴并集得到，物理含义干净。
-
-- **必用 median 不用 mean**：mean 被 10-20s 级 rank 同步停顿污染（max 达 2e7 us）。
-- isl=2500 是线性外推（原始 2500 窗口被同步气泡污染）。
-- **overlap≈1.0 的实测含义**：4 个干净 run（isl 10k/20k × ep 1/16）的
-  union ÷ device-median ≈ 1.0~1.05 → KV transfer kernel 基本**串行执行**，既不
-  互相重叠也不藏在 compute 后——这正是「KV transfer = 87% prefill 执行时间」的字面意思。
-
-**isl>20k 线性外推（2026-06-04 改，原为 clamp 持平）**:  
-实测表只标定到 isl=20k。原先 isl>20k 持平在 20k 值（2571ms）严重低估长序列。
-现按顶部两点斜率线性外推（KV transfer ~线性于 isl：chunk 数线性 + per-call
-近常数）：**isl=40k→4354ms，80k→7921ms**。这是有物理依据的**估计非实测**
-（仅 2 点拟合斜率，标 🟡）；低端 + ep 轴仍 clamp。注意 **agg 模式不付 KV
-transfer**（KVTransfer 仅在 disagg prefill 计费），故外推只影响 disagg 路径精度。
-
-**结果**:  
-- Prefill 覆盖率 10.6% → 97.8%（KV transfer 87.2% 转为已建模）
-- E2E 验证（GLM-5 disagg prefill ep16）：isl 10k/20k = 1679/2571ms = 完整 net 墙钟
-
-**精度边界**:
-- 仅标定到 isl=20k，isl>20k 是线性外推，待补采 isl=40k/80k profiler 升级为实测。
-
-### 4.2 DSA SparseFlashAttention 采集攻关（attr 冲突 → 最终判定 binary 缺失）
-
-> **结论提要**: 本节的 attr-冲突是采集路上**较早**遇到的一个坑，用 OOT 路径注入
-> 绕过了；但绕过后进一步诊断发现该机 SFA kernel binary **整个缺失（561002）**，
-> 合成采集测出的 latency 是 no-op 假值。故 prefill DSA 最终**放弃合成、转
-> profiler-derived**（§4.5）。本节保留作为采集踩坑记录。
-
-**问题现象**:  
-Kernel segfault "attr index 5/6/7/8 out of range 5"
-
-**根因分析**:  
-CANN内置SFA binary（9 attrs）与vllm-ascend注册的op（5 attrs）版本冲突：
-
-```
-vllm-ascend路径:
-  vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/
-  sparse_flash_attention.bin（注册5 attrs）
-  
-CANN内置路径:
-  CANN_ROOT/opp/built-in/.../sparse_flash_attention/
-  sparse_flash_attention.bin（注册9 attrs）
-  
-冲突机制:
-  1. vllm_ascend_C.so 注册op时定义5 attrs
-  2. ACL runtime缓存dispatch search path
-  3. 若未提前设置ASCEND_CUSTOM_OPP_PATH，优先匹配CANN内置版本
-  4. Kernel读取attr index 5/6/7/8 → out of range 5 → segfault
-```
-
-**解决方案**: OOT custom OPP路径注入
-
-```python
-# collect_mla_module.py:23-67
-def _ensure_oot_custom_opp_path() -> None:
-    """Prepend vllm-ascend's OOT custom-op vendor dir."""
-    
-    # 在import torch_npu前执行
-    # import vllm_ascend before torch_npu
-    
-    import vllm_ascend
-    oot = os.path.join(
-        os.path.dirname(vllm_ascend.__file__),
-        "_cann_ops_custom", "vendors", "vllm-ascend",
-    )
-    
-    existing = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
-    if oot not in existing.split(":"):
-        os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{oot}:{existing}"
-        
-# 调用时机：collect脚本入口，import torch_npu前
-_ensure_oot_custom_opp_path()
-import torch
-import torch_npu
-```
-
-**后续判定（重要，纠正早期"采集成功"判断）**:  
-attr 冲突绕过后，合成 collector 仍测出系统性偏小 13~188× 的值。诊断脚本
-`diagnose_dsa_sfa.sh` 给出铁证：FIA/SFA 自检全 FAILED(561002) = SFA kernel
-binary 整个缺失，forward "成功"返回的 latency 是 sparse 步被静默跳过的 no-op
-假值（早期看到的 38.49ms 之类不可信）。**故 prefill DSA 改 profiler-derived，
-见 §4.5。**
-
-### 4.3 MoE Dispatch ep 覆盖（已补采生产 ep32 → 触发 10.8× 吞吐修正）
-
-**问题**:  
-生产 prefill/decode 用 ep32，旧 silicon 表仅 ep{2,4,8}，ep32/ep64 被 clamp 到 ep8。
-
-**根因（重大，2026-06-04 定位）**:  
-A3 单节点 = 16 DIE = 16 NPU device。EP 组是真实 HCCL 子组（每 rank 物理
-device），不能用少 device 模拟大 ep。故 ep16 → 单节点（WORLD16），ep32 →
-**2 个 A3 节点**（2×16，不是 4 节点）。补采脚本 `collect_moe_dispatch_ep32.sh`
-自动探测 `torch.npu.device_count()`，守卫 `WORLD % EP`。
-
-**已采并合并**（fee37d4/4f783c4）:  
-ep32 实测（2×A3，13 token 点 ×2 dtype = 26 行）合并进两树，grid 现
-**{2,4,8,32}**。关键数据：ep32 @ tok256 w8a8 = **340us**，而旧 clamp 用的
-ep8 = **405us**——高估约 **16%**。
-
-**连锁影响：10.8× 单卡吞吐修正**:  
-
-```
-ep8-clamp 高估 dispatch
-  → 所有 bs>1 配置的 TPOT/TTFT 被算超 SLO 而滤掉
-  → 寻优只剩 bs=1（旧档1：5.75 tok/s/gpu）
-
-补采 ep32 实测后
-  → bs=16/并发128 的 TTFT 压到 1980<2000、TPOT 31<70 达标
-  → 单卡吞吐跃至 62 tok/s/gpu
-
-单变量 A/B 验证：移除 ep32 行干净退回 bs=1/5.75
-  → 确认是 ep32 数据【单独】导致，非其他改动
-```
-
-> 旧版"全 bs=1、5.75 tok/s/gpu"是 ep8-clamp 高估 dispatch 的 artifact，**已作废**。
-> 详细 SLO 结果见 §3.7。当前 ep64 仍 snap 到最近的 ep32（grid 最大点），是已知近似。
-
-### 4.4 Wrapper内存溢出
-
-**问题**:  
-FusedMC2 wrapper硬编码`max_output_size=65536` → 单卡bench OOM
-
-**根因**:  
-```python
-# vllm-ascend wrapper（FusedMC2CommImpl）
-max_output_size = 65536  # 硬编码worst case
-
-# 单卡bench：M=256, world=1
-# scratch分配：max_output_size × ...
-# → 9-12 GiB最坏情况scratch → 超单卡HBM容量
-```
-
-**解决方案**: 绕过wrapper直调底层C op
-
-```python
-# collect_moe_dispatch_combine.py
-# moe_dispatch_factory.py:10-19
-
-# 直调torch.ops._C_ascend.dispatch_ffn_combine
-# 精确设置max_output_size = ceil(M×K/NL) + margin
-
-max_output_size = int(math.ceil(num_tokens * hidden / (num_local_experts * topk)) + 128)
-
-torch.ops._C_ascend.dispatch_ffn_combine(
-    hidden_states,
-    expert_weights,
-    ...
-    max_output_size=max_output_size,  # 精确控制
-)
-```
-
-**效果**:  
-单卡采集成功，内存开销可控，入库实测数据（ep{2,4,8,32}×BF16+W8A8）。
-
-### 4.5 Prefill DSA 改 profiler-derived（本轮最大方法转向）
-
-**为什么放弃合成 silicon**:  
-DSA 是 GLM-5 最复杂的算子（LightningIndexer + SparseFlashAttention + MLA），
-合成 collector 在本 CANN 机上**测不出真实值**——铁证（诊断脚本
-`diagnose_dsa_sfa.sh`）：
-
-```
-[BISECT] 所有 FIA/SFA 自检（含最小 hd144/nh16 点）全部 FAILED(561002)
-         = SparseFlashAttention kernel binary 整个缺失
-attn_module=DeepSeekV2MLAAttention is_sparse=None  ← sparse 路径未激活
-forward "成功"返回 b1s8192=1.62ms                  ← 假值（sparse 步是空操作）
-```
-
-合成 collector 在该机系统性比生产小 13~188×（query=1 或 256 都一样），因为
-SFA kernel 缺失静默走退化空操作。投影 GEMM PROBE OK，只有 sparse attention 缺。
-**结论：放弃合成 silicon，转 profiler-derived 建模。**
-
-**口径纠错（必读，曾 2 次误判）**:  
-GLM-5 DSA prefill 用 **Context Parallelism（序列/token 维切分）**，不是 TP 头维切分：
-每卡保留**全部 64 头**，只处理 **1/cp 的 query token**（CP16 下每卡 query=256=4096/16），
-通过 all-to-all / o_proj full-gather 汇聚。这与 decode 走头维切分（tp4→nh16）**根本不同**。
-旧版按 nh=4 + 每卡 full-query 双重错（头少算 16× / query 多算 16×，方向相反不抵消），
-把单请求 DSA 放大成 3315ms（实际 ~152ms）。
-
-**实现**（a013456）:
-
-```
-# dsa_context_attn_core_perf.txt （profiler 实测，单卡 nh64 CP16 q256）
-cum_kv,  per_layer_us
-4096,    290     # chunk0 偏低（未满 topk / 预热）
-8192,    1037    # chunk1 后 SFA 饱和（sparse topk=2048 封顶）
-12288,   1105
-16384,   1196
-20480,   1278
-
-# ContextDSAModule.query（operations.py）双路拆解：
-#   per-step = profiler 核心(cum_kv 查表) + 投影 GEMM(走 SOL, ∝query)
-#   每卡 query 按 CP 切：per_rank_q = chunk // cp_size
-#   末 chunk 按实际 query 比例缩放 SFA（q_frac = 新 token / chunk）
-```
-
-**端到端锚定结果**:
-
-| isl | 模型 DSA 单卡 | profiler 实测单卡核心 | 偏差 |
-|---|---|---|---|
-| 10000 | 162ms（核心 144 + 投影 18） | 152.5ms | +6%（含投影）|
-| 20480 | 428ms（核心 392 + 投影 36） | 392.3ms | **+0.0%（核心）** |
-
-> isl=20480（5 满 chunk）核心 392.5 vs 基线 392.3 = 完美；isl=10000 末 chunk
-> query 实测仅 114（不满 256），按比例缩放后核心 144（−5.7%）。修前 10k 是 +25.6%
-> （末 chunk 按满 chunk 算）。10k/20k 在相同累积 KV 点交叉验证 <4%。**SFA 单层延迟
-> 在 chunk1 后饱和 ~780-810us 不随 KV 继续涨 = sparse topk 封顶的硬证据。**
-
-**架构 dims 陷阱（已标注，YAGNI 不修）**:  
-GLM-5 config 声明 `DeepseekV32ForCausalLM`，但真实 dims（hidden6144/q_lora2048/
-v256/idx32）匹配 `GlmMoeDsaForCausalLM` 条目。投影 SOL 沿用 DeepseekV32 dims →
-投影低估 34%（115 vs 174 us/层），但 **E2E 仅 0.69%**（投影是 DSA 小头，attention
-核心是实测值不受影响）。正确修需管道改造，性价比低，故仅代码注释 + 文档标注。
-
----
-
-## 5. 数据采集工程实践
+## 4. 数据采集工程实践
 
 ### 5.1 采集脚本体系
 
@@ -1083,7 +847,7 @@ def create_dsa_module(num_heads_override):
 
 ---
 
-## 6. 后续计划
+## 5. 后续计划
 
 > **已完成项（6 月，原计划列在"高优先级"，现已落地）**:
 > - ✅ **MoE dispatch 补采生产 ep32**（2×A3 节点）→ grid {2,4,8,32}，触发 10.8× 吞吐修正（§4.3）
@@ -1145,7 +909,7 @@ batch profiler 验证 KV pool 是否仍 < compute。
 
 ---
 
-## 7. 项目价值总结
+## 6. 项目价值总结
 
 ### 7.1 量化成果
 
@@ -1218,7 +982,7 @@ KVTransfer.query(ep, isl) = interpolate_grid(kv_transfer_perf.txt)  # net_kv_wal
 
 ---
 
-## 8. 与传统Profiling方法的对比
+## 7. 与传统Profiling方法的对比
 
 ### 8.1 方法论本质差异
 
@@ -1358,7 +1122,7 @@ AIConfigurator表现:
 
 ---
 
-## 9. Q&A
+## 8. Q&A
 
 ### 9.1 常见问题预设
 
@@ -1521,13 +1285,42 @@ latency = benchmark_npu(lambda: module.forward(hidden_states, ...), ...)
 - **OOT路径注入**：CANN内置SFA binary（9 attrs）与vllm-ascend注册op（5 attrs）冲突，需注入`ASCEND_CUSTOM_OPP_PATH`
 - **Context Parallelism处理**：prefill DSA用CP切query（每卡全64头+1/cp query），需按CP切分构造输入
 
-**特殊处理（prefill）**：
-- 合成采集失败（SFA kernel缺失，返回no-op假值）→ 改用profiler-derived建模（§4.5）
-- 仅保留decode generation module的实采数据
+**特殊处理（prefill DSA采集攻关）**：
+
+**问题1：Attr冲突**  
+Kernel segfault "attr index 5/6/7/8 out of range 5"，根因是CANN内置SFA binary（9 attrs）与vllm-ascend注册op（5 attrs）版本冲突。若未提前设置`ASCEND_CUSTOM_OPP_PATH`，ACL runtime优先匹配CANN内置版本，kernel读取attr index超出范围导致segfault。
+
+**解决方案**：OOT custom OPP路径注入。在import torch_npu前，注入vllm-ascend的custom-op路径：
+```python
+import vllm_ascend
+oot = os.path.join(os.path.dirname(vllm_ascend.__file__), "_cann_ops_custom", "vendors", "vllm-ascend")
+os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{oot}:{existing}"
+```
+
+**问题2：Kernel binary缺失（重要判定）**  
+Attr冲突绕过后，合成collector测出的latency系统性偏小13~188×。诊断脚本`diagnose_dsa_sfa.sh`给出铁证：所有FIA/SFA自检FAILED(561002) = SparseFlashAttention kernel binary整个缺失。Forward"成功"返回的latency是sparse步被静默跳过的no-op假值（早期看到的38.49ms不可信）。
+
+**最终判定**：放弃合成silicon，prefill DSA转profiler-derived建模。
+
+**实现**（a013456）：
+```
+# dsa_context_attn_core_perf.txt （profiler实测，单卡nh64 CP16 q256）
+cum_kv,  per_layer_us
+4096,    290     # chunk0偏低（未满topk/预热）
+8192,    1037    # chunk1后SFA饱和（sparse topk=2048封顶）
+
+# ContextDSAModule.query双路拆解：
+#   per-step = profiler核心(cum_kv查表) + 投影GEMM(走SOL, ∝query)
+#   每卡query按CP切：per_rank_q = chunk // cp_size
+```
+
+**端到端锚定**：isl=20480核心392.5ms vs profiler基线392.3ms = +0.0%（完美）；isl=10000核心144ms（末chunk实测query仅114，按比例缩放）。
+
+- Prefill DSA改用profiler-derived，仅保留decode generation module的实采数据
 
 **输出文件**：
-- `dsa_context_module_perf.txt`（369行，已废弃，改用profiler-derived）
-- `dsa_generation_module_perf.txt`（696行，cols: batch, seq, num_heads, latency_us）
+- `dsa_context_attn_core_perf.txt`（5行，profiler-derived）
+- `dsa_generation_module_perf.txt`（696行，实采，cols: batch, seq, num_heads, latency_us）
 
 ### A.5 MoE Dispatch+Combine采集（collect_moe_dispatch_combine.py）
 
@@ -1542,16 +1335,34 @@ torch.ops._C_ascend.dispatch_ffn_combine(
 )
 ```
 
-**关键技术**：
-- **绕过wrapper**：FusedMC2CommImpl硬编码max_output_size=65536→单卡OOM，直调C op精确控制
-- **EP依赖**：dispatch latency强依赖ep_size（ntok=8时ep2=1711us/ep8=867/ep32=301，差5.7×）
-- **补采ep32**：生产用ep32，旧bench仅ep{2,4,8}，补采ep32触发10.8×吞吐修正（§4.3）
+**关键技术攻关**：
 
-**启动方式**：
-```bash
-torchrun --nproc_per_node=8 collect_moe_dispatch_combine.py --ep-size 8
-torchrun --nproc_per_node=16 collect_moe_dispatch_combine.py --ep-size 16  # 2×A3节点
+**问题1：Wrapper内存溢出**  
+FusedMC2CommImpl硬编码`max_output_size=65536`（worst case），单卡bench M=256/world=1时，scratch分配达9-12 GiB，超单卡HBM容量导致OOM。
+
+**解决方案**：绕过wrapper直调底层C op，精确设置max_output_size：
+```python
+# moe_dispatch_factory.py
+max_output_size = int(math.ceil(num_tokens * hidden / (num_local_experts * topk)) + 128)
+
+torch.ops._C_ascend.dispatch_ffn_combine(
+    hidden_states, expert_weights, ...
+    max_output_size=max_output_size  # 精确控制，避免OOM
+)
 ```
+
+**问题2：EP覆盖不足（重大）**  
+旧silicon表仅ep{2,4,8}，生产prefill/decode用ep32/ep64被clamp到ep8。A3单节点=16 DIE=16 NPU device，EP组是真实HCCL子组（每rank物理device），不能用少device模拟大ep。故ep16→单节点（WORLD16），ep32→**2个A3节点**（2×16，不是4节点）。
+
+**补采ep32**（fee37d4/4f783c4）：
+- 启动方式：`torchrun --nproc_per_node=16`（2×A3节点），脚本自动探测device_count守卫WORLD % EP
+- 实测数据：ep32 @ tok256 w8a8 = **340us**，旧clamp用ep8 = **405us**（高估16%）
+- Grid现{2,4,8,32}，合并进两树
+
+**连锁影响：10.8×吞吐修正**  
+ep8-clamp高估dispatch → 所有bs>1配置的TPOT/TTFT被算超SLO滤掉 → 寻优只剩bs=1（5.75 tok/s/gpu）。补采ep32后 → bs=16/并发128的TTFT压到1980<2000、TPOT 31<70达标 → 单卡吞吐跃至62 tok/s/gpu。单变量验证：移除ep32行干净退回bs=1/5.75，确认是ep32数据单独导致。
+
+**EP依赖**：dispatch latency强依赖ep_size（ntok=8时ep2=1711us/ep8=867/ep32=301，差**5.7×**）。
 
 **输出文件**：`moe_dispatch_combine_perf.txt`（170行，含ep32实测）
 
