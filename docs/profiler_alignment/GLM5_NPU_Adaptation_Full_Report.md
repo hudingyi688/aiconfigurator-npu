@@ -225,70 +225,34 @@ pareto_front = picking.filter_pareto(results, ttft_target=3000, tpot_target=50)
 
 ### 2.2 数据采集机制
 
-**采集脚本架构**（`collector/npu/`）:
+**核心设计**：将 vllm-ascend 当作算子库直接 import，不启动推理服务，通过实例化框架算子对象 + NPU Event 计时，采集真实 kernel latency。核心价值：从框架层调用确保测到真实 kernel 路径（W8A8→QuantBatchMatmulV3，BF16→MatMulV2，DSA→SparseFlashAttention）。
 
-| 脚本 | 采集算子 | vllm-ascend API调用 | 输出文件 |
-|---|---|---|---|
-| `collect_gemm.py` | BF16/W8A8 GEMM | `vllm_ascend.ops.linear.AscendRowParallelLinear` → `MatMulV2`/`QuantBatchMatmulV3` | `gemm_perf.txt` |
-| `collect_attn.py` | Context/Decode attention | `vllm_ascend.attention.attention_v1.AscendAttentionBackendImpl.forward` | `context_attention_perf.txt`/`generation_attention_perf.txt` |
-| `collect_moe.py` | MoE FFN (group GEMM) | `npu_grouped_matmul`/`npu_grouped_matmul_swiglu_quant` | `moe_perf.txt` |
-| `collect_mla_module.py` | DSA module前向 | `npu_fused_infer_attention_score[_v2]` + module整段forward | `dsa_context_module_perf.txt`/`dsa_generation_module_perf.txt` |
-| `collect_moe_dispatch_combine.py` | FusedMC2融合算子 | `torch.ops._C_ascend.dispatch_ffn_combine`（**绕过wrapper**） | `moe_dispatch_combine_perf.txt` |
+**采集脚本总览**（`collector/npu/`）:
 
-**关键技术细节**:
+| 脚本 | 采集算子 | 核心API | 输出文件 | 行数 |
+|---|---|---|---|---|
+| `collect_gemm.py` | BF16/W8A8 GEMM | `vllm_ascend.ops.linear.AscendRowParallelLinear` | `gemm_perf.txt` | 4942 |
+| `collect_attn.py` | Context/Decode attention | `vllm_ascend.attention.attention_v1` | `context/generation_attention_perf.txt` | 1013/1217 |
+| `collect_moe.py` | MoE FFN group GEMM | `npu_grouped_matmul` | `moe_perf.txt` | 196 |
+| `collect_mla_module.py` | DSA module整段forward | `DeepseekV2MLAAttention` | `dsa_context/generation_module_perf.txt` | 369/696 |
+| `collect_moe_dispatch_combine.py` | FusedMC2融合算子 | `torch.ops._C_ascend.dispatch_ffn_combine` | `moe_dispatch_combine_perf.txt` | 170 |
+| `collect_elementwise.py` | RMSNorm等轻量op | `torch_npu.nn.functional.rms_norm` | `rmsnorm_perf.txt`等 | ~200 |
+| `collect_nccl.py` | DP通信算子 | `HCCL allgather/reduce_scatter` | `nccl_perf.txt` | 629 |
+| `collect_all_reduce.py` | TP custom allreduce | `vllm_ascend.ops.custom_allreduce` | `custom_allreduce_perf.txt` | 172 |
 
-1. **NPU Graph捕获消除Python dispatch开销**  
-   ```python
-   # bench_engine.py:87-118
-   # 优先在非默认stream上捕获graph并replay
-   # 同时跑eager，取两者较小值
-   # graph捕获失败自动降级eager
-   
-   latency = min(graph_latency, eager_latency)
-   # 效果：~30us Python dispatch → ~10us pure kernel
-   ```
+**关键技术要点**（详见附录A）：
 
-2. **vllm-ascend框架层kernel选路一致性**  
-   - 直接import `vllm_ascend` kernel，不走torch原始API
-   - 保证与生产推理路径选路一致（如W8A8走`QuantBatchMatmulV3`而非普通`MatMul`）
+1. **框架层 kernel 选路一致性**：直接 import vllm-ascend 算子层 API，保证与生产推理路径一致（如 W8A8 走 QuantBatchMatmulV3 而非 MatMulV2）
 
-3. **Module级采集保证路径一致**  
-   - DSA module采集整段forward（投影+attention+输出）
-   - 不是单独采`SparseFlashAttention`，避免路径错位
+2. **完整推理环境构造**：Attention 采集构造 VllmConfig + KV Cache + Metadata，vllm-ascend 自动选择后端
 
-4. **DSA SFA OOT路径注入**  
-   ```python
-   # collect_mla_module.py:23-67
-   # 在import torch_npu前注入OOT custom OPP路径
-   # 解决CANN内置SFA binary（9 attrs）与vllm-ascend注册op（5 attrs）冲突
-   
-   os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
-       f"{vllm_ascend_path}/_cann_ops_custom/vendors/vllm-ascend:{existing}"
-   )
-   ```
+3. **Module 级采集**：DSA module 采集整段 forward（投影+attention+输出），避免路径错位
 
-5. **绕过wrapper直调C op避免OOM**  
-   ```python
-   # collect_moe_dispatch_combine.py
-   # FusedMC2 wrapper硬编码max_output_size=65536 → 单卡bench OOM
-   # 直调底层C op，精确设置max_output_size = ceil(M×K/NL)+margin
-   
-   torch.ops._C_ascend.dispatch_ffn_combine(
-       ..., max_output_size=calculated_size
-   )
-   ```
+4. **计时引擎**：NPU Graph 消除 Python dispatch 开销（~30us→~10us），6-op L2 cache 冲刷模拟真实推理 cache 竞争
 
-6. **KV Transfer建模方式（profiler trace反推，非单算子采集）**  
-   
-   KV transfer是PD分离模式下Mooncake P2P KV传输的组合行为，包含调度器+IPC+AICPU+HCCL操作，**不是单算子**，无法用常规采集脚本独立计时。建模方式：
-   
-   - **数据来源**：生产profiler kernel timeline（11个run）
-   - **建模方法**：按(ep, isl)聚合KV传输族算子的**net墙钟时间**（时间轴union − 与compute重叠）
-   - **输出文件**：`kv_transfer_perf.txt`（6行实测网格：ep∈{1,16} × isl∈{2500,10k,20k}）
-   - **口径关键**：存的是profiler实测net KV墙钟（不是device时间×overlap_factor），必用median（mean被rank同步气泡污染）
-   - **长序列处理**：isl>20k按顶部两点线性外推（标记为🟡估计非实测）
-   
-   这种"profiler反推建模"方式是对调度器不可见行为的补充建模，区别于§2.3的三类建模方式（SILICON/CALIBRATION/HYBRID），专门用于**算子级不可见的系统级行为**（详见§4.1）。
+5. **特殊建模**：KV transfer 和 prefill DSA 采用 profiler 反推建模（详见§4.1/§4.5）
+
+**数据流向**：`collector/npu/*.py` → `bench_engine.py`（计时） → `systems/data/*.txt`（性能数据库）
 
 ### 2.3 三类建模方式
 
@@ -1458,7 +1422,178 @@ A7: 不会（2026-06-05 核实，§3.8）：
 
 ---
 
-## 附录：核心代码引用
+## 附录A：Collect脚本详细说明
+
+### A.1 GEMM采集（collect_gemm.py）
+
+**采集算子**：BF16/W8A8 GEMM，穷举(M, N, K)参数空间
+
+**核心API调用**：
+```python
+from vllm_ascend.ops.linear import AscendRowParallelLinear
+from vllm_ascend.model_executor.layers.quantization import Fp8Config
+
+gemm = AscendRowParallelLinear(
+    input_size=k, output_size=n, bias=False,
+    params_dtype=torch.float16,
+    quant_config=Fp8Config(...) if quant_type == "w8a8" else None
+)
+latency = benchmark_npu(lambda: gemm.forward(x), ...)
+```
+
+**kernel选路逻辑**（vllm-ascend框架层）：
+- BF16：`AscendRowParallelLinear.forward()` → `MatMulV2`（CANN原生GEMM）
+- W8A8：`Fp8LinearMethod.apply()` → `QuantBatchMatmulV3`（量化GEMM）
+
+**关键技术**：
+- **框架层选路**：不走`torch.mm`，保证W8A8走真实量化kernel而非MatMulV2
+- **参数空间**：M∈[1..16384]（密集采样decode小M+prefill大M），N/K∈[256..16384]笛卡尔积，约97K组合
+- **模型特化**：`--model GlmMoeDsa`扫描实际使用的(N,K)组合，避免冗余笛卡尔积
+- **6-op L2冲刷**：创建6个独立GEMM实例，模拟真实推理cache竞争，避免latency偏乐观
+
+**输出文件**：`gemm_perf.txt`（4942行，cols: quant_type, m, n, k, latency_us）
+
+### A.2 Attention采集（collect_attn.py）
+
+**采集算子**：Context/Generation attention
+
+**核心API调用**：
+```python
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+from vllm_ascend.config import VllmConfig
+
+backend = AscendAttentionBackendImpl(VllmConfig(...))
+# vllm-ascend自动选择后端：FlashInfer/FlashAttention/FlexAttention
+latency = benchmark_npu(lambda: backend.forward(...), ...)
+```
+
+**完整推理环境构造**：
+- VllmConfig（block_size, max_seq_len等）
+- Paged KV Cache（mock allocation + 填充）
+- Attention Metadata（batch_size, seq_lens, block_tables）
+
+**关键技术**：
+- **自动后端选择**：vllm-ascend根据平台自动选FlashInfer/FlashAttn，bench测到与生产一致kernel
+- **KV Cache构造**：分配真实paged cache结构，模拟生产环境内存布局
+- **API兼容**：4层try/except处理vllm-ascend API签名变更（use_sparse/use_v1等）
+
+**输出文件**：`context_attention_perf.txt`（1013行）/`generation_attention_perf.txt`（1217行）
+
+### A.3 MoE FFN采集（collect_moe.py）
+
+**采集算子**：MoE expert FFN（grouped GEMM）
+
+**核心API调用**：
+```python
+import torch_npu
+
+# BF16路径
+torch_npu.npu_grouped_matmul(x, experts, group_type=3)
+
+# W8A8路径
+torch_npu.npu_grouped_matmul_swiglu_quant(x, experts_w8, scales, ...)
+```
+
+**关键技术**：
+- **两条kernel路径**：BF16走`npu_grouped_matmul`，W8A8走`npu_grouped_matmul_swiglu_quant`
+- **Power Law分布**：模拟expert负载不均（`--distribution power_law`），唯一和模型配置相关的算子
+- **routing预计算**：生成topk routing weights，模拟真实dispatch pattern
+
+**输出文件**：`moe_perf.txt`（196行，cols: num_tokens, hidden, inter, num_experts, topk, dtype, latency_us）
+
+### A.4 DSA Module采集（collect_mla_module.py）
+
+**采集算子**：DeepSeek Sparse Attention完整module（投影+attention+输出）
+
+**核心API调用**：
+```python
+from vllm_ascend.model_executor.models.deepseek import DeepseekV2MLAAttention
+
+module = DeepseekV2MLAAttention(config)
+latency = benchmark_npu(lambda: module.forward(hidden_states, ...), ...)
+```
+
+**关键技术**：
+- **Module级采集**：整段forward（projection→SFA→output），不是单独采SparseFlashAttention
+- **OOT路径注入**：CANN内置SFA binary（9 attrs）与vllm-ascend注册op（5 attrs）冲突，需注入`ASCEND_CUSTOM_OPP_PATH`
+- **Context Parallelism处理**：prefill DSA用CP切query（每卡全64头+1/cp query），需按CP切分构造输入
+
+**特殊处理（prefill）**：
+- 合成采集失败（SFA kernel缺失，返回no-op假值）→ 改用profiler-derived建模（§4.5）
+- 仅保留decode generation module的实采数据
+
+**输出文件**：
+- `dsa_context_module_perf.txt`（369行，已废弃，改用profiler-derived）
+- `dsa_generation_module_perf.txt`（696行，cols: batch, seq, num_heads, latency_us）
+
+### A.5 MoE Dispatch+Combine采集（collect_moe_dispatch_combine.py）
+
+**采集算子**：FusedMC2融合算子（dispatch+expert FFN+combine）
+
+**核心API调用**：
+```python
+# 绕过wrapper，直调底层C op
+torch.ops._C_ascend.dispatch_ffn_combine(
+    hidden_states, expert_weights, ...
+    max_output_size=calculated_size  # 精确控制，避免OOM
+)
+```
+
+**关键技术**：
+- **绕过wrapper**：FusedMC2CommImpl硬编码max_output_size=65536→单卡OOM，直调C op精确控制
+- **EP依赖**：dispatch latency强依赖ep_size（ntok=8时ep2=1711us/ep8=867/ep32=301，差5.7×）
+- **补采ep32**：生产用ep32，旧bench仅ep{2,4,8}，补采ep32触发10.8×吞吐修正（§4.3）
+
+**启动方式**：
+```bash
+torchrun --nproc_per_node=8 collect_moe_dispatch_combine.py --ep-size 8
+torchrun --nproc_per_node=16 collect_moe_dispatch_combine.py --ep-size 16  # 2×A3节点
+```
+
+**输出文件**：`moe_dispatch_combine_perf.txt`（170行，含ep32实测）
+
+### A.6 Elementwise采集（collect_elementwise.py）
+
+**采集算子**：RMSNorm、RoPE、SwiGLU等轻量op
+
+**核心API调用**：
+```python
+import torch_npu
+
+torch_npu.nn.functional.rms_norm(x, weight, epsilon)
+torch_npu.nn.functional.rotary_positional_embeddings(x, cos, sin)
+```
+
+**用途**：这些op延迟<50us，时间占比<3%，用实采而非SOL估算提升精度
+
+### A.7 通信算子采集
+
+**NCCL通信**（`collect_nccl.py`）：
+- 调HCCL官方binary（黑盒），几何级数扫描message_bytes
+- 输出：`nccl_perf.txt`（DP allgather/reduce_scatter）
+
+**Custom AllReduce**（`collect_all_reduce.py`）：
+- 实例化vllm-ascend Custom AllReduce + CUDA Graph
+- 输出：`custom_allreduce_perf.txt`（TP allreduce）
+
+### A.8 计时引擎（bench_engine.py）
+
+**六阶段流水线**：
+1. Adaptive Warmup → 估算单次耗时，计算actual_num_runs
+2. NPU Graph Capture → 录制kernel_func到graph（失败则fallback eager）
+3. Graph Warmup → graph.replay() × warmup_iters
+4. 正式测量 → Event.record() + graph.replay() × N + synchronize()
+5. Throttling检测 → NPU clock下降>10%则标记
+6. 取min(graph_latency, eager_latency) → 消除Python dispatch开销
+
+**关键参数**：
+- warmup_iters：10（自适应warmup+graph warmup）
+- num_runs：50（正式测量次数）
+- repeat_n：1（单次kernel_func内的op数，如GEMM用6-op）
+
+---
+
+## 附录B：核心代码引用
 
 ### A.1 Performance数据库查询接口
 
