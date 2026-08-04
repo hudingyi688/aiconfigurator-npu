@@ -1057,6 +1057,14 @@ class GenerationAttention(Operation):
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
 
+        # DCP: each card stores 1/dcp_size of KV tokens → query with reduced s.
+        # GQA invariance: head growth (×dcp/tp) cancels KV shrink (÷dcp) in FLOPs,
+        # but the silicon table is keyed on s, so we pass s/dcp to match the
+        # reduced per-card KV cache length.
+        dcp_size = kwargs.get("dcp_size", 1) or 1
+        if dcp_size > 1:
+            s = max(1, s // dcp_size)
+
         result = database.query_generation_attention(
             batch_size,
             s,
@@ -1789,6 +1797,15 @@ class GenerationDSAModule(Operation):
             raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
+
+        # DCP: each card stores 1/dcp_size of KV tokens along the sequence dim.
+        # For DSA decode: sparse attention uses effective_kv=min(s, topk), so
+        # when s > topk the sparse attention FLOPs are unchanged. But the
+        # indexer logits scan (∝ s) and indexer KV cache read (∝ s) are halved.
+        # The silicon table is keyed on s (= isl field), so we pass s/dcp.
+        dcp_size = kwargs.get("dcp_size", 1) or 1
+        if dcp_size > 1:
+            s = max(1, s // dcp_size)
 
         result = database.query_generation_dsa_module(
             b=batch_size,

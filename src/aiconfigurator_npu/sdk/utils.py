@@ -112,6 +112,7 @@ def enumerate_parallel_config(
     min_num_gpus: int | None = None,
     max_num_gpus: int | None = None,
     allow_moe_pure_tp: bool = True,
+    dcp_list: list[int] | None = None,
 ) -> list[list[int]]:
     """
     Enumerate parallel configurations based on parallel list.
@@ -142,6 +143,9 @@ def enumerate_parallel_config(
     if real_silicon_sweep:
         pp_list = [1]
 
+    if dcp_list is None:
+        dcp_list = [1]
+
     parallel_config_list = []
     for tp in tp_list:
         for pp in pp_list:
@@ -164,10 +168,16 @@ def enumerate_parallel_config(
                                         continue
                                 elif backend == common.BackendName.vllm:
                                     pass  # TODO
-                                parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep])
+                                for dcp in dcp_list:
+                                    if dcp > 1 and tp % dcp != 0:
+                                        continue
+                                    parallel_config_list.append([tp, pp, dp, moe_tp, moe_ep, dcp])
             else:
                 if tp * pp in num_gpu_list:
-                    parallel_config_list.append([tp, pp, 1, 1, 1])
+                    for dcp in dcp_list:
+                        if dcp > 1 and tp % dcp != 0:
+                            continue
+                        parallel_config_list.append([tp, pp, 1, 1, 1, dcp])
 
     # Apply real silicon sweep filters to reduce sweep time on real silicon
     if real_silicon_sweep:

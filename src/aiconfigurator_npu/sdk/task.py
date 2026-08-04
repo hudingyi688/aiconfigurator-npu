@@ -66,6 +66,8 @@ class TaskContext:
     profiles: list[str] = field(default_factory=list)
     yaml_patch: dict = field(default_factory=dict)
     yaml_mode: Literal["patch", "replace"] = "patch"
+    enable_pp: bool = False
+    dcp_sizes: list[int] | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -387,7 +389,7 @@ class TaskConfigFactory:
 
     @staticmethod
     def _agg_defaults_layer(ctx: TaskContext) -> dict:
-        should_enable_pp = False  # FIXME: need to improve pp alignment and then enable
+        should_enable_pp = ctx.enable_pp
         worker_config = {
             "system_name": ctx.system_name,
             "backend_name": ctx.backend_name,
@@ -455,6 +457,11 @@ class TaskConfigFactory:
             else:
                 raise ValueError(f"Invalid backend: {ctx.backend_name}")
 
+        # DCP: decode-only feature, but agg mode has a single worker that does
+        # both prefill and decode. Apply dcp here so agg search can also benefit.
+        dcp_list = ctx.dcp_sizes if ctx.dcp_sizes else [1]
+        worker_config["dcp_list"] = dcp_list
+
         return {
             "is_moe": ctx.is_moe,
             "worker_config": worker_config,
@@ -470,6 +477,7 @@ class TaskConfigFactory:
             decode_system=decode_system,
             is_moe=ctx.is_moe,
             enable_wideep=ctx.enable_wideep,
+            should_enable_pp=ctx.enable_pp,
             model_family=ctx.model_family,
         )
 
@@ -488,6 +496,11 @@ class TaskConfigFactory:
             wc.setdefault("enable_eplb", None)
             wc.setdefault("moe_backend", None)
             wc.setdefault("attention_backend", "flashinfer")
+
+        # DCP: decode-only. Prefill always dcp=1.
+        dcp_list = ctx.dcp_sizes if ctx.dcp_sizes else [1]
+        prefill_worker_config["dcp_list"] = [1]
+        decode_worker_config["dcp_list"] = dcp_list
 
         replica_config = {
             "num_gpu_per_replica": [
@@ -663,6 +676,8 @@ class TaskConfig:
         enable_wideep: bool = False,
         enable_chunked_prefill: bool = False,
         enable_eplb: bool = False,
+        enable_pp: bool = False,
+        dcp_sizes: list[int] | None = None,
         total_gpus: int | None = None,
         profiles: list[str] | None = None,
         yaml_config: dict | None = None,
@@ -738,6 +753,8 @@ class TaskConfig:
             request_latency=request_latency,
             enable_wideep=enable_wideep,
             enable_chunked_prefill=enable_chunked_prefill,
+            enable_pp=enable_pp,
+            dcp_sizes=dcp_sizes,
             total_gpus=total_gpus,
             profiles=effective_profiles,
             yaml_patch=yaml_patch,
@@ -1152,6 +1169,7 @@ class TaskRunner:
                 is_moe=check_is_moe(task_config.model_path),
                 backend=common.BackendName(task_config.worker_config.backend_name),
                 enable_wideep=task_config.enable_wideep,
+                dcp_list=getattr(task_config.worker_config, "dcp_list", [1]),
             )
         except Exception:  # pragma: no cover
             logger.exception(
@@ -1164,8 +1182,9 @@ class TaskRunner:
 
         logger.info("Task %s: Listing parallelism configs to evaluate: ", task_config.task_name)
         for i, parallel_config in enumerate(parallel_config_list):
-            tp, pp, dp, moe_tp, moe_ep = parallel_config
-            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}")
+            tp, pp, dp, moe_tp, moe_ep = parallel_config[:5]
+            dcp = parallel_config[5] if len(parallel_config) > 5 else 1
+            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}" + (f", dcp={dcp}" if dcp > 1 else ""))
 
         logger.info("Task %s: Running agg pareto", task_config.task_name)
         enable_chunked_prefill = getattr(task_config, "enable_chunked_prefill", False)
@@ -1258,6 +1277,7 @@ class TaskRunner:
                 is_moe=check_is_moe(task_config.model_path),
                 backend=common.BackendName(task_config.prefill_worker_config.backend_name),
                 enable_wideep=prefill_enable_wideep,
+                dcp_list=getattr(task_config.prefill_worker_config, "dcp_list", [1]),
             )
         except Exception:  # pragma: no cover
             logger.exception(
@@ -1270,8 +1290,9 @@ class TaskRunner:
 
         logger.info("Task %s: Listing prefill parallelism configs to evaluate: ", task_config.task_name)
         for i, parallel_config in enumerate(prefill_parallel_config_list):
-            tp, pp, dp, moe_tp, moe_ep = parallel_config
-            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}")
+            tp, pp, dp, moe_tp, moe_ep = parallel_config[:5]
+            dcp = parallel_config[5] if len(parallel_config) > 5 else 1
+            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}" + (f", dcp={dcp}" if dcp > 1 else ""))
 
         logger.debug("Task %s: Setting up decode database", task_config.task_name)
         try:
@@ -1319,6 +1340,7 @@ class TaskRunner:
                 is_moe=check_is_moe(task_config.model_path),
                 backend=common.BackendName(task_config.decode_worker_config.backend_name),
                 enable_wideep=decode_enable_wideep,
+                dcp_list=getattr(task_config.decode_worker_config, "dcp_list", [1]),
             )
         except Exception:  # pragma: no cover
             logger.exception(
@@ -1331,8 +1353,9 @@ class TaskRunner:
 
         logger.info("Task %s: Listing decode parallelism configs to evaluate: ", task_config.task_name)
         for i, parallel_config in enumerate(decode_parallel_config_list):
-            tp, pp, dp, moe_tp, moe_ep = parallel_config
-            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}")
+            tp, pp, dp, moe_tp, moe_ep = parallel_config[:5]
+            dcp = parallel_config[5] if len(parallel_config) > 5 else 1
+            logger.info(f"{i + 1}) tp={tp}, pp={pp}, dp={dp}, moe_tp={moe_tp}, moe_ep={moe_ep}" + (f", dcp={dcp}" if dcp > 1 else ""))
 
         # For SGLang non-wideep disaggregated serving
         # See: https://github.com/ai-dynamo/dynamo/issues/5870

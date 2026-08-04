@@ -505,19 +505,40 @@ def _resolve_moe_parallelism(
     moe_tp_size: int | None,
     moe_ep_size: int | None,
     model_path: str | None = None,
+    backend_name: str | None = None,
 ) -> tuple[int, int]:
     """Resolve and validate MoE parallelism widths, returning (moe_tp_size, moe_ep_size).
 
     For dense (non-MoE) models the width constraint is not enforced because
     MoE parallelism has no effect on the computation.
+
+    For vllm-ascend backend, moe_tp is pinned to 1 (vllm-ascend does not
+    support moe_tp>1 and moe_ep>1 simultaneously).
     """
+    is_vllm_ascend = backend_name in ("vllm-ascend", "vllm_ascend")
+
     if moe_tp_size is None and moe_ep_size is None:
-        moe_tp_size = tp_size
-        moe_ep_size = attention_dp_size
+        if is_vllm_ascend:
+            moe_tp_size = 1
+            moe_ep_size = tp_size * attention_dp_size
+        else:
+            moe_tp_size = tp_size
+            moe_ep_size = attention_dp_size
     elif moe_tp_size is None:
-        moe_tp_size = tp_size * attention_dp_size // moe_ep_size
+        if is_vllm_ascend:
+            moe_tp_size = 1
+        else:
+            moe_tp_size = tp_size * attention_dp_size // moe_ep_size
     elif moe_ep_size is None:
         moe_ep_size = tp_size * attention_dp_size // moe_tp_size
+
+    if moe_tp_size is not None and moe_tp_size <= 0:
+        raise ValueError(
+            f"Resolved moe_tp_size={moe_tp_size} is non-positive. "
+            f"Check tp_size={tp_size}, attention_dp_size={attention_dp_size}, "
+            f"moe_ep_size={moe_ep_size}. For vllm-ascend, moe_tp is pinned to 1 "
+            f"and moe_ep should equal tp * dp."
+        )
 
     attn_width = tp_size * attention_dp_size
     moe_width = moe_tp_size * moe_ep_size
@@ -541,6 +562,7 @@ def _build_model_config(
     fmha_quant_mode: str | None = None,
     moe_quant_mode: str | None = None,
     comm_quant_mode: str | None = None,
+    dcp_size: int = 1,
 ):
     """Build a ModelConfig with optional quant mode overrides."""
     from aiconfigurator_npu.sdk.common import (
@@ -563,6 +585,7 @@ def _build_model_config(
         fmha_quant_mode=FMHAQuantMode[fmha_quant_mode] if fmha_quant_mode else None,
         moe_quant_mode=MoEQuantMode[moe_quant_mode] if moe_quant_mode else None,
         comm_quant_mode=CommQuantMode[comm_quant_mode] if comm_quant_mode else None,
+        dcp_size=dcp_size,
     )
 
 
@@ -604,6 +627,8 @@ def cli_estimate(
     decode_moe_ep_size: int | None = None,
     decode_batch_size: int | None = None,
     decode_num_workers: int | None = None,
+    dcp_size: int = 1,
+    decode_dcp_size: int | None = None,
     systems_paths: str | None = None,
 ) -> EstimateResult:
     """
@@ -703,6 +728,17 @@ def cli_estimate(
             db.set_default_database_mode(DatabaseMode[database_mode])
         return db
 
+    # vllm-ascend: auto-derive attention_dp_size from tp + moe_ep.
+    # vllm-ascend pins moe_tp=1, so EP = tp * dp. When user gives --tp and --moe-ep
+    # but not --attention-dp-size, derive dp = ep / tp.
+    if backend_name in ("vllm-ascend", "vllm_ascend"):
+        if moe_tp_size is None:
+            moe_tp_size = 1
+        if moe_ep_size is not None:
+            derived_dp = moe_ep_size // tp_size
+            if moe_ep_size % tp_size == 0 and derived_dp > 0:
+                attention_dp_size = derived_dp
+
     if mode == "agg":
         return _run_agg_estimate(
             model_path=model_path,
@@ -723,6 +759,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            dcp_size=dcp_size,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -772,6 +809,7 @@ def cli_estimate(
             fmha_quant_mode=fmha_quant_mode,
             moe_quant_mode=moe_quant_mode,
             comm_quant_mode=comm_quant_mode,
+            decode_dcp_size=decode_dcp_size or dcp_size,
             load_database=_load_database,
             get_backend=get_backend,
             get_model=get_model,
@@ -800,6 +838,7 @@ def _run_agg_estimate(
     fmha_quant_mode,
     moe_quant_mode,
     comm_quant_mode,
+    dcp_size: int = 1,
     load_database,
     get_backend,
     get_model,
@@ -809,7 +848,8 @@ def _run_agg_estimate(
     from aiconfigurator_npu.sdk.inference_session import InferenceSession
 
     moe_tp_size, moe_ep_size = _resolve_moe_parallelism(
-        tp_size, attention_dp_size, moe_tp_size, moe_ep_size, model_path=model_path
+        tp_size, attention_dp_size, moe_tp_size, moe_ep_size,
+        model_path=model_path, backend_name=backend_name
     )
 
     model_config = _build_model_config(
@@ -823,6 +863,7 @@ def _run_agg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        dcp_size=dcp_size,
     )
     runtime_config = RuntimeConfig(isl=isl, osl=osl, batch_size=batch_size)
 
@@ -847,7 +888,7 @@ def _run_agg_estimate(
     return EstimateResult(
         ttft=result_dict["ttft"],
         tpot=result_dict["tpot"],
-        power_w=result_dict.get("power_w", 0.0),
+        power_w=float(result_dict.get("power_w", 0.0)),
         isl=isl,
         osl=osl,
         batch_size=batch_size,
@@ -892,6 +933,7 @@ def _run_disagg_estimate(
     fmha_quant_mode,
     moe_quant_mode,
     comm_quant_mode,
+    decode_dcp_size: int = 1,
     load_database,
     get_backend,
     get_model,
@@ -900,6 +942,21 @@ def _run_disagg_estimate(
     from aiconfigurator_npu.sdk.config import RuntimeConfig
     from aiconfigurator_npu.sdk.inference_session import DisaggInferenceSession
 
+    # vllm-ascend: auto-derive attention_dp_size for prefill and decode separately
+    if backend_name in ("vllm-ascend", "vllm_ascend"):
+        if prefill_moe_tp_size is None:
+            prefill_moe_tp_size = 1
+        if prefill_moe_ep_size is not None:
+            needed_dp = prefill_moe_ep_size // prefill_tp_size
+            if prefill_moe_ep_size % prefill_tp_size == 0 and needed_dp > 0:
+                prefill_attention_dp_size = needed_dp
+        if decode_moe_tp_size is None:
+            decode_moe_tp_size = 1
+        if decode_moe_ep_size is not None:
+            needed_dp = decode_moe_ep_size // decode_tp_size
+            if decode_moe_ep_size % decode_tp_size == 0 and needed_dp > 0:
+                decode_attention_dp_size = needed_dp
+
     # Resolve MoE parallelism for prefill and decode separately
     p_moe_tp, p_moe_ep = _resolve_moe_parallelism(
         prefill_tp_size,
@@ -907,6 +964,7 @@ def _run_disagg_estimate(
         prefill_moe_tp_size,
         prefill_moe_ep_size,
         model_path=model_path,
+        backend_name=backend_name,
     )
     d_moe_tp, d_moe_ep = _resolve_moe_parallelism(
         decode_tp_size,
@@ -914,6 +972,7 @@ def _run_disagg_estimate(
         decode_moe_tp_size,
         decode_moe_ep_size,
         model_path=model_path,
+        backend_name=backend_name,
     )
 
     prefill_model_config = _build_model_config(
@@ -939,6 +998,7 @@ def _run_disagg_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        dcp_size=decode_dcp_size,
     )
 
     runtime_config = RuntimeConfig(isl=isl, osl=osl)
@@ -990,7 +1050,7 @@ def _run_disagg_estimate(
     return EstimateResult(
         ttft=result_dict["ttft"],
         tpot=result_dict["tpot"],
-        power_w=result_dict.get("power_w", 0.0),
+        power_w=float(result_dict.get("power_w", 0.0)),
         isl=isl,
         osl=osl,
         batch_size=prefill_batch_size,

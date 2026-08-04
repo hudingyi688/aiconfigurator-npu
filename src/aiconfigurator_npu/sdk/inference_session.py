@@ -366,7 +366,8 @@ class DisaggInferenceSession:
         all_configs_oom = True
 
         for parallel_config in parallel_config_list:
-            tp_size, pp_size, dp_size, moe_tp_size, moe_ep_size = parallel_config
+            tp_size, pp_size, dp_size, moe_tp_size, moe_ep_size = parallel_config[:5]
+            dcp_size = parallel_config[5] if len(parallel_config) > 5 else 1
             logger.debug(
                 "Getting candidate workers with parallel config: tp=%d, pp=%d, dp=%d, moe_tp=%d, moe_ep=%d",
                 tp_size,
@@ -383,6 +384,7 @@ class DisaggInferenceSession:
                 overwritten_model_config.moe_tp_size = moe_tp_size
                 overwritten_model_config.moe_ep_size = moe_ep_size
                 overwritten_model_config.attention_dp_size = dp_size
+                overwritten_model_config.dcp_size = dcp_size
                 model = models.get_model(
                     model_path=model_path,
                     model_config=overwritten_model_config,
@@ -808,7 +810,11 @@ class DisaggInferenceSession:
             logger.debug(f"No disagg result found for {model_path} with given constraints.")
             return disagg_summary
 
-        disagg_summary_df = disagg_summary_df.drop_duplicates(ignore_index=True)
+        # drop_duplicates fails when columns contain unhashable types (e.g. numpy.ndarray).
+        # Only deduplicate on hashable (scalar) columns.
+        import numpy as np
+        hashable_cols = [c for c in disagg_summary_df.columns if disagg_summary_df[c].apply(lambda x: not isinstance(x, np.ndarray)).all()]
+        disagg_summary_df = disagg_summary_df.drop_duplicates(subset=hashable_cols if hashable_cols else None, ignore_index=True)
         # set final disagg summary
         disagg_summary.set_summary_df(disagg_summary_df)
         return disagg_summary

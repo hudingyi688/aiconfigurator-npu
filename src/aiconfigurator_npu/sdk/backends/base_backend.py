@@ -86,6 +86,8 @@ class BaseBackend(ABC):
 
         batch_size = batch_size * (model._nextn + 1)
 
+        dcp_size = getattr(model.config, "dcp_size", 1) or 1
+
         for i in range(0, osl - 1, stride):
             latency_dict = defaultdict(float)
             energy_wms_dict = defaultdict(float)
@@ -100,6 +102,7 @@ class BaseBackend(ABC):
                     s=isl + i + 1,
                     model_name=getattr(model, "model_name", ""),
                     gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
+                    dcp_size=dcp_size,
                 )
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
@@ -236,7 +239,11 @@ class BaseBackend(ABC):
         ) = self._run_static_breakdown(model, database, runtime_config, mode, stride, latency_correction_scale)
 
         if mode == "static_ctx":
-            memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, 1, prefix=prefix)
+            chunk_tokens = getattr(runtime_config, "max_num_batched_tokens", None) or 4096
+            memory = self._get_memory_usage(
+                model, database, batch_size, beam_width, isl, 1,
+                num_tokens=chunk_tokens, prefix=prefix,
+            )
         elif mode == "static_gen":
             memory = self._get_memory_usage(
                 model,
@@ -249,7 +256,11 @@ class BaseBackend(ABC):
                 prefix=prefix,
             )  # for gen only, all kvcache is needed.
         else:
-            memory = self._get_memory_usage(model, database, batch_size, beam_width, isl, osl, prefix=prefix)
+            # "static" mode (agg): cap activations to chunked prefill budget
+            memory = self._get_memory_usage(
+                model, database, batch_size, beam_width, isl, osl,
+                prefix=prefix, max_act_tokens=4096,
+            )
 
         # Calculate total latencies and energies (simple sums - decoupled!)
         context_latency_ms = sum(context_latency_dict.values())  # milliseconds
@@ -295,8 +306,9 @@ class BaseBackend(ABC):
         dp = model.config.attention_dp_size
         moe_tp = model.config.moe_tp_size
         moe_ep = model.config.moe_ep_size
+        dcp = getattr(model.config, "dcp_size", 1) or 1
         num_total_gpus = tp * pp * dp
-        parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
+        parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}" + (f"dcp{dcp}" if dcp > 1 else "")
         gemm = model.config.gemm_quant_mode.name
         kvcache = model.config.kvcache_quant_mode.name
         fmha = model.config.fmha_quant_mode.name
@@ -459,6 +471,7 @@ class BaseBackend(ABC):
         osl: int,
         num_tokens: int = 0,
         prefix: int = 0,
+        max_act_tokens: int = 0,
     ) -> dict[str, float]:
         """
         Get the memory usage of the backend.

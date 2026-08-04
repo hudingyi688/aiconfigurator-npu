@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 import yaml
 from scipy import interpolate
+from scipy.spatial import QhullError
 
 from aiconfigurator_npu.sdk import common
 from aiconfigurator_npu.sdk.common import PerfDataFilename
@@ -3187,7 +3188,7 @@ class PerfDatabase:
             for y in sorted(data_dict[x].keys()):
                 z_dict = data_dict[x][y]
                 if len(z_dict) <= 1:
-                    logger.warning(
+                    logger.debug(
                         f"only one data point for a given xy, might trigger error. "
                         f"Please revisit data collection. {x=}, {y=}, {z_dict=}"
                     )
@@ -3197,7 +3198,7 @@ class PerfDatabase:
                         z_left, z_right = self._nearest_1d_point_helper(z, list(z_dict.keys()), False)
                         # Check if both left and right boundaries exist
                         if z_left not in z_dict or z_right not in z_dict:
-                            logger.warning(
+                            logger.debug(
                                 f"Skipping interpolation for z={z} as boundaries z_left={z_left} "
                                 f"or z_right={z_right} do not exist in z_dict for x={x}, y={y}"
                             )
@@ -3324,8 +3325,6 @@ class PerfDatabase:
         """
         assert values is not None and len(values) >= 1, "values is None or empty"
         if len(values) == 1:
-            if inner_only and x != values[0]:
-                raise ValueError(f"x is not equal to the only value in the list. {x=}, {values=}")
             return values[0], values[0]
 
         sorted_values = sorted(values)
@@ -3360,6 +3359,17 @@ class PerfDatabase:
             logger.debug(f"Negative value detected {value}, pass")
         return value
 
+    @staticmethod
+    def _safe_griddata(points, values, target, method="linear"):
+        """Wrap interpolate.griddata with QhullError fallback to nearest."""
+        points = np.array(points)
+        values = np.array(values)
+        target = np.array(target)
+        try:
+            return interpolate.griddata(points, values, target, method=method)
+        except QhullError:
+            return interpolate.griddata(points, values, target, method="nearest")
+
     def _interp_3d_linear(self, x: int, y: int, z: int, data: dict) -> float:
         """
         Interpolate the 3d data using linear interpolation
@@ -3377,7 +3387,7 @@ class PerfDatabase:
                 values_list.append(data[i][j][z_right])
 
         return self._validate(
-            interpolate.griddata(np.array(points_list), np.array(values_list), (x, y, z), method="linear")
+            self._safe_griddata(np.array(points_list), np.array(values_list), (x, y, z), method="linear")
         )
 
     def _interp_2d_linear(self, x: int, y: int, data: dict) -> dict:
@@ -3409,7 +3419,7 @@ class PerfDatabase:
                     latency_values.append(latency_data[i][j])
 
             latency = self._validate(
-                interpolate.griddata(np.array(points_list), np.array(latency_values), (x, y), method="linear")
+                self._safe_griddata(np.array(points_list), np.array(latency_values), (x, y), method="linear")
             )
 
             # Interpolate energy using same points
@@ -3420,7 +3430,7 @@ class PerfDatabase:
                     energy_values.append(energy_data[i][j])
 
             energy = self._validate(
-                interpolate.griddata(np.array(points_list), np.array(energy_values), (x, y), method="linear")
+                self._safe_griddata(np.array(points_list), np.array(energy_values), (x, y), method="linear")
             )
 
             return {"latency": latency, "power": 0.0, "energy": energy}
@@ -3436,7 +3446,7 @@ class PerfDatabase:
                     values_list.append(data[i][j])
 
             latency = self._validate(
-                interpolate.griddata(np.array(points_list), np.array(values_list), (x, y), method="linear")
+                self._safe_griddata(np.array(points_list), np.array(values_list), (x, y), method="linear")
             )
 
             return {"latency": latency, "power": 0.0, "energy": 0.0}
@@ -3578,7 +3588,7 @@ class PerfDatabase:
             if method == "cubic":
                 x_values.append(
                     self._validate(
-                        interpolate.griddata(np.array(points_list), np.array(values_list), (y, z), method="cubic")
+                        self._safe_griddata(np.array(points_list), np.array(values_list), (y, z), method="cubic")
                     )
                 )
             elif method == "bilinear":

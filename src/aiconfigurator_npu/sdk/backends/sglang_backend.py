@@ -310,6 +310,7 @@ class SGLANGBackend(BaseBackend):
             dp = model.config.attention_dp_size
             moe_tp = model.config.moe_tp_size
             moe_ep = model.config.moe_ep_size
+            dcp = getattr(model.config, "dcp_size", 1) or 1
             tokens_s_gpu = output_throughput / pp / tp / dp
             tokens_s_user = 1000 / tpot
             seq_s = request_rate
@@ -317,7 +318,7 @@ class SGLANGBackend(BaseBackend):
             tokens_s = output_throughput
             request_latency = ttft + tpot * max(osl - 1, 0)
             num_total_gpus = tp * pp * dp
-            parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
+            parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}" + (f"dcp{dcp}" if dcp > 1 else "")
             gemm = model.config.gemm_quant_mode.name
             kvcache = model.config.kvcache_quant_mode.name
             fmha = model.config.fmha_quant_mode.name
@@ -503,6 +504,7 @@ class SGLANGBackend(BaseBackend):
         osl: int,
         num_tokens: int = 0,
         prefix: int = 0,
+        max_act_tokens: int = 0,
     ) -> dict[str, float]:
         """
         Get the memory usage of the SGLANG backend.
@@ -524,25 +526,26 @@ class SGLANGBackend(BaseBackend):
         h = model._num_heads * model._head_size
         if num_tokens == 0:
             num_tokens = (isl - prefix) * batch_size
+        act_tokens = min(num_tokens, max_act_tokens) if max_act_tokens > 0 else num_tokens
 
         # ==== SGLANG backend specific memory calculations ====
         # SGLANG typically has higher activation memory due to Python overhead
         # and dynamic execution patterns
         if model.model_family == "GPT":
             c_dict = {1: 13, 2: 8, 4: 6.5, 8: 6.5}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 90 * 1024 * 1024)  # Higher minimum for SGLANG
         elif model.model_family == "LLAMA":
             c_dict = {1: 14, 2: 8.5, 4: 6.5, 8: 6.5}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 90 * 1024 * 1024)  # Higher minimum for SGLANG
         elif model.model_family == "MOE":
             c_dict = {1: 28, 2: 17, 4: 13, 8: 13}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 90 * 1024 * 1024)  # Higher minimum for SGLANG
         elif model.model_family in ("DEEPSEEK", "DEEPSEEKV32"):
             c_dict = {1: 28, 2: 17, 4: 13, 8: 13}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations += (
                 num_tokens
                 * h
@@ -557,7 +560,7 @@ class SGLANGBackend(BaseBackend):
         else:
             # Default case - increased coefficients for SGLANG
             c_dict = {1: 13, 2: 8, 4: 6.5, 8: 6.5}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 90 * 1024 * 1024)  # Higher minimum for SGLANG
 
         # MTP correction: additional activation memory for draft tokens (applies to all models)

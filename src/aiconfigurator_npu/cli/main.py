@@ -32,6 +32,15 @@ def _build_common_cli_parser() -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
     common_parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        type=str,
+        default=None,
+        choices=["debug", "info", "warning", "error"],
+        help="Set logging level (default: info, or debug if --debug). "
+        "Use 'error' to suppress warnings from perf database interpolation.",
+    )
+    common_parser.add_argument(
         "--no-color",
         dest="no_color",
         action="store_true",
@@ -177,6 +186,24 @@ def _add_default_mode_arguments(parser):
         default=False,
         help="Enable chunked prefill for finer-grained context token sweep during optimization. "
         "When off (default), context token stride is aligned to ISL for faster sweeping.",
+    )
+    parser.add_argument(
+        "--enable-pp",
+        action="store_true",
+        default=False,
+        help="Enable pipeline parallelism (PP) candidates in the search space. "
+        "When off (default), only PP=1 is searched. "
+        "Enable to include PP in {1,2,4,8} for agg and disagg prefill search.",
+    )
+    parser.add_argument(
+        "--dcp-sizes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Decode Context Parallel (DCP) sizes to search for decode. "
+        "DCP slices KV cache along sequence dim: each card stores 1/dcp of KV. "
+        "Must divide tp_size (tp %% dcp == 0). Decode-only. "
+        "Example: --dcp-sizes 1 2 4. Default: [1] (off).",
     )
 
 
@@ -330,6 +357,16 @@ def _add_estimate_mode_arguments(parser):
     )
     parser.add_argument(
         "--decode-moe-ep-size", type=int, default=None, help="Decode MoE EP size (disagg). Defaults to --moe-ep-size."
+    )
+    parser.add_argument(
+        "--dcp-size", type=int, default=1,
+        help="Decode Context Parallel size. Slices KV cache along sequence dim "
+        "during decode: each card stores 1/dcp of KV tokens. Must divide tp_size. "
+        "Decode-only (prefill always dcp=1). Default: 1 (off)."
+    )
+    parser.add_argument(
+        "--decode-dcp-size", type=int, default=None,
+        help="Decode DCP size (disagg). Defaults to --dcp-size."
     )
     parser.add_argument(
         "--decode-batch-size", type=int, default=None, help="Decode batch size (disagg). Required for disagg mode."
@@ -613,6 +650,8 @@ def build_default_task_configs(
     nextn: int = 0,
     nextn_accept_rates: list[float] | None = None,
     enable_chunked_prefill: bool = False,
+    enable_pp: bool = False,
+    dcp_sizes: list[int] | None = None,
 ) -> dict[str, TaskConfig]:
     """Build agg and disagg task configs for default mode comparison.
 
@@ -701,6 +740,8 @@ def build_default_task_configs(
         "prefix": prefix,
         "database_mode": database_mode,
         "enable_chunked_prefill": enable_chunked_prefill,
+        "enable_pp": enable_pp,
+        "dcp_sizes": dcp_sizes,
     }
 
     # Create yaml_config to pass nextn and nextn_accept_rates if specified
@@ -895,6 +936,10 @@ def build_experiment_task_configs(
             task_kwargs["enable_eplb"] = exp_config["enable_eplb"]
         if "enable_chunked_prefill" in exp_config:
             task_kwargs["enable_chunked_prefill"] = exp_config["enable_chunked_prefill"]
+        if "enable_pp" in exp_config:
+            task_kwargs["enable_pp"] = exp_config["enable_pp"]
+        if "dcp_sizes" in exp_config:
+            task_kwargs["dcp_sizes"] = exp_config["dcp_sizes"]
         if "database_mode" in exp_config:
             task_kwargs["database_mode"] = exp_config["database_mode"]
 
@@ -966,6 +1011,59 @@ def _execute_task_configs(
                     if db_mode == common.DatabaseMode.SILICON.name
                     else ""
                 )
+
+                # SLO relaxation retry: if disagg returned no results and TTFT constraint
+                # is set, retry with a very relaxed TTFT to get full data for reporting.
+                # This mirrors MSMODELING's "--ttft-limits 200000" strategy.
+                rc = task_config.config.get("runtime_config")
+                relaxed_ttft = rc.get("ttft") if rc else None
+                relaxed_tpot = rc.get("tpot") if rc else None
+                if not isinstance(relaxed_ttft, (int, float)):
+                    relaxed_ttft = None
+                if "disagg" in exp_name and relaxed_ttft is not None and relaxed_ttft < 100000:
+                    logger.info(
+                        "Experiment %s returned no results under SLO (ttft=%s, tpot=%s). "
+                        "Retrying with relaxed SLO to get full data...",
+                        exp_name, relaxed_ttft, relaxed_tpot,
+                    )
+                    # Create a new TaskConfig with relaxed SLO instead of deepcopy
+                    # (deepcopy doesn't work well with TaskConfig's internal state).
+                    from aiconfigurator_npu.sdk.task import TaskConfig as _TC
+                    relaxed_config = _TC(
+                        serving_mode=task_config.serving_mode,
+                        model_path=task_config.model_path,
+                        system_name=task_config.system_name,
+                        decode_system_name=task_config.decode_system_name,
+                        backend_name=task_config.backend_name,
+                        backend_version=task_config.backend_version,
+                        isl=rc.get("isl"),
+                        osl=rc.get("osl"),
+                        prefix=rc.get("prefix", 0),
+                        ttft=200000,
+                        tpot=200000,
+                        request_latency=None,
+                        enable_wideep=task_config.enable_wideep,
+                        enable_chunked_prefill=task_config.config.get("enable_chunked_prefill", False),
+                        enable_eplb=False,
+                        enable_pp=task_config.config.get("enable_pp", False) if "enable_pp" in task_config.config else False,
+                        total_gpus=task_config.total_gpus,
+                        database_mode=task_config.config.get("database_mode"),
+                    )
+                    try:
+                        relaxed_result = runner.run(relaxed_config)
+                        if relaxed_result is not None:
+                            relaxed_pareto = relaxed_result["pareto_df"]
+                            if relaxed_pareto is not None and not relaxed_pareto.empty:
+                                results[exp_name] = relaxed_result
+                                logger.info(
+                                    "Experiment %s completed with %d results under relaxed SLO "
+                                    "(original SLO too tight; showing all configs for reference).",
+                                    exp_name, len(relaxed_pareto),
+                                )
+                                continue
+                    except Exception:
+                        pass
+
                 msg = (
                     f"Experiment {exp_name} returned no results. Possible causes: "
                     "(1) TTFT/TPOT constraints are too tight — try relaxing --ttft or --tpot; "
@@ -1330,6 +1428,7 @@ def _run_estimate_mode(args):
         fmha_quant_mode=args.fmha_quant_mode,
         moe_quant_mode=args.moe_quant_mode,
         comm_quant_mode=args.comm_quant_mode,
+        dcp_size=args.dcp_size,
     )
 
     if estimate_mode == "disagg":
@@ -1349,6 +1448,7 @@ def _run_estimate_mode(args):
             decode_moe_ep_size=args.decode_moe_ep_size,
             decode_batch_size=args.decode_batch_size,
             decode_num_workers=args.decode_num_workers,
+            decode_dcp_size=args.decode_dcp_size or args.dcp_size,
         )
 
     result = cli_estimate(**estimate_kwargs)
@@ -1406,8 +1506,12 @@ def _run_estimate_mode(args):
 
 
 def main(args):
+    if getattr(args, "log_level", None):
+        level = {"debug": logging.DEBUG, "info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR}[args.log_level]
+    else:
+        level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
     setup_logging(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=level,
         no_color=getattr(args, "no_color", False),
     )
 
@@ -1452,6 +1556,8 @@ def main(args):
             nextn=args.nextn,
             nextn_accept_rates=[float(x) for x in args.nextn_accept_rates.split(",")],
             enable_chunked_prefill=args.enable_chunked_prefill,
+            enable_pp=args.enable_pp,
+            dcp_sizes=args.dcp_sizes,
         )
     elif args.mode == "exp":
         try:

@@ -311,6 +311,7 @@ class TRTLLMBackend(BaseBackend):
             dp = model.config.attention_dp_size
             moe_tp = model.config.moe_tp_size
             moe_ep = model.config.moe_ep_size
+            dcp = getattr(model.config, "dcp_size", 1) or 1
             tokens_s_gpu = output_throughput / pp / tp / dp
             tokens_s_user = 1000 / tpot
             seq_s = request_rate
@@ -318,7 +319,7 @@ class TRTLLMBackend(BaseBackend):
             tokens_s = output_throughput
             request_latency = ttft + tpot * max(osl - 1, 0)
             num_total_gpus = tp * pp * dp
-            parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}"
+            parallel = f"tp{tp}pp{pp}dp{dp}etp{moe_tp}ep{moe_ep}" + (f"dcp{dcp}" if dcp > 1 else "")
             gemm = model.config.gemm_quant_mode.name
             kvcache = model.config.kvcache_quant_mode.name
             fmha = model.config.fmha_quant_mode.name
@@ -504,9 +505,15 @@ class TRTLLMBackend(BaseBackend):
         osl: int,
         num_tokens: int = 0,
         prefix: int = 0,
+        max_act_tokens: int = 0,
     ) -> dict[str, float]:
         """
         Get the memory usage of the backend.
+
+        Args:
+            max_act_tokens: If > 0, cap the activation num_tokens to this value
+                (chunked prefill budget). KV cache uses the full isl-based formula.
+                When 0 (default), use num_tokens as-is (legacy behavior).
         """
         weights, activations, kvcache = 0.0, 0.0, 0.0
         for op in model.context_ops:
@@ -519,28 +526,34 @@ class TRTLLMBackend(BaseBackend):
         if num_tokens == 0:
             num_tokens = (isl - prefix) * batch_size
 
+        # Cap activation tokens for chunked prefill: production vLLM processes
+        # at most max-num-batched-tokens (default 4096) tokens per step, so
+        # activation memory is bounded by the chunk size, not total concurrent
+        # tokens. KV cache still uses the full isl-based formula below.
+        act_tokens = min(num_tokens, max_act_tokens) if max_act_tokens > 0 else num_tokens
+
         # ==== this below section is backend specific ====
         # FIXME: the measurement is done based on trt workflow and traditional moe.
         #        needs to study the new model again. Expecially fine-grained moe will introduce
         #        more act/workspace memory.
         if model.model_family == "GPT":
             c_dict = {1: 10, 2: 6, 4: 5, 8: 5}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 70 * 1024 * 1024)  # minimum act
         elif model.model_family == "LLAMA":
             c_dict = {1: 11, 2: 6.5, 4: 5, 8: 5}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 70 * 1024 * 1024)  # minimum act
         elif model.model_family == "MOE":
             c_dict = {1: 22, 2: 13, 4: 10, 8: 10}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 70 * 1024 * 1024)  # minimum act
         elif model.model_family in ("DEEPSEEK", "DEEPSEEKV32"):
             c_dict = {1: 22, 2: 13, 4: 10, 8: 10}
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             # moe workspace, 128 for block scale, float for 4bytes
             activations += (
-                num_tokens
+                act_tokens
                 * h
                 * model.config.attention_dp_size
                 * model._num_experts
@@ -557,7 +570,7 @@ class TRTLLMBackend(BaseBackend):
                 4: 5,
                 8: 5,
             }  # 4+6/TP, fp8 will have relatively low act, but ignore here. need more experiments
-            activations = 2 * num_tokens * h * c_dict[min(model.config.tp_size, 8)]
+            activations = 2 * act_tokens * h * c_dict[min(model.config.tp_size, 8)]
             activations = max(activations, 70 * 1024 * 1024)  # minimum act
         # ==== this above section is backend specific ====
 
@@ -576,6 +589,13 @@ class TRTLLMBackend(BaseBackend):
             * model.config.kvcache_quant_mode.value.memory
             * kvcache_per_token
         )
+        # DCP: each card stores 1/dcp_size of KV tokens along the sequence dim.
+        # Applied to decode (static_gen) only; prefill (static_ctx) always dcp=1.
+        # The physical per-token cost is unchanged; the total bytes shrink because
+        # fewer tokens are stored per card (capacity grows dcp_size× for same HBM).
+        dcp_size = getattr(model.config, "dcp_size", 1) or 1
+        if dcp_size > 1:
+            kvcache = kvcache / dcp_size
         # if 'DEEPSEEK' in model.model_path or 'MOE' in model.model_path:
         #    kvcache = kvcache * model.config.attention_dp_size # this is incorrect. tp will
         #    duplicate the kvcache while attn_dp will not.

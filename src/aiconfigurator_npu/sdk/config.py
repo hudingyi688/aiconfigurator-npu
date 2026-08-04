@@ -39,6 +39,10 @@ class ModelConfig:
     # producer side. Set True only for the prefill model in a disagg run; agg
     # and decode leave it False so KVTransfer contributes nothing.
     is_disagg_prefill: bool = False
+    # Decode Context Parallel: slices KV cache along sequence dim during decode.
+    # Each card stores 1/dcp_size of KV tokens → capacity grows dcp_size×.
+    # Must divide tp_size (tp % dcp == 0). Decode-only; prefill always dcp=1.
+    dcp_size: int = 1
 
 
 @dataclass
