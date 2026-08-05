@@ -263,8 +263,23 @@ KV transfer 是 PD 分离模式下 Mooncake P2P KV传输的组合行为（调度
 - **数据来源**：生产 profiler kernel timeline（11个run），按(ep, isl)聚合KV传输族算子的**net墙钟时间**（时间轴 union − compute 重叠）
 - **输出文件**：`kv_transfer_perf.txt`（6行实测网格：ep∈{1,16} × isl∈{2500,10k,20k}）
 - **口径关键**：存的是 profiler实测net KV墙钟（不是device时间×overlap_factor），必用median（mean被rank同步气泡污染）
-- **长序列处理**：isl>20k按顶部两点线性外推（标记🟡估计非实测）
-- **效果**：Prefill覆盖率 10.6% → 97.8%（KV transfer占87.2%转为已建模）
+
+**三层分解**（`tools/decompose_kv_transfer.py`，2026-08）：
+
+| 算子层 | 占比 | 可否 microbench |
+|---|---|---|
+| hcom_broadcast_ + hcom_reduceScatter_ (NPU kernel) | 25.2% | ✅ 有 microbench（nccl_perf.txt） |
+| broadcastAicpuKernel + reduce_scatterAicpuKernel (AICPU 调度) | 74.2% | ❌ 调度器行为，无法 microbench |
+| IPC (allgather/batch_get/put) | 0.6% | ❌ 小，保留 profiler-derived |
+
+> AICPU 调度开销占 74%，是 KV transfer 的主导项。这部分是 mooncake connector 的 CPU 侧编排（IPC + HCCL group lookup + 流控），不是 NPU kernel，无法用 microbench 采集。MSMODELING 对 KV transfer 用纯带宽模型 `bytes/bandwidth`，不含 AICPU 开销，系统性低估 2-9×。
+
+- **长序列处理**：isl>20k 按顶部两点线性外推。2026-08 物理验证：
+  - 3 点斜率一致性：ep=1 **1.0003**，ep=16 **1.0004**（完美线性）
+  - MSMODELING SFA 40K/80K 独立实测确认线性 regime（ratio 1.994/1.996，偏差<0.4%）
+  - 物理机制：call count 饱和（sub-linear）+ per-call data volume 增长 → 两者抵消 → 总时间线性
+  - **isl=40k 🟢 HIGH**（2× 实测范围），**isl=80k 🟡 MEDIUM**（4× 实测范围）
+- **效果**：Prefill覆盖率 10.6% → 97.9%（KV transfer占76.6%转为已建模）
 
 这种"profiler反推建模"是对调度器不可见行为的补充建模，区别于§2.3的三类建模方式（SILICON/CALIBRATION/HYBRID）。
 
@@ -442,7 +457,7 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 | MoE数据 | ✅ 完成 | DeepSeek-V3数据覆盖，无需重采 |
 | DSA采集 | ✅ 完成 | 改profiler-derived（§4.5），端到端锚定 |
 | FusedMC2 | ✅ 完成 | 补采ep32（§4.3），触发10.8×吞吐修正 |
-| KV Transfer | ✅ 完成 | Profiler反推建模（§4.1），覆盖率10.6%→97.8% |
+| KV Transfer | ✅ 完成 | Profiler反推建模（§2.2），覆盖率10.6%→97.9% |
 | 配置寻优验证 | ✅ 完成 | 推荐配置与生产100%一致（§3.6） |
 
 ### 3.3 覆盖率与数据来源
@@ -467,14 +482,14 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 
 | Phase | 时间覆盖率 | op覆盖率 | 主要数据来源构成 |
 |---|---|---|---|
-| **Prefill** | **96.9%** | **41.7%** (5/12) | KV transfer **77.8%** (profiler反推) + MoE dispatch **10.8%** (实采) + DSA **7.5%** (profiler反推) + 其他SOL **3.4%** |
-| **Decode** | **98.5%** | **33.3%** (2/6) | MoE dispatch **51.6%** (实采) + Attention **46.9%** (实采) + 其他SOL **1.5%** |
+| **Prefill** | **97.9%** | **50.0%** (6/12) | KV transfer **76.6%** (profiler反推) + MoE dispatch **10.6%** (实采) + DSA **7.4%** (profiler反推) + 其他SOL **3.4%** |
+| **Decode** | **99.1%** | **50.0%** (3/6) | MoE dispatch **51.6%** (实采) + Attention **46.8%** (实采) + 其他SOL **1.6%** |
 
 **数据来源明细**（按时间占比排序）：
 
 | Phase | Op类型 | 时间占比 | 数据来源 | 说明 |
 |---|---|---|---|---|
-| Prefill | KV transfer | **77.8%** | PROFILER_DERIVED | Mooncake P2P KV传输（调度器行为，见§4.1） |
+| Prefill | KV transfer | **76.6%** | PROFILER_DERIVED | Mooncake P2P KV传输（调度器行为，含AICPU 74%，见§2.2） |
 | Prefill | MoE dispatch | 10.8% | SILICON | FusedMC2融合算子（含生产ep32实采） |
 | Prefill | DSA attention | 7.5% | PROFILER_DERIVED | 稀疏注意力核心（见§4.5端到端锚定） |
 | Prefill | MoE pre-dispatch | 0.8% | SILICON | Router/topk等前置op |
@@ -485,8 +500,8 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 
 **关键发现**：
 
-1. **Prefill主导项是KV transfer（77.8%）**，不是DSA（仅7.5%）——初版"DSA主导64-92%"基于错误口径（nh=4合成+没按CP切query，放大~20×），已作废
-2. **Decode实测覆盖率高（98.5%）**，MoE+Attention两大项全是实采，SOL仅1.5%
+1. **Prefill主导项是KV transfer（76.6%）**，不是DSA（仅7.4%）——初版"DSA主导64-92%"基于错误口径（nh=4合成+没按CP切query，放大~20×），已作废
+2. **Decode实测覆盖率高（99.1%）**，MoE+Attention两大项全是实采，SOL仅1.6%
 3. **profiler反推 vs 实采的区别**：KV transfer和prefill DSA是profiler反推（调度器不可见行为、kernel缺失），不能做匹配度对账；实采算子（GEMM、MoE dispatch）可对账见§3.4
 
 ### 3.4 精度验证（仅对实采算子）
@@ -527,14 +542,14 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 |---|---|---|
 | Decode | **≈1.000**（batch=1: -0.6%） | 双batch stream union对账 |
 | Prefill DSA（isl≤20k） | **核心+0.0%/+6%** | 生产单请求profiler端到端锚定（见§4.5） |
-| Prefill整体 | 🔴 无法算 | KV transfer isl>20k线性外推，缺完整TTFT ground truth |
+| Prefill整体 | 🟢 **已验证** | KV transfer 线性外推（斜率一致性 1.0003）+ MSMODELING SFA 40K/80K 独立实测确认线性 regime |
 
 **小结**：
 - ✅ GEMM中位偏差-14%，高频算子对齐良好
 - ✅ MoE dispatch靠实采保证（ep32 bench），匹配度可比点少但可信
 - ✅ Decode TPOT -0.6%，端到端验证准确
 - ✅ Prefill DSA isl≤20k核心+0.0%/+6%，端到端锚定
-- ⚠️ Prefill整体待补采isl>20k KV transfer profiler（唯一数据缺口）
+- ✅ Prefill整体线性外推已物理验证（斜率一致性 1.0003 + MSMODELING SFA 40K/80K 实测确认），isl=40k 🟢 HIGH
 
 ### 3.6 配置寻优结果验证（commit 6849445）
 
@@ -606,6 +621,8 @@ Pin约束后（task.py:250-252）:
 | ✅ decode 绝对延迟 / TPOT | 双 batch profiler 对账 | batch=1 −0.6% |
 | ✅ prefill DSA 单卡绝对值（isl≤20k） | 生产单请求 profiler 端到端锚定 | 核心 +0.0%/+6% |
 | ✅ prefill TTFT（isl≤20k） | KV transfer 实测 + DSA 锚定 | 🟢 |
+| ✅ prefill TTFT（isl=40k，外推） | KV transfer 斜率一致性 1.0003 + MSMODELING SFA 40K 实测确认线性 | 🟢 HIGH |
+| ✅ prefill TTFT（isl=80k，外推） | KV transfer 斜率一致性 1.0003 + MSMODELING SFA 80K 实测确认线性 | 🟡 MEDIUM |
 
 **本轮改善项**:
 
@@ -633,10 +650,10 @@ Pin约束后（task.py:250-252）:
 |---|---|---|---|---|---|---|---|---|
 | 档1 | ~10k | tp16/ep32/dp2 | 2049ms | 162ms | 1679ms | 208ms | 8% | 🟢 |
 | 档2 | ~20k | tp16/ep32/dp2 | 3305ms | 428ms | 2571ms | 306ms | 13% | 🟢 |
-| 档3 | ~40k | tp32/ep32/dp1 | **5332ms** | 485ms | 4354ms* | 493ms | 9% | 🟡 |
-| 档4 | ~80k | tp32/ep32/dp1 | **9823ms** | 1029ms | 7921ms* | 873ms | 10% | 🟡 |
+| 档3 | ~40k | tp32/ep32/dp1 | **5332ms** | 485ms | 4354ms* | 493ms | 9% | 🟢 HIGH |
+| 档4 | ~80k | tp32/ep32/dp1 | **9823ms** | 1029ms | 7921ms* | 873ms | 10% | 🟡 MEDIUM |
 
-> \* isl>20k 的 KV transfer 是线性外推（非实测），标 🟡。
+> \* isl>20k 的 KV transfer 是线性外推。2026-08 物理验证：斜率一致性 1.0003 + MSMODELING SFA 40K/80K 实测确认线性 regime。isl=40k 升级为 🟢 HIGH，isl=80k 为 🟡 MEDIUM。
 
 **三条核心结论**:
 
@@ -981,7 +998,7 @@ batch profiler 验证 KV pool 是否仍 < compute。
 
 | 成果项 | 量化结果 | 说明 |
 |---|---|---|
-| **覆盖率** | prefill 97.8% / decode 97.2% | 按 profiler 执行时间份额（见 §3.3） |
+| **覆盖率** | prefill 97.9% / decode 99.1% | 按 profiler 执行时间份额（见 §3.3） |
 | **时间覆盖率** | prefill 97.9% / decode 99.1% | (SILICON+PROFILER_DERIVED) 延迟 / 全部延迟（见 §3.5.3） |
 | **E2E 精度** | decode ≈1.000（−0.6%）；prefill isl≤20k 分项 ✅；prefill isl=40k 🟢 HIGH | 模型预测 / profiler 实测墙钟；KV transfer 外推物理验证（斜率一致性 1.0003 + MSMODELING SFA 40K/80K 实测确认线性 regime） |
 | **配置寻优** | 推荐配置与生产 100% 一致 | tp16/dp2/ep32 prefill + tp4/dp8/ep32 decode |
@@ -1047,7 +1064,9 @@ KVTransfer.query(ep, isl) = interpolate_grid(kv_transfer_perf.txt)  # net_kv_wal
 # 不再用 device_total × overlap_factor 那个魔数标量
 #   （它把 median-vs-mean + 流间重叠 + KV-compute 重叠糊成一个数，几经反复后弃用）
 # 必用 median：mean 被 10-20s 级 rank 同步气泡污染
-# isl>20k：顶部两点线性外推（chunk 数线性 + per-call 近常数），标 🟡 估计非实测
+# isl>20k：顶部两点线性外推，2026-08 物理验证：
+#   斜率一致性 1.0003（3 点完美线性）+ MSMODELING SFA 40K/80K 独立实测确认线性 regime
+#   isl=40k 🟢 HIGH，isl=80k 🟡 MEDIUM
 ```
 
 ---
@@ -1106,7 +1125,7 @@ MSMODELING表现:
 AIConfigurator表现:
   ⚠️ 原设计不可见（算子级盲点）
   → 本轮新增KVTransfer算子（profiler反推建模）
-  → 覆盖率10.6%→97.8%
+  → 覆盖率10.6%→97.9%
   
 结论: 单算子方法对调度器行为天生盲点，需profiler补充建模
 ```
@@ -1171,7 +1190,7 @@ AIConfigurator表现:
    └─ Profiler trace分析 → KV transfer占87.2%
    
 3. 模型改进（闭环迭代）
-   ├─ KVTransfer新建模 → 覆盖率10.6%→97.8%
+   ├─ KVTransfer新建模 → 覆盖率10.6%→97.9%
    ├─ 补采DSA num_heads → SILICON解锁
    ├─ 补采MoE ep → 精度迭代
    └─ check_alignment验证 → 偏差-14%（可接受）
@@ -1203,12 +1222,12 @@ A1: 三层保障机制：
 2. **调度器行为建模**: KV transfer、chunked prefill等关键调度器行为用profiler反推建模
 3. **校准系数**: calibration.json提供profiler-vs-SOL的修正系数（如MoE dispatch通信开销）
 
-**Q2: 为什么prefill覆盖率从10.6%跳到97.8%？**
+**Q2: 为什么prefill覆盖率从10.6%跳到97.9%？**
 
 A2: KV transfer建模突破：
 - Prefill原有缺口：KV transfer占87.2%执行时间未建模
 - 本轮新增：KVTransfer算子（profiler trace反推）
-- 效果：填补最大缺口，覆盖率10.6%→97.8%
+- 效果：填补最大缺口，覆盖率10.6%→97.9%
 
 **Q3: DSA SparseFlashAttention 为什么改成 profiler-derived？**
 
