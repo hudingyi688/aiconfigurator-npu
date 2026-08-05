@@ -469,96 +469,124 @@ GLM-5的MoE维度与DeepSeek-V3完全相同，可直接复用现有数据：
 | KV Transfer | ✅ 完成 | Profiler反推建模（§2.2），覆盖率10.6%→97.9% |
 | 配置寻优验证 | ✅ 完成 | 推荐配置与生产100%一致（§3.6） |
 
-### 3.3 覆盖率与数据来源
+### 3.3 算子映射与覆盖率（profiler op_type 粒度）
 
 > **三件事必须分开看**：
-> 1. **采集方式** —— 数据怎么来的：microbench 实采 vs profiler 反推
-> 2. **时间覆盖率** —— 有实测数据的算子覆盖了多少预测时间
-> 3. **匹配度** —— txt实采值 vs profiler实测的偏差（只对实采算子有意义）
->
-> 本节回答第1、2件事，第3件事见§3.4。
+> 1. **采集方式** —— 数据怎么来的：microbench 实采 vs profiler 反推 vs SOL 解析
+> 2. **时间覆盖率** —— 有实测数据的算子覆盖了多少 profiler 总时间
+> 3. **匹配度** —— bench 实采值 vs profiler 实测的偏差（只对实采算子有意义，见§3.4）
 
-**指标定义**（AIConfigurator体系，op类型粒度）：
+#### 算子级映射表（profiler op_type → aic-npu 建模）
 
-| 指标 | 公式 | 回答的问题 |
-|---|---|---|
-| **时间覆盖率** | (SILICON+PROFILER_DERIVED)延迟 / 全部延迟 | 有实测数据的算子覆盖了多少预测时间？ |
-| **op 覆盖率** | SILICON/PROFILER_DERIVED op数 / 非ZERO op数 | 有几个op有实测数据支撑？ |
+以下基于 profiler groundtruth（11 个 run，882,413 次 op 调用，308,161 ms 总时间），按 profiler op_type 粒度给出映射关系和覆盖度：
 
-> 时间覆盖率高（96-98%）是因为真正耗时的大算子（KV transfer、MoE、DSA）都有实测数据；op覆盖率低（33-42%）是因为SOL轻量op数量多但不占时间。时间覆盖率是精度的前提，不是充分条件。
+| profiler op_type | total_ms | time% | shapes | aic-npu 数据来源 | aic-npu 建模 op | shape 覆盖 |
+|---|---|---|---|---|---|---|
+| QuantBatchMatmulV3 | 61,542 | 20.0% | 69 | **SILICON** | GEMM (W8A8) | 60.3% (85/141) |
+| DispatchFFNCombine | 61,300 | 19.9% | 8 | **SILICON** | MoEDispatch | ep∈{2,4,8,32} |
+| broadcastAicpuKernel | 59,940 | 19.5% | 1 | **PROFILER_DERIVED** | KVTransfer | 6 点 |
+| reduce_scatterAicpuKernel | 52,283 | 17.0% | 1 | **PROFILER_DERIVED** | KVTransfer | 6 点 |
+| hcom_broadcast_ | 32,346 | 10.5% | 1 | **SILICON** | NCCL broadcast | 23×5 nd |
+| hcom_reduceScatter_ | 22,786 | 7.4% | 1 | **SILICON** | NCCL reduce_scatter | sweep |
+| SparseFlashAttention | 3,122 | 1.0% | 17 | **PROFILER_DERIVED + SILICON** | DSA module | 5+695 点 |
+| hcom_alltoall_ | 1,653 | 0.5% | 1 | 折入 FusedMC2 | MoEDispatch（含） | — |
+| hcom_allGather_ | 1,478 | 0.5% | 1 | **SILICON** | NCCL all_gather | sweep |
+| LightningIndexer | 1,281 | 0.4% | 17 | SOL | Indexer | — |
+| MatMulV2 | 1,237 | 0.4% | 72 | **SILICON** | GEMM (BF16) | 60.3% (85/141) |
+| mla_preprocess_0_mix_aic | 1,231 | 0.4% | 1 | SOL | MLA preprocess | — |
+| hcom_allReduce_ | 1,028 | 0.3% | 1 | **SILICON** | CustomAllReduce | sweep |
+| DynamicQuant | 684 | 0.2% | 35 | SOL | Quant util | — |
+| AscendQuantV2 | 568 | 0.2% | 24 | SOL | Quant util | — |
+| PadV3 / MemSet / TensorMove | 901 | 0.3% | 31 | SOL | Memory ops | — |
+| batch_getAicpuKernel | 350 | 0.1% | 1 | **PROFILER_DERIVED** | KVTransfer (IPC) | 6 点（含） |
+| AddRmsNormBias / RmsNorm | 350 | 0.1% | 32 | SOL | RMSNorm | — |
+| SwiGlu / Cast / Transpose / Slice 等 | ~1,500 | 0.5% | ~300 | SOL | ElementWise | — |
+| GroupedMatmulSwigluQuant | 87 | 0.0% | 75 | **SILICON** | MoE FFN (W8A8) | ep∈{2,4,8,32} |
+| GroupedMatmul | 39 | 0.0% | 75 | **SILICON** | MoE FFN (BF16) | ep∈{2,4,8,32} |
+| 其他小算子（<0.1% each） | ~500 | 0.2% | ~500 | SOL | 各类 | — |
 
-**GLM-5实测结果**：
+#### 按数据来源汇总
 
-| Phase | 时间覆盖率 | op覆盖率 | 主要数据来源构成 |
+| 数据来源 | total_ms | time% | 说明 |
 |---|---|---|---|
-| **Prefill** | **97.9%** | **50.0%** (6/12) | KV transfer **76.6%** (profiler反推) + MoE dispatch **10.6%** (实采) + DSA **7.4%** (profiler反推) + 其他SOL **3.4%** |
-| **Decode** | **99.1%** | **50.0%** (3/6) | MoE dispatch **51.6%** (实采) + Attention **46.8%** (实采) + 其他SOL **1.6%** |
+| **SILICON** (microbench 实采) | 181,844 | **59.0%** | GEMM + MoE + FusedMC2 + HCCL 通信 |
+| **PROFILER_DERIVED** (profiler 反推) | 115,798 | **37.6%** | KV transfer (含 AICPU 调度 74%) + DSA prefill |
+| **SOL** (解析估算) | 10,519 | **3.4%** | 小算子（RMSNorm/Indexer/Cast/Quant 等） |
+| **总计** | 308,161 | 100% | 882,413 次调用 |
+| **时间覆盖率 (SILICON+PROFILER)** | | **96.6%** | |
 
-**数据来源明细**（按时间占比排序）：
+#### 按建模阶段分解
 
-| Phase | Op类型 | 时间占比 | 数据来源 | 说明 |
-|---|---|---|---|---|
-| Prefill | KV transfer | **76.6%** | PROFILER_DERIVED | Mooncake P2P KV传输（调度器行为，含AICPU 74%，见§2.2） |
-| Prefill | MoE dispatch | 10.8% | SILICON | FusedMC2融合算子（含生产ep32实采） |
-| Prefill | DSA attention | 7.5% | PROFILER_DERIVED | 稀疏注意力核心（见§4.5端到端锚定） |
-| Prefill | MoE pre-dispatch | 0.8% | SILICON | Router/topk等前置op |
-| Prefill | 其他（norm/router/shared/embedding） | 3.4% | SOL | 轻量op，解析估算 |
-| Decode | MoE dispatch | **51.6%** | SILICON | FusedMC2融合算子（dispatch+FFN+combine） |
-| Decode | Attention | **46.9%** | SILICON | DSA generation module（SFA+Indexer） |
-| Decode | 其他（norm/logits/embedding） | 1.5% | SOL | 轻量op，解析估算 |
+| Phase | 时间覆盖率 | op数覆盖率 | 主要构成 |
+|---|---|---|---|
+| **Prefill** | **97.9%** | **50.0%** (6/12) | KV transfer 76.6% (profiler反推) + MoE dispatch 10.6% (实采) + DSA 7.4% (profiler反推) + SOL 3.4% |
+| **Decode** | **99.1%** | **50.0%** (3/6) | MoE dispatch 51.6% (实采) + Attention 46.8% (实采) + SOL 1.6% |
 
 **关键发现**：
 
-1. **Prefill主导项是KV transfer（76.6%）**，不是DSA（仅7.4%）——初版"DSA主导64-92%"基于错误口径（nh=4合成+没按CP切query，放大~20×），已作废
-2. **Decode实测覆盖率高（99.1%）**，MoE+Attention两大项全是实采，SOL仅1.6%
-3. **profiler反推 vs 实采的区别**：KV transfer和prefill DSA是profiler反推（调度器不可见行为、kernel缺失），不能做匹配度对账；实采算子（GEMM、MoE dispatch）可对账见§3.4
+1. **Prefill 主导项是 KV transfer（76.6%）**，不是 DSA（仅 7.4%）——初版"DSA 主导 64-92%"基于错误口径，已作废
+2. **Decode 实测覆盖率高（99.1%）**，MoE+Attention 两大项全是实采，SOL 仅 1.6%
+3. **profiler 反推 vs 实采的区别**：KV transfer 和 prefill DSA 是 profiler 反推（调度器不可见行为、kernel 缺失），不能做匹配度对账；实采算子（GEMM、MoE dispatch）可对账见§3.4
 
 ### 3.4 精度验证（仅对实采算子）
 
-> 本节只回答"匹配度"：实采算子的txt值 vs profiler实测偏差。profiler反推的数据（KV transfer、prefill DSA）自己比自己无意义。
+> 本节只回答"匹配度"：实采算子的 bench 值 vs profiler 实测偏差。profiler 反推的数据（KV transfer、prefill DSA）自己比自己无意义。
 
 **验证工具**：
-- `tools/check_alignment.py`：GEMM逐shape比对
-- `tools/check_moe_alignment.py`：MoE dispatch比对（严格按phase/ep分组）
-- `tools/compute_m1_m4.py`：运行时source tracking + E2E精度计算
+- `tools/check_alignment.py`：GEMM 逐 shape 比对
+- `tools/check_moe_alignment.py`：MoE dispatch 比对（严格按 phase/ep 分组）
+- `tools/compute_m1_m4.py`：运行时 source tracking + E2E 精度计算
 
-**GEMM匹配度**（71条real-signal，kernel≥30us）：
+#### GEMM 匹配度（71 条 real-signal，kernel≥30us）
 
 | 指标 | 值 | 说明 |
 |---|---|---|
-| 中位偏差 | **-14.0%** | 高频W8A8算子对齐良好 |
-| ±20%内 | 24条 | 占主要时间份额 |
-| ±50%内 | 61条 | 可接受范围 |
-| 异常归类 | 10条 | expert-batched误归类/DSA投影语义错位，已定位根因不影响寻优 |
+| 中位偏差 | **-14.0%** | 高频 W8A8 算子对齐良好 |
+| ±20% 内 | 41 条 (58%) | 占主要时间份额 |
+| ±50% 内 | 61 条 (86%) | 可接受范围 |
+| shape 命中率 | **60.3%** (85/141) | 56 条 MISS（小 N=32/128 + DSA 投影 K 值） |
+
+偏差分布：
+
+| 偏差区间 | 条数 |
+|---|---|
+| ±10% | 17 |
+| ±10~20% | 24 |
+| ±20~50% | 20 |
+| ±50~100% | 9 |
+| >100% | 1 |
 
 高频算子样本（调用次数≥1500）：
-- (9,1024,6144) w8a8：+13.2%（3619次调用）
-- (6,1024,6144) w8a8：+19.8%（3542次调用）
-- (256,6144,2048) w8a8：-10.9%（2772次调用）
+- (9,1024,6144) w8a8：+13.2%（3619 次调用）
+- (6,1024,6144) w8a8：+19.8%（3542 次调用）
+- (256,6144,2048) w8a8：-10.9%（2772 次调用）
 
-**MoE dispatch匹配度**：
+#### MoE dispatch 匹配度
 
-| phase | ep | ntok | profiler中位 | bench实测 | 偏差 | 备注 |
+| phase | ep | ntok | profiler 中位 | bench 实测 | 偏差 | 备注 |
 |---|---|---|---|---|---|---|
 | decode | 8 | 1 | 267.7us | 303.0us | +13.2% | ✅ 干净可比点 |
-| decode | 8 | 2 | 322.6us | 502.7us | +55.9% | ⚠️ ntok=2反常峰值 |
+| decode | 8 | 2 | 322.6us | 502.7us | +55.9% | ⚠️ ntok=2 反常峰值 |
 
-关键现实：bench表ep∈{2,4,8,32}、profiler实测ep∈{0,8,10,16}，几乎不重叠——**干净可比点仅2个**。MoE dispatch可信度来自实采采集方式（ep32直接bench），非匹配度对账。
+关键现实：bench 表 ep∈{2,4,8,32}、profiler 实测 ep∈{0,8,10,16}，几乎不重叠——**干净可比点仅 2 个**。MoE dispatch 可信度来自实采采集方式（ep32 直接 bench），非匹配度对账。
 
-**E2E精度**（运行时实测）：
+#### E2E 精度（运行时实测）
 
 | Phase | 精度 | 验证方式 |
 |---|---|---|
-| Decode | **≈1.000**（batch=1: -0.6%） | 双batch stream union对账 |
-| Prefill DSA（isl≤20k） | **核心+0.0%/+6%** | 生产单请求profiler端到端锚定（见§4.5） |
-| Prefill整体 | 🟢 **已验证** | KV transfer 线性外推（斜率一致性 1.0003）+ MSMODELING SFA 40K/80K 独立实测确认线性 regime |
+| Decode | **≈1.000**（batch=1: -0.6%） | 双 batch stream union 对账 |
+| Prefill DSA（isl≤20k） | **核心+0.0%/+6%** | 生产单请求 profiler 端到端锚定（见§4.5） |
+| Prefill 整体 | 🟢 **已验证** | KV transfer 线性外推（斜率一致性 1.0003）+ MSMODELING SFA 40K/80K 独立实测确认线性 regime |
+| Prefill isl=40k（外推） | 🟢 **HIGH** | 斜率 1.0003 + SFA 40K 实测 ratio 1.994（偏差<0.4%） |
+| Prefill isl=80k（外推） | 🟡 **MEDIUM** | 斜率 1.0003 + SFA 80K 实测 ratio 1.996（偏差<0.2%） |
 
-**小结**：
-- ✅ GEMM中位偏差-14%，高频算子对齐良好
-- ✅ MoE dispatch靠实采保证（ep32 bench），匹配度可比点少但可信
+#### 小结
+
+- ✅ GEMM 中位偏差 -14%，高频算子对齐良好，shape 命中率 60.3%
+- ✅ MoE dispatch 靠实采保证（ep32 bench），匹配度可比点少但可信
 - ✅ Decode TPOT -0.6%，端到端验证准确
-- ✅ Prefill DSA isl≤20k核心+0.0%/+6%，端到端锚定
-- ✅ Prefill整体线性外推已物理验证（斜率一致性 1.0003 + MSMODELING SFA 40K/80K 实测确认），isl=40k 🟢 HIGH
+- ✅ Prefill DSA isl≤20k 核心 +0.0%/+6%，端到端锚定
+- ✅ Prefill 整体线性外推已物理验证，isl=40k 🟢 HIGH，isl=80k 🟡 MEDIUM
 
 ### 3.6 配置寻优结果验证（commit 6849445）
 
