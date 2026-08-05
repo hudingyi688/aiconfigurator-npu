@@ -99,16 +99,24 @@ AIConfigurator的核心设计范式：
 collector/
 ├── bench_engine.py              # 统一计时引擎（NPU Graph捕获 + Event计时）
 └── npu/
-    ├── collect_gemm.py          # GEMM采集脚本 → gemm_perf.txt
-    ├── collect_attn.py          # Attention采集脚本 → context/generation_attention_perf.txt
-    ├── collect_moe.py           # MoE FFN采集脚本 → moe_perf.txt
-    ├── collect_mla_module.py    # DSA module采集脚本 → dsa_*_module_perf.txt
-    ├── collect_moe_dispatch_combine.py  # FusedMC2采集 → moe_dispatch_combine_perf.txt
-    ├── gemm_factory.py          # GEMM算子构造工厂
-    ├── attn_factory.py          # Attention算子构造工厂
-    ├── moe_factory.py           # MoE算子构造工厂
-    ├── moe_dispatch_factory.py  # FusedMC2算子构造工厂（绕过wrapper）
-    └── mla_module_factory.py    # DSA module构造工厂
+    ├── collect_gemm.py                    # GEMM采集 → gemm_perf.txt
+    ├── collect_attn.py                    # Attention采集 → context/generation_attention_perf.txt
+    ├── collect_moe.py                     # MoE FFN采集 → moe_perf.txt
+    ├── collect_mla_module.py              # DSA module采集 → dsa_*_module_perf.txt
+    ├── collect_mla.py                     # DSA MLA attention采集
+    ├── collect_moe_dispatch_combine.py    # FusedMC2采集 → moe_dispatch_combine_perf.txt
+    ├── collect_elementwise.py             # RMSNorm等轻量op采集
+    ├── generate_comm_microbench.py        # HCCL通信microbench（all_reduce/all_gather/reduce_scatter/all_to_all/broadcast）→ nccl_perf.txt + custom_allreduce_perf.txt
+    ├── collect_moe_dispatch_ep32.sh       # ep32补采脚本（2×A3节点）
+    ├── collect_broadcast.sh               # HCCL broadcast采集（KV transfer建模用）
+    ├── collect_dsa_prefill_chunked.sh     # DSA prefill chunked采集
+    ├── diagnose_dsa_sfa.sh                # DSA SFA诊断脚本
+    ├── gemm_factory.py                    # GEMM算子构造工厂
+    ├── attn_factory.py                    # Attention算子构造工厂
+    ├── moe_factory.py                     # MoE算子构造工厂
+    ├── moe_dispatch_factory.py            # FusedMC2算子构造工厂（绕过wrapper）
+    ├── mla_factory.py                     # MLA attention算子构造工厂
+    └── mla_module_factory.py              # DSA module构造工厂
 ```
 
 **数据流向**：
@@ -233,14 +241,15 @@ pareto_front = picking.filter_pareto(results, ttft_target=3000, tpot_target=50)
 
 | 脚本 | 采集算子 | 核心API | 输出文件 | 行数 |
 |---|---|---|---|---|
-| `collect_gemm.py` | BF16/W8A8 GEMM | `vllm_ascend.ops.linear.AscendRowParallelLinear` | `gemm_perf.txt` | 4942 |
-| `collect_attn.py` | Context/Decode attention | `vllm_ascend.attention.attention_v1` | `context/generation_attention_perf.txt` | 1013/1217 |
-| `collect_moe.py` | MoE FFN group GEMM | `npu_grouped_matmul` | `moe_perf.txt` | 196 |
-| `collect_mla_module.py` | DSA module整段forward | `DeepseekV2MLAAttention` | `dsa_context/generation_module_perf.txt` | 369/696 |
+| `collect_gemm.py` | BF16/W8A8 GEMM | `vllm_ascend.ops.linear.AscendRowParallelLinear` | `gemm_perf.txt` | 4941 |
+| `collect_attn.py` | Context/Decode attention | `vllm_ascend.attention.attention_v1` | `context/generation_attention_perf.txt` | 1012/1216 |
+| `collect_moe.py` | MoE FFN group GEMM | `npu_grouped_matmul` | `moe_perf.txt` | 195 |
+| `collect_mla_module.py` | DSA module整段forward | `DeepseekV2MLAAttention` | `dsa_context_module_perf.txt`<br>`dsa_generation_module_perf.txt` | 368/695 |
 | `collect_moe_dispatch_combine.py` | FusedMC2融合算子 | `torch.ops._C_ascend.dispatch_ffn_combine` | `moe_dispatch_combine_perf.txt` | 170 |
 | `collect_elementwise.py` | RMSNorm等轻量op | `torch_npu.nn.functional.rms_norm` | `rmsnorm_perf.txt`等 | ~200 |
-| `collect_nccl.py` | DP通信算子 | `HCCL allgather/reduce_scatter` | `nccl_perf.txt` | 629 |
-| `collect_all_reduce.py` | TP custom allreduce | `vllm_ascend.ops.custom_allreduce` | `custom_allreduce_perf.txt` | 172 |
+| `generate_comm_microbench.py` | HCCL通信算子（all_reduce/all_gather/reduce_scatter/all_to_all/broadcast） | `torch.distributed` + `torch_npu.profiler` | `nccl_perf.txt` + `custom_allreduce_perf.txt` | 743/171 |
+| `collect_moe_dispatch_ep32.sh` | FusedMC2 ep32补采（2×A3节点） | `torchrun --nproc_per_node=16` | 追加到 `moe_dispatch_combine_perf.txt` | — |
+| `collect_broadcast.sh` | HCCL broadcast采集（KV transfer建模用） | `torchrun` + `generate_comm_microbench.py` | 追加到 `nccl_perf.txt` | — |
 
 **关键技术要点**（详见附录A）：
 
@@ -899,13 +908,12 @@ torch_npu.nn.functional.rotary_positional_embeddings(x, cos, sin)
 
 ### A.7 通信算子采集
 
-**NCCL通信**（`collect_nccl.py`）：
-- 调HCCL官方binary（黑盒），几何级数扫描message_bytes
-- 输出：`nccl_perf.txt`（DP allgather/reduce_scatter）
-
-**Custom AllReduce**（`collect_all_reduce.py`）：
-- 实例化vllm-ascend Custom AllReduce + CUDA Graph
-- 输出：`custom_allreduce_perf.txt`（TP allreduce）
+**HCCL通信microbench**（`generate_comm_microbench.py`）：
+- 统一脚本，支持 all_reduce / all_gather / reduce_scatter / all_to_all / broadcast 五种集合通信
+- 基于 `torch.distributed` + `torch_npu.profiler` kernel 模式计时（对齐 step_trace Communication 口径）
+- 拓扑感知：`--grid-shape` 自动解析 topology_tier（inter_pod / intra_pod / die_level）
+- 输出：`nccl_perf.txt`（含 broadcast，743行）+ `custom_allreduce_perf.txt`（171行）
+- 配套脚本：`collect_broadcast.sh`（KV transfer建模用的 broadcast 专项采集）、`collect_moe_dispatch_ep32.sh`（ep32补采，2×A3节点）
 
 ### A.8 计时引擎（bench_engine.py）
 
