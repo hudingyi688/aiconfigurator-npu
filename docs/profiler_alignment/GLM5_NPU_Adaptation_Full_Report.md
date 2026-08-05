@@ -680,38 +680,46 @@ Pin约束后（task.py:250-252）:
 > DSA 退居次要（8%~13%，sparse topk 封顶使其增长受限；isl>20k 为外推估算）。
 > 降 prefill TTFT 的重点是**减 mooncake KV transfer**（连接器/带宽/重叠），而非初版以为的「减 DSA 重算」。
 
-### 3.8 Prefill 通信（comm）建模收口（2026-06-05）
+### 3.8 Prefill 通信（comm）建模收口（2026-08 复核）
 
-**疑问**: AIConfigurator 把各算子延迟串行相加（`base_backend.py` 对 context_ops
-做 `sum()`，无 union/overlap 逻辑）。那 profiler 里与 compute **重叠**的通信
-（`comm其他`，约占 prefill ~9%）会不会被当成全暴露串行加，导致局部高估？
+**疑问**: AIConfigurator 把各算子延迟串行相加（`base_backend.py` 对 context_ops 做 `sum()`，无 union/overlap 逻辑）。那 profiler 里与 compute **重叠**的通信（`comm其他`，约占 prefill ~9%）会不会被当成全暴露串行加，导致局部高估？
 
 **核实结论：不会，不存在该高估机制。** 验证链：
 
 1. **聚合层确是裸串行和**，所以确实需要检查——若模型为 GLM-5 注册了独立的暴露
    comm op，就会被串行加。
-2. **但 GLM-5 prefill 几乎不注册独立解析 comm op**：`DeepSeekV32Model` 的
-   context_ops 里唯一带 comm 的是 `MoEDispatch`（pre/post）、`KVTransfer`、`P2P`。
-   **没有通用的 all-reduce / reduce-scatter / all-gather op**（其它模型变体有，
-   GLM-5 没有）；代码显式令 fused-MC2 与 dp_latency 互斥，防 DP 流量重复计。
-3. **comm 项分解**（档1 isl10k tp16/ep32/dp2，实跑）：
+2. **GLM-5 prefill context_ops 里无独立 AllReduce op**：`DeepSeekV32Model` 继承
+   `BaseModel`（不是 `GPTModel`/`LLAMAModel`），不注册 `CustomAllReduce`。
+   context_ops 完整列表：Embedding / ElementWise×2 / ContextDSAModule / GEMM×3 /
+   MoEDispatch×2 / MoE / KVTransfer / P2P。**没有独立的 all-reduce / all-gather /
+   reduce-scatter op**（GPTModel/LLAMAModel 有 `context_ar_1/ar_2`，GLM-5 没有）。
+3. **MoEDispatch 内部含 ar_latency（attention all-reduce）**：在 `MoEDispatch.query()`
+   里，当 `attention_tp_size > 1` 时会加 `ar_latency = query_custom_allreduce(...) ×
+   comm_calibration("all_reduce", ep, phase)`。这是 **MoEDispatch 内部的子项**，
+   不是独立的串行 comm op——它被包含在 MoEDispatch 的总延迟里，与 fused kernel 延迟
+   一起返回。对 vllm-ascend 的 fused_mc2 路径，ar_latency 使用 profiler 校准系数
+   `0.1409`（profiler median ÷ SOL），非裸 alpha-beta。
+4. **comm 项分解**（档1 isl10k tp16/ep32/dp2，实跑）：
 
    | comm 项 | 值 | 建模方式 | 是否暴露串行加 |
    |---|---|---|---|
-   | fused MoE（dispatch+FFN+combine）| 221ms | **实测 on-device kernel 墙钟** | 否——重叠已在 kernel 内 captured |
+   | fused MoE（dispatch+FFN+combine）| 232ms | **实测 on-device kernel 墙钟**（FusedMC2 silicon 表） | 否——重叠已在 kernel 内 captured |
+   | MoEDispatch 内含 ar_latency | ~34ms | 解析 SOL **× profiler 校准 0.1409**（含在 MoEDispatch 总延迟内） | 否——是 MoEDispatch 子项，非独立 op |
    | KV transfer | 1679ms | net 墙钟表（重叠已扣）| 否 |
-   | attention all-reduce（ar_latency）| ~34ms | 解析 SOL **× profiler 校准 0.1409** | 唯一解析项，已 de-rate 7× |
    | p2p / context_moe | 0 | pp=1 / 折入 fused | — |
 
-4. profiler 的重叠 `comm其他`（MoE HCCL + KV broadcast/reduceScatter）正好映射到
+5. profiler 的重叠 `comm其他`（MoE HCCL + KV broadcast/reduceScatter）正好映射到
    fused-MC2 实测 kernel 与 KV-transfer net 墙钟这两个**实测墙钟**项，重叠天然
    baked-in，模型从不把那 ~9% 当暴露串行重加。
-5. 唯一真·解析串行 comm = attention all-reduce，仅占 disagg prefill **1.6%** /
-   agg **~7%**，且被 profiler 校准（0.1409 = profiler median ÷ SOL），非裸 alpha-beta。
 
 > **小结**: prefill comm 三路处理全 overlap-aware（fused→实测 silicon / KV
-> transfer→net 墙钟 / attn all-reduce→SOL×0.1409）。「多流并行高估」的怀疑在
-> prefill + decode 全线证伪——若有偏差是偏保守，非偏高。
+> transfer→net 墙钟 / attn all-reduce→MoEDispatch 内含 SOL×0.1409）。
+> 「多流并行高估」的怀疑在 prefill + decode 全线证伪——若有偏差是偏保守，非偏高。
+>
+> **2026-08 复核修正**：原报告称"唯一解析串行 comm = attention all-reduce，仅占
+> disagg prefill 1.6%"。实际复核发现 GLM-5 的 `DeepSeekV32Model` **不注册独立的
+> `CustomAllReduce` op**（与 GPTModel/LLAMAModel 不同），ar_latency 是 MoEDispatch
+> 内部的子项，不是独立的串行 comm op。结论不变（无高估），但机制描述修正。
 
 ---
 
